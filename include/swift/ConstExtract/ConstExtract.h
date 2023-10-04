@@ -1,8 +1,8 @@
-//===-------- ConstExtract.h -- Gather Compile-Time-Known Values ----------===//
+//===---- ConstExtract.h -- Gather Compile-Time-Known Values ----*- C++ -*-===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2022 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -55,8 +55,7 @@ gatherConstValuesForModule(const std::unordered_set<std::string> &Protocols,
 /// Serialize a collection of \c ConstValueInfos to JSON at the
 /// provided output stream.
 bool writeAsJSONToFile(const std::vector<ConstValueTypeInfo> &ConstValueInfos,
-                       llvm::raw_fd_ostream &OS);
-
+                       llvm::raw_ostream &OS);
 } // namespace swift
 
 #endif

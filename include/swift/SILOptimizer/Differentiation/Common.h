@@ -56,8 +56,7 @@ raw_ostream &getADDebugStream();
 ///     %index_1 = integer_literal $Builtin.Word, 1
 ///     %elt1 = index_addr %elt0, %index_1           // element address
 ///     ...
-// TODO(SR-12894): Find a better name and move this general utility to
-// ArraySemantic.h.
+// TODO(https://github.com/apple/swift/issues/55340): Find a better name and move this general utility to ArraySemantic.h.
 ApplyInst *getAllocateUninitializedArrayIntrinsicElementAddress(SILValue v);
 
 /// Given a value, finds its single `destructure_tuple` user if the value is
@@ -144,7 +143,7 @@ template <class Inst> Inst *peerThroughFunctionConversions(SILValue value) {
   return nullptr;
 }
 
-Optional<std::pair<SILDebugLocation, SILDebugVariable>>
+llvm::Optional<std::pair<SILDebugLocation, SILDebugVariable>>
 findDebugLocationAndVariable(SILValue originalValue);
 
 //===----------------------------------------------------------------------===//
@@ -229,7 +228,7 @@ getExactDifferentiabilityWitness(SILModule &module, SILFunction *original,
 /// \param minimalASTParameterIndices is an output parameter that is set to the
 /// AST indices of the minimal configuration, or to `nullptr` if no such
 /// configuration exists.
-Optional<AutoDiffConfig>
+llvm::Optional<AutoDiffConfig>
 findMinimalDerivativeConfiguration(AbstractFunctionDecl *original,
                                    IndexSubset *parameterIndices,
                                    IndexSubset *&minimalASTParameterIndices);

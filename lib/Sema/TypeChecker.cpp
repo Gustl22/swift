@@ -17,6 +17,7 @@
 
 #include "swift/Subsystems.h"
 #include "TypeChecker.h"
+#include "TypeCheckConcurrency.h"
 #include "TypeCheckDecl.h"
 #include "TypeCheckObjC.h"
 #include "TypeCheckType.h"
@@ -40,6 +41,7 @@
 #include "swift/Basic/STLExtras.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Sema/IDETypeChecking.h"
+#include "swift/Sema/SILTypeResolutionContext.h"
 #include "swift/Strings.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PointerUnion.h"
@@ -239,54 +241,9 @@ void swift::bindExtensions(ModuleDecl &mod) {
   // typeCheckDecl().
 }
 
-static void typeCheckDelayedFunctions(SourceFile &SF) {
-  unsigned currentFunctionIdx = 0;
-
-  while (currentFunctionIdx < SF.DelayedFunctions.size()) {
-    auto *AFD = SF.DelayedFunctions[currentFunctionIdx];
-    assert(!AFD->getDeclContext()->isLocalContext());
-    (void) AFD->getTypecheckedBody();
-    ++currentFunctionIdx;
-  }
-
-  SF.DelayedFunctions.clear();
-}
-
 void swift::performTypeChecking(SourceFile &SF) {
   return (void)evaluateOrDefault(SF.getASTContext().evaluator,
                                  TypeCheckSourceFileRequest{&SF}, {});
-}
-
-/// If any of the imports in this source file was @preconcurrency but
-/// there were no diagnostics downgraded or suppressed due to that
-/// @preconcurrency, suggest that the attribute be removed.
-static void diagnoseUnnecessaryPreconcurrencyImports(SourceFile &sf) {
-  switch (sf.Kind) {
-  case SourceFileKind::Interface:
-  case SourceFileKind::SIL:
-    return;
-
-  case SourceFileKind::Library:
-  case SourceFileKind::Main:
-  case SourceFileKind::MacroExpansion:
-    break;
-  }
-
-  ASTContext &ctx = sf.getASTContext();
-
-  if (ctx.TypeCheckerOpts.SkipFunctionBodies != FunctionBodySkipping::None)
-    return;
-
-  for (const auto &import : sf.getImports()) {
-    if (import.options.contains(ImportFlags::Preconcurrency) &&
-        import.importLoc.isValid() &&
-        !sf.hasImportUsedPreconcurrency(import)) {
-      ctx.Diags.diagnose(
-          import.importLoc, diag::remove_predates_concurrency_import,
-          import.module.importedModule->getName())
-        .fixItRemove(import.preconcurrencyRange);
-    }
-  }
 }
 
 evaluator::SideEffect
@@ -327,10 +284,20 @@ TypeCheckSourceFileRequest::evaluate(Evaluator &eval, SourceFile *SF) const {
       }
     }
 
-    typeCheckDelayedFunctions(*SF);
+    // Type-check macro-generated extensions.
+    if (auto *synthesizedSF = SF->getSynthesizedFile()) {
+      for (auto *decl : synthesizedSF->getTopLevelDecls()) {
+        if (!decl->isImplicit()) {
+          assert(isa<ExtensionDecl>(decl));
+          TypeChecker::typeCheckDecl(decl);
+        }
+      }
+    }
+    SF->typeCheckDelayedFunctions();
   }
 
   diagnoseUnnecessaryPreconcurrencyImports(*SF);
+  diagnoseUnnecessaryPublicImports(*SF);
 
   // Check to see if there are any inconsistent imports.
   evaluateOrDefault(
@@ -342,6 +309,13 @@ TypeCheckSourceFileRequest::evaluate(Evaluator &eval, SourceFile *SF) const {
       Ctx.evaluator,
       CheckInconsistentSPIOnlyImportsRequest{SF},
       {});
+
+  if (!Ctx.LangOpts.isSwiftVersionAtLeast(6)) {
+    evaluateOrDefault(
+      Ctx.evaluator,
+      CheckInconsistentAccessLevelOnImport{SF},
+      {});
+  }
 
   evaluateOrDefault(
       Ctx.evaluator,
@@ -395,6 +369,10 @@ void swift::loadDerivativeConfigurations(SourceFile &SF) {
   public:
     DerivativeFinder() {}
 
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
+
     PreWalkAction walkToDeclPre(Decl *D) override {
       if (auto *afd = dyn_cast<AbstractFunctionDecl>(D)) {
         for (auto *derAttr : afd->getAttrs().getAttributes<DerivativeAttr>()) {
@@ -435,17 +413,17 @@ bool swift::isAdditiveArithmeticConformanceDerivationEnabled(SourceFile &SF) {
 }
 
 Type swift::performTypeResolution(TypeRepr *TyR, ASTContext &Ctx,
-                                  bool isSILMode, bool isSILType,
                                   GenericSignature GenericSig,
-                                  GenericParamList *GenericParams,
+                                  SILTypeResolutionContext *SILContext,
                                   DeclContext *DC, bool ProduceDiagnostics) {
-  TypeResolutionOptions options = None;
-  if (isSILMode)
+  TypeResolutionOptions options = llvm::None;
+  if (SILContext) {
     options |= TypeResolutionFlags::SILMode;
-  if (isSILType)
-    options |= TypeResolutionFlags::SILType;
+    if (SILContext->IsSILType)
+      options |= TypeResolutionFlags::SILType;
+  }
 
-  Optional<DiagnosticSuppression> suppression;
+  llvm::Optional<DiagnosticSuppression> suppression;
   if (!ProduceDiagnostics)
     suppression.emplace(Ctx.Diags);
 
@@ -458,8 +436,9 @@ Type swift::performTypeResolution(TypeRepr *TyR, ASTContext &Ctx,
              },
              // FIXME: Don't let placeholder types escape type resolution.
              // For now, just return the placeholder type.
-             PlaceholderType::get)
-      .resolveType(TyR, GenericParams);
+             PlaceholderType::get,
+             /*packElementOpener*/ nullptr)
+      .resolveType(TyR, SILContext);
 }
 
 namespace {
@@ -472,13 +451,19 @@ namespace {
                             GenericParamList *params)
         : dc(dc), params(params) {}
 
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
+
     PreWalkAction walkToTypeReprPre(TypeRepr *T) override {
-      if (auto *ident = dyn_cast<IdentTypeRepr>(T)) {
-        auto firstComponent = ident->getComponentRange().front();
-        auto name = firstComponent->getNameRef().getBaseIdentifier();
+    if (auto *declRefTR = dyn_cast<DeclRefTypeRepr>(T)) {
+      if (auto *identBase =
+              dyn_cast<IdentTypeRepr>(declRefTR->getBaseComponent())) {
+        auto name = identBase->getNameRef().getBaseIdentifier();
         if (auto *paramDecl = params->lookUpGenericParam(name))
-          firstComponent->setValue(paramDecl, dc);
+          identBase->setValue(paramDecl, dc);
       }
+    }
 
       return Action::Continue();
     }
@@ -545,14 +530,19 @@ bool swift::typeCheckASTNodeAtLoc(TypeCheckASTNodeAtLocContext TypeCheckCtx,
 }
 
 bool swift::typeCheckForCodeCompletion(
-    constraints::SolutionApplicationTarget &target, bool needsPrecheck,
+    constraints::SyntacticElementTarget &target, bool needsPrecheck,
     llvm::function_ref<void(const constraints::Solution &)> callback) {
   return TypeChecker::typeCheckForCodeCompletion(target, needsPrecheck,
                                                  callback);
 }
 
+Expr *swift::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE, DeclContext *Context,
+                                bool replaceInvalidRefsWithErrors) {
+  return TypeChecker::resolveDeclRefExpr(UDRE, Context, replaceInvalidRefsWithErrors);
+}
+
 void TypeChecker::checkForForbiddenPrefix(ASTContext &C, DeclBaseName Name) {
-  if (C.TypeCheckerOpts.DebugForbidTypecheckPrefix.empty())
+  if (C.TypeCheckerOpts.DebugForbidTypecheckPrefixes.empty())
     return;
 
   // Don't touch special names or empty names.
@@ -560,8 +550,10 @@ void TypeChecker::checkForForbiddenPrefix(ASTContext &C, DeclBaseName Name) {
     return;
 
   StringRef Str = Name.getIdentifier().str();
-  if (Str.startswith(C.TypeCheckerOpts.DebugForbidTypecheckPrefix)) {
-    llvm::report_fatal_error(Twine("forbidden typecheck occurred: ") + Str);
+  for (auto forbiddenPrefix : C.TypeCheckerOpts.DebugForbidTypecheckPrefixes) {
+    if (Str.startswith(forbiddenPrefix)) {
+      llvm::report_fatal_error(Twine("forbidden typecheck occurred: ") + Str);
+    }
   }
 }
 
@@ -581,7 +573,7 @@ TypeChecker::getDeclTypeCheckingSemantics(ValueDecl *decl) {
 
 bool TypeChecker::isDifferentiable(Type type, bool tangentVectorEqualsSelf,
                                    DeclContext *dc,
-                                   Optional<TypeResolutionStage> stage) {
+                                   llvm::Optional<TypeResolutionStage> stage) {
   if (stage)
     type = dc->mapTypeIntoContext(type);
   auto tanSpace = type->getAutoDiffTangentSpace(
@@ -595,10 +587,9 @@ bool TypeChecker::isDifferentiable(Type type, bool tangentVectorEqualsSelf,
   return type->getCanonicalType() == tanSpace->getCanonicalType();
 }
 
-bool TypeChecker::diagnoseInvalidFunctionType(FunctionType *fnTy, SourceLoc loc,
-                                              Optional<FunctionTypeRepr *>repr,
-                                              DeclContext *dc,
-                                              Optional<TypeResolutionStage> stage) {
+bool TypeChecker::diagnoseInvalidFunctionType(
+    FunctionType *fnTy, SourceLoc loc, llvm::Optional<FunctionTypeRepr *> repr,
+    DeclContext *dc, llvm::Optional<TypeResolutionStage> stage) {
   // Some of the below checks trigger cycles if we don't have a generic
   // signature yet; we'll run the checks again in
   // TypeResolutionStage::Interface.
@@ -711,6 +702,28 @@ bool TypeChecker::diagnoseInvalidFunctionType(FunctionType *fnTy, SourceLoc loc,
       if (repr) {
           diag.highlight((*repr)->getResultTypeRepr()->getSourceRange());
       }
+    }
+
+    // If the result type is void, we need to have at least one differentiable
+    // inout argument
+    if (result->isVoid() &&
+        llvm::find_if(params,
+                      [&](AnyFunctionType::Param param) {
+                        if (param.isNoDerivative())
+                          return false;
+                        return param.isInOut() &&
+                          TypeChecker::isDifferentiable(param.getPlainType(),
+                                                        /*tangentVectorEqualsSelf*/ isLinear,
+                                                        dc, stage);
+                      }) == params.end()) {
+      auto diagLoc = repr ? (*repr)->getResultTypeRepr()->getLoc() : loc;
+      auto resultStr = fnTy->getResult()->getString();
+      auto diag = ctx.Diags.diagnose(
+        diagLoc, diag::differentiable_function_type_void_result);
+      hadAnyError = true;
+
+      if (repr)
+        diag.highlight((*repr)->getResultTypeRepr()->getSourceRange());
     }
   }
 

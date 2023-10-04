@@ -42,8 +42,8 @@ set(swiftDarwin_common_options
       DEPENDS ${darwin_depends})
 
 
-if(${BOOTSTRAPPING_MODE} STREQUAL "BOOTSTRAPPING" AND
-   ${SWIFT_HOST_VARIANT_SDK} IN_LIST SWIFT_DARWIN_PLATFORMS)
+if(BOOTSTRAPPING_MODE STREQUAL "BOOTSTRAPPING" AND
+   SWIFT_HOST_VARIANT_SDK IN_LIST SWIFT_DARWIN_PLATFORMS)
 
   set(swiftDarwin_common_bootstrapping_options
       ${swiftDarwin_common_options}
@@ -74,7 +74,8 @@ endif()
 add_swift_target_library(swiftDarwin ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES}
     ${swiftDarwin_common_options}
     TARGET_SDKS "${swiftDarwin_target_sdks}"
-    INSTALL_IN_COMPONENT sdk-overlay)
+    INSTALL_IN_COMPONENT sdk-overlay
+    MACCATALYST_BUILD_FLAVOR "zippered")
 
 set(swiftGlibc_target_sdks ANDROID CYGWIN FREEBSD OPENBSD LINUX HAIKU)
 if(SWIFT_FREESTANDING_FLAVOR STREQUAL "linux")
@@ -96,6 +97,39 @@ add_swift_target_library(swiftGlibc ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_O
     TARGET_SDKS "${swiftGlibc_target_sdks}"
     INSTALL_IN_COMPONENT sdk-overlay
     DEPENDS glibc_modulemap)
+
+add_swift_target_library(swiftMusl ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_OVERLAY
+    ${swift_platform_sources}
+    POSIXError.swift
+
+    GYB_SOURCES
+      ${swift_platform_gyb_sources}
+      Musl.swift.gyb
+
+    SWIFT_COMPILE_FLAGS
+      ${SWIFT_RUNTIME_SWIFT_COMPILE_FLAGS}
+      ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
+      ${swift_platform_compile_flags}
+    LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
+    TARGET_SDKS MUSL
+    INSTALL_IN_COMPONENT sdk-overlay)
+
+add_swift_target_library(swiftWASILibc ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_OVERLAY
+    ${swift_platform_sources}
+    POSIXError.swift
+
+    GYB_SOURCES
+      ${swift_platform_gyb_sources}
+      WASILibc.swift.gyb
+
+    SWIFT_COMPILE_FLAGS
+      ${SWIFT_RUNTIME_SWIFT_COMPILE_FLAGS}
+      ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
+      ${swift_platform_compile_flags}
+    LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
+    TARGET_SDKS WASI
+    INSTALL_IN_COMPONENT sdk-overlay
+    DEPENDS wasilibc_modulemap)
 
 add_swift_target_library(swiftCRT ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_OVERLAY
     ucrt.swift
@@ -146,33 +180,40 @@ foreach(sdk ${SWIFT_SDKS})
 
     list(APPEND glibc_modulemap_target_list ${glibc_modulemap_target})
 
-    if(SWIFT_BUILD_STATIC_STDLIB)
-      add_custom_command_target(
-        copy_glibc_modulemap_static
-        COMMAND
-          "${CMAKE_COMMAND}" "-E" "make_directory" ${module_dir_static}
-        COMMAND
-          "${CMAKE_COMMAND}" "-E" "copy" ${glibc_modulemap_out} ${glibc_modulemap_out_static}
-        OUTPUT ${glibc_modulemap_out_static}
-        DEPENDS
-          "${glibc_modulemap_target}"
-        COMMENT "Copying Glibc modulemap to static resources")
-
-      list(APPEND glibc_modulemap_target_list ${copy_glibc_modulemap_static})
-    endif()
-
     set(glibc_header_out "${module_dir}/SwiftGlibc.h")
+    set(glibc_header_out_static "${module_dir_static}/SwiftGlibc.h")
     handle_gyb_source_single(glibc_header_target
         SOURCE "SwiftGlibc.h.gyb"
         OUTPUT "${glibc_header_out}"
         FLAGS "-DCMAKE_SDK=${sdk}")
     list(APPEND glibc_modulemap_target_list ${glibc_header_target})
 
+    if(SWIFT_BUILD_STATIC_STDLIB)
+      add_custom_command_target(
+        copy_glibc_modulemap_header_static
+        COMMAND
+          "${CMAKE_COMMAND}" "-E" "make_directory" ${module_dir_static}
+        COMMAND
+          "${CMAKE_COMMAND}" "-E" "copy"
+            ${glibc_modulemap_out} ${glibc_modulemap_out_static}
+        COMMAND
+          "${CMAKE_COMMAND}" "-E" "copy"
+            ${glibc_header_out} ${glibc_header_out_static}
+        OUTPUT ${glibc_modulemap_out_static} ${glibc_header_out_static}
+        DEPENDS
+          "${glibc_modulemap_target}"
+          "${glibc_header_target}"
+        COMMENT "Copying Glibc modulemap and header to static resources")
+
+      list(APPEND glibc_modulemap_target_list
+        ${copy_glibc_modulemap_header_static})
+    endif()
+
     # If this SDK is a target for a non-native host, except if it's for Android
     # with its own native sysroot, create a native modulemap without a sysroot
     # prefix. This is the one we'll install instead.
     if(NOT "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${arch}_PATH}" STREQUAL "/" AND
-       NOT (${sdk} STREQUAL ANDROID AND NOT "${SWIFT_ANDROID_NATIVE_SYSROOT}" STREQUAL ""))
+       NOT (sdk STREQUAL "ANDROID" AND NOT "${SWIFT_ANDROID_NATIVE_SYSROOT}" STREQUAL ""))
       set(glibc_sysroot_relative_modulemap_out "${module_dir}/sysroot-relative-modulemaps/glibc.modulemap")
 
       handle_gyb_source_single(glibc_modulemap_native_target
@@ -209,3 +250,50 @@ endforeach()
 add_custom_target(glibc_modulemap DEPENDS ${glibc_modulemap_target_list})
 set_property(TARGET glibc_modulemap PROPERTY FOLDER "Miscellaneous")
 add_dependencies(sdk-overlay glibc_modulemap)
+
+set(wasilibc_modulemap_target_list)
+if("WASI" IN_LIST SWIFT_SDKS)
+  set(wasilibc_modulemap_source "wasi-libc.modulemap")
+  foreach(arch ${SWIFT_SDK_WASI_ARCHITECTURES})
+    set(arch_subdir "${SWIFT_SDK_WASI_LIB_SUBDIR}/${arch}")
+    set(module_dir "${SWIFTLIB_DIR}/${arch_subdir}")
+    set(module_dir_static "${SWIFTSTATICLIB_DIR}/${arch_subdir}")
+
+    add_custom_command_target(
+      copy_wasilibc_modulemap_resource
+      COMMAND
+        "${CMAKE_COMMAND}" "-E" "make_directory" ${module_dir} ${module_dir_static}
+      COMMAND
+        "${CMAKE_COMMAND}" "-E" "copy_if_different"
+          "${CMAKE_CURRENT_SOURCE_DIR}/${wasilibc_modulemap_source}" ${module_dir}
+      COMMAND
+        "${CMAKE_COMMAND}" "-E" "copy_if_different"
+          "${CMAKE_CURRENT_SOURCE_DIR}/${wasilibc_modulemap_source}" ${module_dir_static}
+      OUTPUT ${module_dir}/${wasilibc_modulemap_source} ${module_dir_static}/${wasilibc_modulemap_source}
+      COMMENT "Copying WASILibc modulemap to resource directories")
+    add_dependencies(sdk-overlay ${copy_wasilibc_modulemap_resource})
+    list(APPEND wasilibc_modulemap_target_list ${copy_wasilibc_modulemap_resource})
+
+    swift_install_in_component(FILES "${wasilibc_modulemap_source}"
+                               DESTINATION "lib/swift/${arch_subdir}"
+                               COMPONENT sdk-overlay)
+    if(SWIFT_BUILD_STATIC_STDLIB)
+      swift_install_in_component(FILES "${wasilibc_modulemap_source}"
+                                 DESTINATION "lib/swift_static/${arch_subdir}"
+                                 COMPONENT sdk-overlay)
+    endif()
+  endforeach()
+endif()
+add_custom_target(wasilibc_modulemap DEPENDS ${wasilibc_modulemap_target_list})
+set_property(TARGET wasilibc_modulemap PROPERTY FOLDER "Miscellaneous")
+add_dependencies(sdk-overlay wasilibc_modulemap)
+
+if(WINDOWS IN_LIST SWIFT_SDKS)
+  swift_install_in_component(FILES
+      ucrt.modulemap
+      vcruntime.apinotes
+      vcruntime.modulemap
+      winsdk.modulemap
+    DESTINATION "share"
+    COMPONENT sdk-overlay)
+endif()

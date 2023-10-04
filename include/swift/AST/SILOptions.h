@@ -59,17 +59,18 @@ enum class CopyPropagationOption : uint8_t {
 };
 
 enum class DestroyHoistingOption : uint8_t {
-  // Do not run SSADestroyHoisting.
+  // Do not run DestroyAddrHoisting.
   Off = 0,
 
-  // Run SSADestroyHoisting pass after AllocBoxToStack in the function passes.
+  // Run DestroyAddrHoisting pass after AllocBoxToStack in the function passes.
   On = 1
 };
 
 enum class CrossModuleOptimizationMode : uint8_t {
   Off = 0,
   Default = 1,
-  Aggressive = 2
+  Aggressive = 2,
+  Everything = 3,
 };
 
 class SILModule;
@@ -98,7 +99,7 @@ public:
   /// When this is 'On' the pipeline has default behavior.
   CopyPropagationOption CopyPropagation = CopyPropagationOption::On;
 
-  /// Whether to run the SSADestroyHoisting pass.
+  /// Whether to run the DestroyAddrHoisting pass.
   ///
   /// When this 'On' the pipeline has the default behavior.
   DestroyHoistingOption DestroyHoisting = DestroyHoistingOption::On;
@@ -117,6 +118,9 @@ public:
   /// Controls whether to emit actor data-race checks.
   bool EnableActorDataRaceChecks = false;
 
+  /// Controls whether to run async demotion pass.
+  bool EnableAsyncDemotion = false;
+
   /// Should we run any SIL performance optimizations
   ///
   /// Useful when you want to enable -O LLVM opts but not -O SIL opts.
@@ -125,15 +129,16 @@ public:
   /// Controls whether cross module optimization is enabled.
   CrossModuleOptimizationMode CMOMode = CrossModuleOptimizationMode::Off;
 
-  /// Enables experimental performance annotations.
-  bool EnablePerformanceAnnotations = false;
-
   /// Enables the emission of stack protectors in functions.
   bool EnableStackProtection = true;
 
   /// Like `EnableStackProtection` and also enables moving of values to
   /// temporaries for stack protection.
   bool EnableMoveInoutStackProtection = false;
+
+  /// Enables codegen support for clang imported ptrauth qualified field
+  /// function pointers.
+  bool EnableImportPtrauthFieldFunctionPointers = false;
 
   /// Controls whether or not paranoid verification checks are run.
   bool VerifyAll = false;
@@ -168,6 +173,15 @@ public:
 
   /// If set to true, compile with the SIL Opaque Values enabled.
   bool EnableSILOpaqueValues = false;
+
+  /// Require linear OSSA lifetimes after SILGen
+  bool OSSACompleteLifetimes = false;
+
+  /// Enable pack metadata stack "promotion".
+  ///
+  /// More accurately, enable skipping mandatory heapification of pack metadata
+  /// when possible.
+  bool EnablePackMetadataStackPromotion = true;
 
   // The kind of function bodies to skip emitting.
   FunctionBodySkipping SkipFunctionBodies = FunctionBodySkipping::None;
@@ -262,6 +276,9 @@ public:
   /// is a single SILModule in a single thread.
   bool checkSILModuleLeaks = false;
 
+  /// Are we building in embedded Swift mode?
+  bool EmbeddedSwift = false;
+
   /// The name of the file to which the backend should save optimization
   /// records.
   std::string OptRecordFile;
@@ -278,6 +295,12 @@ public:
   /// Return a hash code of any components from these options that should
   /// contribute to a Swift Bridging PCH hash.
   llvm::hash_code getPCHHashComponents() const {
+    return llvm::hash_value(0);
+  }
+
+  /// Return a hash code of any components from these options that should
+  /// contribute to a Swift Dependency Scanning hash.
+  llvm::hash_code getModuleScanningHashComponents() const {
     return llvm::hash_value(0);
   }
 

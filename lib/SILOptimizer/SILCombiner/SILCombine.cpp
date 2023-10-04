@@ -24,7 +24,6 @@
 #include "swift/Basic/BridgingUtils.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SIL/DebugUtils.h"
-#include "swift/SIL/SILBridgingUtils.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILVisitor.h"
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
@@ -166,6 +165,7 @@ SILCombiner::SILCombiner(SILFunctionTransform *trans,
                          bool removeCondFails, bool enableCopyPropagation) :
   parentTransform(trans),
   AA(trans->getPassManager()->getAnalysis<AliasAnalysis>(trans->getFunction())),
+  CA(trans->getPassManager()->getAnalysis<BasicCalleeAnalysis>()),
   DA(trans->getPassManager()->getAnalysis<DominanceAnalysis>()),
   PCA(trans->getPassManager()->getAnalysis<ProtocolConformanceAnalysis>()),
   CHA(trans->getPassManager()->getAnalysis<ClassHierarchyAnalysis>()),
@@ -353,8 +353,9 @@ void SILCombiner::canonicalizeOSSALifetimes(SILInstruction *currentInst) {
   CanonicalizeOSSALifetime canonicalizer(
       false /*prune debug*/,
       !parentTransform->getFunction()->shouldOptimize() /*maximize lifetime*/,
-      NLABA, domTree, deleter);
-  CanonicalizeBorrowScope borrowCanonicalizer(deleter);
+      parentTransform->getFunction(), NLABA, domTree, CA, deleter);
+  CanonicalizeBorrowScope borrowCanonicalizer(parentTransform->getFunction(),
+                                              deleter);
 
   while (!defsToCanonicalize.empty()) {
     SILValue def = defsToCanonicalize.pop_back_val();
@@ -439,14 +440,15 @@ bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration) {
       // owned parameters since chains of these values will be in the same
       // block.
       if (auto *svi = dyn_cast<SingleValueInstruction>(I)) {
-        if ((isa<FirstArgOwnershipForwardingSingleValueInst>(svi) ||
-             isa<OwnershipForwardingConversionInst>(svi)) &&
-            SILValue(svi)->getOwnershipKind() == OwnershipKind::Owned) {
-          // Try to sink the value. If we sank the value and deleted it,
-          // continue. If we didn't optimize or sank but we are still able to
-          // optimize further, we fall through to SILCombine below.
-          if (trySinkOwnedForwardingInst(svi)) {
-            continue;
+        if (auto fwdOp = ForwardingOperation(svi)) {
+          if (fwdOp.getSingleForwardingOperand() &&
+              SILValue(svi)->getOwnershipKind() == OwnershipKind::Owned) {
+            // Try to sink the value. If we sank the value and deleted it,
+            // continue. If we didn't optimize or sank but we are still able to
+            // optimize further, we fall through to SILCombine below.
+            if (trySinkOwnedForwardingInst(svi)) {
+              continue;
+            }
           }
         }
       }
@@ -538,28 +540,28 @@ static llvm::StringMap<BridgedInstructionPassRunFn> swiftInstPasses;
 static bool passesRegistered = false;
 
 // Called from initializeSwiftModules().
-void SILCombine_registerInstructionPass(llvm::StringRef name,
+void SILCombine_registerInstructionPass(llvm::StringRef instClassName,
                                         BridgedInstructionPassRunFn runFn) {
-  swiftInstPasses[name] = runFn;
+  swiftInstPasses[instClassName] = runFn;
   passesRegistered = true;
 }
 
-#define SWIFT_INSTRUCTION_PASS_COMMON(INST, TAG, LEGACY_RUN) \
+#define SWIFT_SILCOMBINE_PASS(INST) \
 SILInstruction *SILCombiner::visit##INST(INST *inst) {                     \
   static BridgedInstructionPassRunFn runFunction = nullptr;                \
-  static bool runFunctionSet = false;                                      \
   static bool passDisabled = false;                                        \
-  if (!runFunctionSet) {                                                   \
-    runFunction = swiftInstPasses[TAG];                                    \
-    if (!runFunction && passesRegistered) {                                \
-      llvm::errs() << "Swift pass " << TAG << " is not registered\n";      \
-      abort();                                                             \
-    }                                                                      \
-    passDisabled = SILPassManager::isPassDisabled(TAG);                    \
-    runFunctionSet = true;                                                 \
-  }                                                                        \
   if (!runFunction) {                                                      \
-    LEGACY_RUN;                                                            \
+    runFunction = swiftInstPasses[#INST];                                  \
+    if (!runFunction) {                                                    \
+      if (passesRegistered) {                                              \
+        llvm::errs() << "Swift pass " << #INST << " is not registered\n";  \
+        abort();                                                           \
+      } else {                                                             \
+        return nullptr;                                                    \
+      }                                                                    \
+    }                                                                      \
+    StringRef instName = getSILInstructionName(SILInstructionKind::INST);  \
+    passDisabled = SILPassManager::isInstructionPassDisabled(instName);    \
   }                                                                        \
   if (passDisabled &&                                                      \
       SILPassManager::disablePassesForFunction(inst->getFunction())) {     \
@@ -571,12 +573,7 @@ SILInstruction *SILCombiner::visit##INST(INST *inst) {                     \
 
 #define PASS(ID, TAG, DESCRIPTION)
 
-#define SWIFT_INSTRUCTION_PASS(INST, TAG) \
-  SWIFT_INSTRUCTION_PASS_COMMON(INST, TAG, { return nullptr; })
-
 #include "swift/SILOptimizer/PassManager/Passes.def"
-
-#undef SWIFT_INSTRUCTION_PASS_COMMON
 
 //===----------------------------------------------------------------------===//
 //                                Entry Points
@@ -620,6 +617,10 @@ void SwiftPassInvocation::eraseInstruction(SILInstruction *inst) {
   if (silCombiner) {
     silCombiner->eraseInstFromFunction(*inst);
   } else {
-    inst->eraseFromParent();
+    if (inst->isStaticInitializerInst()) {
+      inst->getParent()->erase(inst, *getPassManager()->getModule());
+    } else {
+      inst->eraseFromParent();
+    }
   }
 }

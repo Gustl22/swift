@@ -57,9 +57,12 @@ public:
       AutoDiffDerivativeFunctionIdentifier *derivativeId) {
     beginManglingWithAutoDiffOriginalFunction(func);
     auto kind = Demangle::getAutoDiffFunctionKind(derivativeId->getKind());
+    auto *resultIndices =
+      autodiff::getFunctionSemanticResultIndices(func,
+                                                 derivativeId->getParameterIndices());
     AutoDiffConfig config(
         derivativeId->getParameterIndices(),
-        IndexSubset::get(func->getASTContext(), 1, {0}),
+        resultIndices,
         derivativeId->getDerivativeGenericSignature());
     appendAutoDiffFunctionParts("TJ", kind, config);
     appendOperator("Tj");
@@ -86,9 +89,12 @@ public:
       AutoDiffDerivativeFunctionIdentifier *derivativeId) {
     beginManglingWithAutoDiffOriginalFunction(func);
     auto kind = Demangle::getAutoDiffFunctionKind(derivativeId->getKind());
+    auto *resultIndices =
+      autodiff::getFunctionSemanticResultIndices(func,
+                                                 derivativeId->getParameterIndices());
     AutoDiffConfig config(
         derivativeId->getParameterIndices(),
-        IndexSubset::get(func->getASTContext(), 1, {0}),
+        resultIndices,
         derivativeId->getDerivativeGenericSignature());
     appendAutoDiffFunctionParts("TJ", kind, config);
     appendOperator("Tq");
@@ -633,6 +639,8 @@ public:
                                            CanType type,
                                            ProtocolConformanceRef conformance);
 
+  std::string mangleSymbolNameForMangledGetEnumTagForLayoutString(CanType type);
+
   std::string
   mangleSymbolNameForUnderlyingTypeAccessorString(OpaqueTypeDecl *opaque,
                                                   unsigned index);
@@ -642,6 +650,7 @@ public:
 
   std::string mangleSymbolNameForGenericEnvironment(
                                                 CanGenericSignature genericSig);
+
 protected:
   SymbolicMangling
   withSymbolicReferences(IRGenModule &IGM,

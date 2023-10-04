@@ -177,10 +177,6 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
     arguments.push_back("-aarch64-use-tbi");
   }
 
-  if (output.getPrimaryOutputType() == file_types::TY_SwiftModuleFile) {
-    arguments.push_back("-warn-on-potentially-unavailable-enum-case");
-  }
-
   // Enable or disable ObjC interop appropriately for the platform
   if (Triple.isOSDarwin()) {
     arguments.push_back("-enable-objc-interop");
@@ -210,6 +206,24 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
     arguments.push_back("-sdk");
     arguments.push_back(inputArgs.MakeArgString(OI.SDKPath));
   }
+
+  if (const Arg *A = inputArgs.getLastArg(options::OPT_windows_sdk_root)) {
+    arguments.push_back("-windows-sdk-root");
+    arguments.push_back(inputArgs.MakeArgString(A->getValue()));
+  }
+  if (const Arg *A = inputArgs.getLastArg(options::OPT_windows_sdk_version)) {
+    arguments.push_back("-windows-sdk-version");
+    arguments.push_back(inputArgs.MakeArgString(A->getValue()));
+  }
+  if (const Arg *A = inputArgs.getLastArg(options::OPT_visualc_tools_root)) {
+    arguments.push_back("-visualc-tools-root");
+    arguments.push_back(inputArgs.MakeArgString(A->getValue()));
+  }
+  if (const Arg *A = inputArgs.getLastArg(options::OPT_visualc_tools_version)) {
+    arguments.push_back("-visualc-tools-version");
+    arguments.push_back(inputArgs.MakeArgString(A->getValue()));
+  }
+
 
   if (llvm::sys::Process::StandardErrHasColors()) {
     arguments.push_back("-color-diagnostics");
@@ -252,6 +266,8 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   inputArgs.AddLastArg(arguments, options::OPT_module_cache_path);
   inputArgs.AddLastArg(arguments, options::OPT_module_link_name);
   inputArgs.AddLastArg(arguments, options::OPT_module_abi_name);
+  inputArgs.AddLastArg(arguments, options::OPT_package_name);
+  inputArgs.AddLastArg(arguments, options::OPT_export_as);
   inputArgs.AddLastArg(arguments, options::OPT_nostdimport);
   inputArgs.AddLastArg(arguments, options::OPT_parse_stdlib);
   inputArgs.AddLastArg(arguments, options::OPT_resource_dir);
@@ -302,7 +318,8 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   inputArgs.AddLastArg(arguments, options::OPT_library_level);
   inputArgs.AddLastArg(arguments, options::OPT_enable_bare_slash_regex);
   inputArgs.AddLastArg(arguments, options::OPT_enable_experimental_cxx_interop);
-  inputArgs.AddLastArg(arguments, options::OPT_load_plugin_library);
+  inputArgs.AddLastArg(arguments, options::OPT_cxx_interoperability_mode);
+  inputArgs.AddLastArg(arguments, options::OPT_enable_builtin_module);
 
   // Pass on any build config options
   inputArgs.AddAllArgs(arguments, options::OPT_D);
@@ -351,9 +368,24 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
     inputArgs.AddAllArgs(arguments, options::OPT_file_compilation_dir);
   }
 
+  // Specify default plugin search path options after explicitly specified
+  // options.
+  inputArgs.AddAllArgs(arguments, options::OPT_plugin_search_Group);
+  addPlatformSpecificPluginFrontendArgs(OI, output, inputArgs, arguments);
+
+  addPluginArguments(inputArgs, arguments);
+
   // Pass through any subsystem flags.
   inputArgs.AddAllArgs(arguments, options::OPT_Xllvm);
   inputArgs.AddAllArgs(arguments, options::OPT_Xcc);
+}
+
+void ToolChain::addPlatformSpecificPluginFrontendArgs(
+    const OutputInfo &OI,
+    const CommandOutput &output,
+    const llvm::opt::ArgList &inputArgs,
+    llvm::opt::ArgStringList &arguments) const {
+  // Overridden where necessary.
 }
 
 static void addRuntimeLibraryFlags(const OutputInfo &OI,
@@ -361,7 +393,7 @@ static void addRuntimeLibraryFlags(const OutputInfo &OI,
   if (!OI.RuntimeVariant)
     return;
 
-  const OutputInfo::MSVCRuntime RT = OI.RuntimeVariant.getValue();
+  const OutputInfo::MSVCRuntime RT = OI.RuntimeVariant.value();
 
   Arguments.push_back("-autolink-library");
   Arguments.push_back("oldnames");
@@ -619,7 +651,8 @@ ToolChain::constructInvocation(const CompileJobAction &job,
     context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph_dir);
   }
   context.Args.AddLastArg(Arguments, options::OPT_include_spi_symbols);
-  context.Args.AddLastArg(Arguments, options::OPT_emit_extension_block_symbols);
+  context.Args.AddLastArg(Arguments, options::OPT_emit_extension_block_symbols,
+                          options::OPT_omit_extension_block_symbols);
   context.Args.AddLastArg(Arguments, options::OPT_symbol_graph_minimum_access_level);
 
   return II;
@@ -701,6 +734,9 @@ const char *ToolChain::JobContext::computeFrontendModeForCompile() const {
   case file_types::TY_IndexUnitOutputPath:
   case file_types::TY_SwiftABIDescriptor:
   case file_types::TY_ConstValues:
+  case file_types::TY_SwiftFixIt:
+  case file_types::TY_ModuleSemanticInfo:
+  case file_types::TY_CachedDiagnostics:
     llvm_unreachable("Output type can never be primary output.");
   case file_types::TY_INVALID:
     llvm_unreachable("Invalid type ID");
@@ -962,6 +998,9 @@ ToolChain::constructInvocation(const BackendJobAction &job,
     case file_types::TY_IndexUnitOutputPath:
     case file_types::TY_SwiftABIDescriptor:
     case file_types::TY_ConstValues:
+    case file_types::TY_SwiftFixIt:
+    case file_types::TY_ModuleSemanticInfo:
+    case file_types::TY_CachedDiagnostics:
       llvm_unreachable("Output type can never be primary output.");
     case file_types::TY_INVALID:
       llvm_unreachable("Invalid type ID");
@@ -1116,7 +1155,8 @@ ToolChain::constructInvocation(const MergeModuleJobAction &job,
   context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph);
   context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph_dir);
   context.Args.AddLastArg(Arguments, options::OPT_include_spi_symbols);
-  context.Args.AddLastArg(Arguments, options::OPT_emit_extension_block_symbols);
+  context.Args.AddLastArg(Arguments, options::OPT_emit_extension_block_symbols,
+                          options::OPT_omit_extension_block_symbols);
   context.Args.AddLastArg(Arguments, options::OPT_symbol_graph_minimum_access_level);
 
   context.Args.AddLastArg(Arguments, options::OPT_import_objc_header);
@@ -1373,7 +1413,7 @@ void ToolChain::addPathEnvironmentVariableIfNeeded(
   }
   if (auto currentPaths = llvm::sys::Process::GetEnv(name)) {
     newPaths.append(separator);
-    newPaths.append(currentPaths.getValue());
+    newPaths.append(currentPaths.value());
   }
   env.emplace_back(name, args.MakeArgString(newPaths));
 }
@@ -1393,9 +1433,10 @@ void ToolChain::getClangLibraryPath(const ArgList &Args,
   getResourceDirPath(LibPath, Args, /*Shared=*/true);
   // Remove platform name.
   llvm::sys::path::remove_filename(LibPath);
-  llvm::sys::path::append(LibPath, "clang", "lib",
-                          T.isOSDarwin() ? "darwin"
-                                         : getPlatformNameForTriple(T));
+  StringRef platformName = "darwin";
+  if (!T.isOSDarwin())
+    platformName = T.isAndroid() ? "linux" : getPlatformNameForTriple(T);
+  llvm::sys::path::append(LibPath, "clang", "lib", platformName);
 }
 
 /// Get the runtime library link path, which is platform-specific and found
@@ -1453,7 +1494,8 @@ void ToolChain::getRuntimeLibraryPaths(SmallVectorImpl<std::string> &runtimeLibP
   if (!scratchPath.empty())
     runtimeLibPaths.push_back(std::string(scratchPath.str()));
 
-  if (!SDKPath.empty()) {
+  // Only Darwin places libraries directly in /sdk/usr/lib/swift/.
+  if (Triple.isOSDarwin() && !SDKPath.empty()) {
     if (!scratchPath.empty()) {
       // If we added the secondary resource dir, we also need the iOSSupport
       // directory.

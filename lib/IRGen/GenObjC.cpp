@@ -113,8 +113,8 @@ llvm::InlineAsm *IRGenModule::getObjCRetainAutoreleasedReturnValueMarker() {
   // Check to see if we've already computed the market.  Note that we
   // might have cached a null marker, and that's fine.
   auto &cache = ObjCRetainAutoreleasedReturnValueMarker;
-  if (cache.hasValue())
-    return cache.getValue();
+  if (cache.has_value())
+    return cache.value();
 
   // Ask the target for the string.
   StringRef asmString = TargetInfo.ObjCRetainAutoreleasedReturnValueMarker;
@@ -144,7 +144,7 @@ llvm::InlineAsm *IRGenModule::getObjCRetainAutoreleasedReturnValueMarker() {
     cache = llvm::InlineAsm::get(type, asmString, "", /*sideeffects*/ true);
   }
 
-  return cache.getValue();
+  return cache.value();
 }
 
 /// Reclaim an autoreleased return value.
@@ -193,7 +193,8 @@ namespace {
   public:
     UnknownTypeInfo(llvm::PointerType *storageType, Size size,
                  SpareBitVector spareBits, Alignment align)
-      : HeapTypeInfo(storageType, size, spareBits, align) {
+      : HeapTypeInfo(ReferenceCounting::Unknown, storageType, size, spareBits,
+                     align) {
     }
 
     /// AnyObject requires ObjC reference-counting.
@@ -222,8 +223,8 @@ namespace {
   public:
     BridgeObjectTypeInfo(llvm::PointerType *storageType, Size size,
                  SpareBitVector spareBits, Alignment align)
-      : HeapTypeInfo(storageType, size, spareBits, align) {
-    }
+      : HeapTypeInfo(ReferenceCounting::Bridge, storageType, size, spareBits,
+                     align) {}
 
     /// Builtin.BridgeObject uses its own specialized refcounting implementation.
     ReferenceCounting getReferenceCounting() const {
@@ -421,6 +422,18 @@ getProtocolRefsList(llvm::Constant *protocol) {
   if (objCProtocolList->isNullValue()) {
     return std::make_pair(0, nullptr);
   }
+
+  if (!protocol->getContext().supportsTypedPointers()) {
+    auto protocolRefsVar = cast<llvm::GlobalVariable>(objCProtocolList);
+    auto sizeListPair =
+        cast<llvm::ConstantStruct>(protocolRefsVar->getInitializer());
+    auto size =
+        cast<llvm::ConstantInt>(sizeListPair->getOperand(0))->getZExtValue();
+    auto protocolRefsList =
+        cast<llvm::ConstantArray>(sizeListPair->getOperand(1));
+    return std::make_pair(size, protocolRefsList);
+  }
+
   auto bitcast = cast<llvm::ConstantExpr>(objCProtocolList);
   assert(bitcast->getOpcode() == llvm::Instruction::BitCast);
   auto protocolRefsVar = cast<llvm::GlobalVariable>(bitcast->getOperand(0));
@@ -431,6 +444,19 @@ getProtocolRefsList(llvm::Constant *protocol) {
   auto protocolRefsList =
       cast<llvm::ConstantArray>(sizeListPair->getOperand(1));
   return std::make_pair(size, protocolRefsList);
+}
+
+static void appendNonRuntimeImpliedProtocols(
+  clang::ObjCProtocolDecl *proto,
+  llvm::SetVector<clang::ObjCProtocolDecl *> &nonRuntimeImpliedProtos) {
+
+  if (!proto->isNonRuntimeProtocol()) {
+    nonRuntimeImpliedProtos.insert(proto->getCanonicalDecl());
+    return;
+  }
+
+  for (auto *parent : proto->protocols())
+    appendNonRuntimeImpliedProtocols(parent, nonRuntimeImpliedProtos);
 }
 
 // Get runtime protocol list used during emission of objective-c protocol
@@ -454,23 +480,8 @@ getRuntimeProtocolList(clang::ObjCProtocolDecl::protocol_range protocols) {
   // Find the non-runtime implied protocols: protocols that occur in the closest
   // ancestry of a non-runtime protocol.
   llvm::SetVector<clang::ObjCProtocolDecl *> nonRuntimeImpliedProtos;
-  std::vector<clang::ObjCProtocolDecl *> worklist;
-  llvm::DenseSet<clang::ObjCProtocolDecl*> seen;
   for (auto *nonRuntimeProto : nonRuntimeProtocols) {
-    worklist.push_back(nonRuntimeProto);
-    while(!worklist.empty()) {
-       auto *item = worklist.back();
-       worklist.pop_back();
-       if (!seen.insert(item).second)
-         continue;
-
-       if (item->isNonRuntimeProtocol()) {
-         for (auto *parent : item->protocols())
-           worklist.push_back(parent);
-       } else {
-         nonRuntimeImpliedProtos.insert(item->getCanonicalDecl());
-       }
-    }
+    appendNonRuntimeImpliedProtocols(nonRuntimeProto, nonRuntimeImpliedProtos);
   }
 
   // Subtract the implied protocols of the runtime protocols and non runtime
@@ -505,13 +516,16 @@ static void updateProtocolRefs(IRGenModule &IGM,
   assert(clangImporter && "Must have a clang importer");
 
   // Get the array containining the protocol refs.
-  unsigned protocolRefsSize;
-  llvm::ConstantArray *protocolRefs;
-  std::tie(protocolRefsSize, protocolRefs) = getProtocolRefsList(protocol);
+  unsigned protocolRefsSize = getProtocolRefsList(protocol).first;
   unsigned currentIdx = 0;
   auto inheritedObjCProtocols = getRuntimeProtocolList(objcProtocol->protocols());
   for (auto inheritedObjCProtocol : inheritedObjCProtocols) {
     assert(currentIdx < protocolRefsSize);
+
+    // Getting the `protocolRefs` constant must not be hoisted out of the loop
+    // because this constant might be deleted by
+    // `oldVar->replaceAllUsesWith(newOpd)` below.
+    llvm::ConstantArray *protocolRefs = getProtocolRefsList(protocol).second;
     auto oldVar = protocolRefs->getOperand(currentIdx);
     // Map the objc protocol to swift protocol.
     auto optionalDecl = clangImporter->importDeclCached(inheritedObjCProtocol);
@@ -526,8 +540,11 @@ static void updateProtocolRefs(IRGenModule &IGM,
     auto record = IGM.getAddrOfObjCProtocolRecord(inheritedSwiftProtocol,
                                                   NotForDefinition);
     auto newOpd = llvm::ConstantExpr::getBitCast(record, oldVar->getType());
-    if (newOpd != oldVar)
-      oldVar->replaceAllUsesWith(newOpd);
+    if (newOpd != oldVar) {
+      oldVar->replaceUsesWithIf(newOpd, [protocol](llvm::Use &U) -> bool {
+                                return U.getUser() == getProtocolRefsList(protocol).second;
+                                });
+    }
     ++currentIdx;
   }
   assert(currentIdx == protocolRefsSize);
@@ -817,10 +834,8 @@ Callee irgen::getObjCMethodCallee(IRGenFunction &IGF,
 
 Callee irgen::getObjCDirectMethodCallee(CalleeInfo &&info, const FunctionPointer &fn,
                                         llvm::Value *selfValue) {
-  // Direct calls to Objective-C methods have a selector value of `undef`.
-  auto selectorType = fn.getFunctionType()->getParamType(1);
-  auto selectorValue = llvm::UndefValue::get(selectorType);
-  return Callee(std::move(info), fn, selfValue, selectorValue);
+  // Direct calls to Objective-C methods don't have a selector value.
+  return Callee(std::move(info), fn, selfValue, nullptr);
 }
 
 /// Call [self allocWithZone: nil].
@@ -889,6 +904,7 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
     case ResultConvention::Unowned:
     case ResultConvention::Owned:
     case ResultConvention::Autoreleased:
+    case ResultConvention::Pack:
       lifetimeExtendsSelf = false;
       break;
     }
@@ -908,9 +924,11 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
     break;
   case ParameterConvention::Indirect_In_Guaranteed:
   case ParameterConvention::Indirect_In:
-  case ParameterConvention::Indirect_In_Constant:
   case ParameterConvention::Indirect_Inout:
   case ParameterConvention::Indirect_InoutAliasable:
+  case ParameterConvention::Pack_Guaranteed:
+  case ParameterConvention::Pack_Owned:
+  case ParameterConvention::Pack_Inout:
     llvm_unreachable("self passed indirectly?!");
   }
   
@@ -919,7 +937,7 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
   llvm::Value *context = params.takeLast();
   Address dataAddr = layout.emitCastTo(subIGF, context);
   auto &fieldLayout = layout.getElement(0);
-  Address selfAddr = fieldLayout.project(subIGF, dataAddr, None);
+  Address selfAddr = fieldLayout.project(subIGF, dataAddr, llvm::None);
   Explosion selfParams;
   if (retainsSelf)
     cast<LoadableTypeInfo>(selfTI).loadAsCopy(subIGF, selfAddr, selfParams);
@@ -991,7 +1009,7 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
     assert(nativeParam.empty());
 
     // Pass along the value.
-    ti.reexplode(subIGF, nonNativeParam, translatedParams);
+    ti.reexplode(nonNativeParam, translatedParams);
   }
 
   // Prepare the call to the underlying method.
@@ -1059,7 +1077,7 @@ void irgen::emitObjCPartialApplication(IRGenFunction &IGF,
   llvm::Value *data = IGF.emitUnmanagedAlloc(layout, "closure",
                                              Descriptor);
   // FIXME: non-fixed offsets
-  NonFixedOffsets offsets = None;
+  NonFixedOffsets offsets = llvm::None;
   Address dataAddr = layout.emitCastTo(IGF, data);
   auto &fieldLayout = layout.getElement(0);
   auto &fieldType = layout.getElementTypes()[0];

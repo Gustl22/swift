@@ -58,7 +58,7 @@ const uint16_t SWIFTMODULE_VERSION_MAJOR = 0;
 /// describe what change you made. The content of this comment isn't important;
 /// it just ensures a conflict if two people change the module format.
 /// Don't worry about adhering to the 80-column limit for this line.
-const uint16_t SWIFTMODULE_VERSION_MINOR = 722; // has_symbol SIL serialization
+const uint16_t SWIFTMODULE_VERSION_MINOR = 810; // access enforcement
 
 /// A standard hash seed used for all string hashes in a serialized module.
 ///
@@ -109,16 +109,16 @@ public:
     return rawValue != 0;
   }
 
-  Optional<DeclID> getAsDeclID() const {
+  llvm::Optional<DeclID> getAsDeclID() const {
     if (rawValue > 0)
       return DeclID(rawValue);
-    return None;
+    return llvm::None;
   }
 
-  Optional<LocalDeclContextID> getAsLocalDeclContextID() const {
+  llvm::Optional<LocalDeclContextID> getAsLocalDeclContextID() const {
     if (rawValue < 0)
       return LocalDeclContextID(-rawValue);
-    return None;
+    return llvm::None;
   }
 
   static DeclContextID getFromOpaqueValue(uint32_t opaqueValue) {
@@ -139,6 +139,21 @@ public:
 // in the same way.
 using ProtocolConformanceID = DeclID;
 using ProtocolConformanceIDField = DeclIDField;
+
+// The low two bits of the ProtocolConformanceID determine the kind:
+// 00 -- abstract conformance
+// 01 -- concrete conformance
+// 10 -- pack conformance
+struct SerializedProtocolConformanceKind {
+  enum  {
+    Abstract = 0,
+    Concrete = 1,
+    Pack = 2,
+
+    Shift = 2,
+    Mask = 3
+  };
+};
 
 // GenericSignatureID must be the same as DeclID because it is stored in the
 // same way.
@@ -281,8 +296,12 @@ enum class SILFunctionTypeRepresentation : uint8_t {
   WitnessMethod,
   Closure,
   CXXMethod,
+  KeyPathAccessorGetter,
+  KeyPathAccessorSetter,
+  KeyPathAccessorEquals,
+  KeyPathAccessorHash,
 };
-using SILFunctionTypeRepresentationField = BCFixed<4>;
+using SILFunctionTypeRepresentationField = BCFixed<5>;
 
 // These IDs must \em not be renumbered or reordered without incrementing
 // the module version.
@@ -315,6 +334,7 @@ enum AccessorKind : uint8_t {
   MutableAddress,
   Read,
   Modify,
+  Init,
 };
 using AccessorKindField = BCFixed<4>;
 
@@ -335,18 +355,21 @@ using CtorInitializerKindField = BCFixed<2>;
 enum class ParamDeclSpecifier : uint8_t {
   Default = 0,
   InOut = 1,
-  Shared = 2,
-  Owned = 3,
+  Borrowing = 2,
+  Consuming = 3,
+  LegacyShared = 4,
+  LegacyOwned = 5,
 };
-using ParamDeclSpecifierField = BCFixed<2>;
+using ParamDeclSpecifierField = BCFixed<3>;
 
 // These IDs must \em not be renumbered or reordered without incrementing
 // the module version.
 enum class VarDeclIntroducer : uint8_t {
   Let = 0,
-  Var = 1
+  Var = 1,
+  InOut = 2,
 };
-using VarDeclIntroducerField = BCFixed<1>;
+using VarDeclIntroducerField = BCFixed<2>;
 
 // These IDs must \em not be renumbered or reordered without incrementing
 // the module version.
@@ -359,6 +382,9 @@ enum class ParameterConvention : uint8_t {
   Direct_Guaranteed,
   Indirect_In_Guaranteed,
   Indirect_In_Constant,
+  Pack_Owned,
+  Pack_Inout,
+  Pack_Guaranteed,
 };
 using ParameterConventionField = BCFixed<4>;
 
@@ -377,6 +403,7 @@ enum class ResultConvention : uint8_t {
   Unowned,
   UnownedInnerPointer,
   Autoreleased,
+  Pack,
 };
 using ResultConventionField = BCFixed<3>;
 
@@ -399,9 +426,11 @@ using MetatypeRepresentationField = BCFixed<2>;
 enum class SelfAccessKind : uint8_t {
   NonMutating = 0,
   Mutating,
+  LegacyConsuming,
   Consuming,
+  Borrowing
 };
-using SelfAccessKindField = BCFixed<2>;
+using SelfAccessKindField = BCFixed<3>;
   
 /// Translates an operator decl fixity to a Serialization fixity, whose values
 /// are guaranteed to be stable.
@@ -478,16 +507,6 @@ using ReferenceOwnershipField = BCFixed<2>;
 
 // These IDs must \em not be renumbered or reordered without incrementing
 // the module version.
-enum ValueOwnership : uint8_t {
-  Default = 0,
-  InOut,
-  Shared,
-  Owned
-};
-using ValueOwnershipField = BCFixed<2>;
-
-// These IDs must \em not be renumbered or reordered without incrementing
-// the module version.
 enum class DefaultArgumentKind : uint8_t {
   None = 0,
   Normal,
@@ -521,6 +540,7 @@ enum class AccessLevel : uint8_t {
   Private = 0,
   FilePrivate,
   Internal,
+  Package,
   Public,
   Open,
 };
@@ -583,10 +603,14 @@ enum class ImportControl : uint8_t {
   Normal = 0,
   /// `@_exported import FooKit`
   Exported,
-  /// `@_uncheckedImplementationOnly import FooKit`
-  ImplementationOnly
+  /// `@_implementationOnly import FooKit`
+  ImplementationOnly,
+  /// `internal import FooKit` or more restrictive.
+  InternalOrBelow,
+  /// `package import FooKit`
+  PackageOnly,
 };
-using ImportControlField = BCFixed<2>;
+using ImportControlField = BCFixed<3>;
 
 // These IDs must \em not be renumbered or reordered without incrementing
 // the module version.
@@ -604,6 +628,43 @@ enum class GenericEnvironmentKind : uint8_t {
   OpenedExistential,
   OpenedElement
 };
+
+// These IDs must \em not be renumbered or reordered without incrementing
+// the module version.
+enum class MacroRole : uint8_t {
+  Expression,
+  Declaration,
+  Accessor,
+  MemberAttribute,
+  Member,
+  Peer,
+  Conformance,
+  CodeItem,
+  Extension,
+};
+using MacroRoleField = BCFixed<4>;
+
+// These IDs must \em not be renumbered or reordered without incrementing
+// the module version.
+enum class MacroIntroducedDeclNameKind : uint8_t {
+  Named = 0,
+  Overloaded,
+  Accessors,
+  Prefixed,
+  Suffixed,
+  Arbitrary,
+};
+using MacroIntroducedDeclNameKindField = BCFixed<4>;
+
+// These IDs must \em not be renumbered or reordered without incrementing
+// the module version.
+enum class PluginSearchOptionKind : uint8_t {
+  PluginPath,
+  ExternalPluginPath,
+  LoadPluginLibrary,
+  LoadPluginExecutable,
+};
+using PluginSearchOptionKindField = BCFixed<3>;
 
 // Encodes a VersionTuple:
 //
@@ -634,13 +695,13 @@ enum class GenericEnvironmentKind : uint8_t {
     unsigned X##_Major = 0, X##_Minor = 0, X##_Subminor = 0,\
              X##_HasMinor = 0, X##_HasSubminor = 0;\
     const auto &X##_Val = X_Expr;\
-    if (X##_Val.hasValue()) {\
-      const auto &Y = X##_Val.getValue();\
+    if (X##_Val.has_value()) {\
+      const auto &Y = X##_Val.value();\
       X##_Major = Y.getMajor();\
-      X##_Minor = Y.getMinor().getValueOr(0);\
-      X##_Subminor = Y.getSubminor().getValueOr(0);\
-      X##_HasMinor = Y.getMinor().hasValue();\
-      X##_HasSubminor = Y.getSubminor().hasValue();\
+      X##_Minor = Y.getMinor().value_or(0);\
+      X##_Subminor = Y.getSubminor().value_or(0);\
+      X##_HasMinor = Y.getMinor().has_value();\
+      X##_HasSubminor = Y.getSubminor().has_value();\
     }
 
 /// The various types of blocks that can occur within a serialized Swift
@@ -769,7 +830,8 @@ namespace control_block {
     TARGET,
     SDK_NAME,
     REVISION,
-    IS_OSSA
+    IS_OSSA,
+    ALLOWABLE_CLIENT_NAME
   };
 
   using MetadataLayout = BCRecordLayout<
@@ -809,6 +871,11 @@ namespace control_block {
     IS_OSSA,
     BCFixed<1>
   >;
+
+  using AllowableClientLayout = BCRecordLayout<
+    ALLOWABLE_CLIENT_NAME,
+    BCBlob
+  >;
 }
 
 /// The record types within the options block (a sub-block of the control
@@ -822,6 +889,7 @@ namespace options_block {
     IS_SIB,
     IS_STATIC_LIBRARY,
     HAS_HERMETIC_SEAL_AT_LINK,
+    IS_EMBEDDED_SWIFT_MODULE,
     IS_TESTABLE,
     RESILIENCE_STRATEGY,
     ARE_PRIVATE_IMPORTS_ENABLED,
@@ -830,6 +898,10 @@ namespace options_block {
     IS_ALLOW_MODULE_WITH_COMPILER_ERRORS_ENABLED,
     MODULE_ABI_NAME,
     IS_CONCURRENCY_CHECKED,
+    MODULE_PACKAGE_NAME,
+    MODULE_EXPORT_AS_NAME,
+    PLUGIN_SEARCH_OPTION,
+    HAS_CXX_INTEROPERABILITY_ENABLED,
   };
 
   using SDKPathLayout = BCRecordLayout<
@@ -840,6 +912,12 @@ namespace options_block {
   using XCCLayout = BCRecordLayout<
     XCC,
     BCBlob // -Xcc flag, as string
+  >;
+
+  using PluginSearchOptionLayout = BCRecordLayout<
+    PLUGIN_SEARCH_OPTION,
+    PluginSearchOptionKindField, // kind
+    BCBlob                       // option value string
   >;
 
   using IsSIBLayout = BCRecordLayout<
@@ -853,6 +931,10 @@ namespace options_block {
 
   using HasHermeticSealAtLinkLayout = BCRecordLayout<
     HAS_HERMETIC_SEAL_AT_LINK
+  >;
+
+  using IsEmbeddedSwiftModuleLayout = BCRecordLayout<
+    IS_EMBEDDED_SWIFT_MODULE
   >;
 
   using IsTestableLayout = BCRecordLayout<
@@ -887,6 +969,20 @@ namespace options_block {
 
   using IsConcurrencyCheckedLayout = BCRecordLayout<
     IS_CONCURRENCY_CHECKED
+  >;
+
+  using ModulePackageNameLayout = BCRecordLayout<
+    MODULE_PACKAGE_NAME,
+    BCBlob
+  >;
+
+  using ModuleExportAsNameLayout = BCRecordLayout<
+    MODULE_EXPORT_AS_NAME,
+    BCBlob
+  >;
+
+  using HasCxxInteroperabilityEnabledLayout = BCRecordLayout<
+    HAS_CXX_INTEROPERABILITY_ENABLED
   >;
 }
 
@@ -1097,6 +1193,7 @@ namespace decls_block {
     BCFixed<1>,                      // concurrent?
     BCFixed<1>,                      // async?
     BCFixed<1>,                      // throws?
+    TypeIDField,                     // thrown error
     DifferentiabilityKindField,      // differentiability kind
     TypeIDField                      // global actor
     // trailed by parameters
@@ -1110,7 +1207,7 @@ namespace decls_block {
     BCFixed<1>,          // vararg?
     BCFixed<1>,          // autoclosure?
     BCFixed<1>,          // non-ephemeral?
-    ValueOwnershipField, // inout, shared or owned?
+    ParamDeclSpecifierField, // inout, shared or owned?
     BCFixed<1>,          // isolated
     BCFixed<1>,          // noDerivative?
     BCFixed<1>           // compileTimeConst
@@ -1190,6 +1287,7 @@ namespace decls_block {
     BCFixed<1>,                      // concurrent?
     BCFixed<1>,                      // async?
     BCFixed<1>,                      // throws?
+    TypeIDField,                     // thrown error
     DifferentiabilityKindField,      // differentiability kind
     TypeIDField,                     // global actor
     GenericSignatureIDField          // generic signature
@@ -1206,6 +1304,7 @@ namespace decls_block {
     SILFunctionTypeRepresentationField, // representation
     BCFixed<1>,                         // pseudogeneric?
     BCFixed<1>,                         // noescape?
+    BCFixed<1>,                         // unimplementable?
     DifferentiabilityKindField,         // differentiability kind
     BCFixed<1>,                         // error result?
     BCVBR<6>,                           // number of parameters
@@ -1278,14 +1377,22 @@ namespace decls_block {
     TypeIDField  // count type
   );
 
-  TYPE_LAYOUT(PackTypeLayout,
-    PACK_TYPE
+  TYPE_LAYOUT(PackElementTypeLayout,
+    PACK_ELEMENT_TYPE,
+    TypeIDField,  // pack type
+    BCFixed<32>   // level
   );
 
-  using PackTypeEltLayout = BCRecordLayout<
-    PACK_TYPE_ELT,
-    TypeIDField         // type
-  >;
+  TYPE_LAYOUT(PackTypeLayout,
+    PACK_TYPE,
+    BCArray<TypeIDField>  // component types
+  );
+
+  TYPE_LAYOUT(SILPackTypeLayout,
+    SIL_PACK_TYPE,
+    BCFixed<1>,         // is address
+    BCArray<TypeIDField>// component types
+  );
 
   using TypeAliasLayout = BCRecordLayout<
     TYPE_ALIAS_DECL,
@@ -1400,9 +1507,11 @@ namespace decls_block {
     BCFixed<1>,  // stub implementation?
     BCFixed<1>,  // async?
     BCFixed<1>,  // throws?
+    TypeIDField,  // thrown error
     CtorInitializerKindField,  // initializer kind
     GenericSignatureIDField, // generic environment
     DeclIDField, // overridden decl
+    BCFixed<1>,   // whether the overridden decl affects ABI
     AccessLevelField, // access level
     BCFixed<1>,   // requires a new vtable slot
     BCFixed<1>,   // 'required' but overridden is not (used for recovery)
@@ -1473,6 +1582,7 @@ namespace decls_block {
     BCFixed<1>,   // has forced static dispatch?
     BCFixed<1>,   // async?
     BCFixed<1>,   // throws?
+    TypeIDField,  // thrown error
     GenericSignatureIDField, // generic environment
     TypeIDField,  // result interface type
     BCFixed<1>,   // IUO result?
@@ -1534,6 +1644,7 @@ namespace decls_block {
     BCFixed<1>,   // has forced static dispatch?
     BCFixed<1>,   // async?
     BCFixed<1>,   // throws?
+    TypeIDField,  // thrown error
     GenericSignatureIDField, // generic environment
     TypeIDField,  // result interface type
     BCFixed<1>,   // IUO result?
@@ -1662,6 +1773,42 @@ namespace decls_block {
     // This record is trailed by its inlinable body text
   >;
 
+  using MacroLayout = BCRecordLayout<
+    MACRO_DECL,
+    DeclContextIDField,  // context decl
+    BCFixed<1>,   // implicit?
+    GenericSignatureIDField, // generic environment
+    BCFixed<1>,   // whether there is a parameter list
+    TypeIDField,  // result interface type
+    AccessLevelField, // access level
+    BCVBR<5>,    // number of parameter name components
+    BCVBR<3>,    // builtin macro definition ID
+    BCFixed<1>,  // whether it has an expanded macro definition
+    IdentifierIDField, // external module name, for external macros
+    IdentifierIDField,  // external type name, for external macros
+    BCArray<IdentifierIDField> // name components,
+                               // followed by TypeID dependencies
+    // The record is trailed by:
+    // - its generic parameters, if any
+    // - parameter list, if present
+    // - expanded macro definition, if needed.
+  >;
+
+  /// The expanded macro definition text.
+  using ExpandedMacroDefinitionLayout = BCRecordLayout<
+    EXPANDED_MACRO_DEFINITION,
+    BCFixed<1>, // whether it has replacements
+    BCBlob // expansion text
+    // potentially trailed by the expanded macro replacements
+  >;
+
+  /// The replacements to be performed for an expanded macro definition.
+  using ExpandedMacroReplacementsLayout = BCRecordLayout<
+    EXPANDED_MACRO_REPLACEMENTS,
+    BCArray<BCVBR<6>> // a set of replacement triples (start offset,
+                      // end offset, parameter index)
+  >;
+
   using InlinableBodyTextLayout = BCRecordLayout<
     INLINABLE_BODY_TEXT,
     BCBlob // body text
@@ -1728,8 +1875,9 @@ namespace decls_block {
   using GenericEnvironmentLayout = BCRecordLayout<
     GENERIC_ENVIRONMENT,
     BCFixed<1>,                  // GenericEnvironmentKind
-    TypeIDField,                 // existential type
-    GenericSignatureIDField      // parent signature
+    TypeIDField,                 // existential type or shape class
+    GenericSignatureIDField,     // parent signature
+    SubstitutionMapIDField       // substitution map
   >;
 
   using SubstitutionMapLayout = BCRecordLayout<
@@ -1777,6 +1925,11 @@ namespace decls_block {
     IdentifierIDField  // the file name, as an identifier
   >;
 
+  using DeserializationSafetyLayout = BCRecordLayout<
+    DESERIALIZATION_SAFETY,
+    IdentifierIDField // name to debug access to unsafe decl
+  >;
+
   using NormalProtocolConformanceLayout = BCRecordLayout<
     NORMAL_PROTOCOL_CONFORMANCE,
     DeclIDField, // the protocol
@@ -1812,9 +1965,14 @@ namespace decls_block {
     BUILTIN_PROTOCOL_CONFORMANCE,
     TypeIDField, // the conforming type
     DeclIDField, // the protocol
-    GenericSignatureIDField, // the generic signature
-    BCFixed<2>, // the builtin conformance kind
-    BCArray<BCVBR<6>> // conditional requirements
+    BCFixed<2>  // the builtin conformance kind
+  >;
+
+  using PackConformanceLayout = BCRecordLayout<
+    PACK_CONFORMANCE,
+    TypeIDField,                         // pattern type
+    DeclIDField,                         // the protocol
+    BCArray<ProtocolConformanceIDField>  // pattern conformances
   >;
 
   using ProtocolConformanceXrefLayout = BCRecordLayout<
@@ -1892,6 +2050,12 @@ namespace decls_block {
     BCBlob      // _silgen_name
   >;
 
+  using SectionDeclAttrLayout = BCRecordLayout<
+    Section_DECL_ATTR,
+    BCFixed<1>, // implicit flag
+    BCBlob      // _section
+  >;
+
   using CDeclDeclAttrLayout = BCRecordLayout<
     CDecl_DECL_ATTR,
     BCFixed<1>, // implicit flag
@@ -1907,6 +2071,14 @@ namespace decls_block {
     Alignment_DECL_ATTR,
     BCFixed<1>, // implicit flag
     BCVBR<8>    // alignment
+  >;
+  
+  using RawLayoutDeclAttrLayout = BCRecordLayout<
+    RawLayout_DECL_ATTR,
+    BCFixed<1>, // implicit
+    TypeIDField, // like type
+    BCVBR<32>, // size
+    BCVBR<8> // alignment
   >;
   
   using SwiftNativeObjCRuntimeBaseDeclAttrLayout = BCRecordLayout<
@@ -2075,6 +2247,12 @@ namespace decls_block {
       BCArray<IdentifierIDField> // target function pieces, spi groups, type erased params
       >;
 
+  using StorageRestrictionsDeclAttrLayout = BCRecordLayout<
+      StorageRestrictions_DECL_ATTR,
+      BCVBR<16>, // num "initializes" properties
+      BCArray<IdentifierIDField> // properties
+  >;
+
   using DifferentiableDeclAttrLayout = BCRecordLayout<
     Differentiable_DECL_ATTR,
     BCFixed<1>, // Implicit flag.
@@ -2136,14 +2314,15 @@ namespace decls_block {
     BCBlob      // Message
   >;
 
-  using BackDeployDeclAttrLayout = BCRecordLayout<
-    BackDeploy_DECL_ATTR,
+  using BackDeployedDeclAttrLayout = BCRecordLayout<
+    BackDeployed_DECL_ATTR,
     BCFixed<1>,     // implicit flag
     BC_AVAIL_TUPLE, // OS version
     BCVBR<5>        // platform
   >;
 
   using ExposeDeclAttrLayout = BCRecordLayout<Expose_DECL_ATTR,
+                                              BCFixed<1>, // exposure kind
                                               BCFixed<1>, // implicit flag
                                               BCBlob      // declaration name
                                               >;
@@ -2154,6 +2333,21 @@ namespace decls_block {
     IdentifierIDField,  // metadata text
     BCFixed<1>,         // has visibility
     AccessLevelField    // visibility
+  >;
+
+  using MacroRoleDeclAttrLayout = BCRecordLayout<
+    MacroRole_DECL_ATTR,
+    BCFixed<1>,                // implicit flag
+    BCFixed<1>,                // macro syntax
+    MacroRoleField,            // macro role
+    BCVBR<5>,                  // number of names
+    BCVBR<5>,                  // number of conformances
+    BCArray<IdentifierIDField> // introduced names, where each is encoded as
+                               //   - introduced kind
+                               //   - base name
+                               //   - # of argument labels + 1 (or 0 if none)
+                               //   - argument labels
+                               // trialed by introduced conformances
   >;
 
 #undef SYNTAX_SUGAR_TYPE_LAYOUT
@@ -2193,6 +2387,8 @@ static inline decls_block::RecordKind getKindForTable(const Decl *D) {
     return decls_block::CONSTRUCTOR_DECL;
   case DeclKind::Destructor:
     return decls_block::DESTRUCTOR_DECL;
+  case DeclKind::Macro:
+    return decls_block::MACRO_DECL;
 
   default:
     llvm_unreachable("cannot store this kind of decl in a hash table");
@@ -2240,6 +2436,7 @@ namespace index_block {
     GENERIC_SIGNATURE_OFFSETS,
     GENERIC_ENVIRONMENT_OFFSETS,
     PROTOCOL_CONFORMANCE_OFFSETS,
+    PACK_CONFORMANCE_OFFSETS,
     SIL_LAYOUT_OFFSETS,
 
     PRECEDENCE_GROUPS,

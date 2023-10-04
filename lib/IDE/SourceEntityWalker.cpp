@@ -10,7 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/IDE/SourceEntityWalker.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Decl.h"
@@ -20,12 +19,15 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Parse/Lexer.h"
 #include "clang/Basic/Module.h"
+#include "swift/IDE/SourceEntityWalker.h"
+#include "swift/IDE/Utils.h"
 
 using namespace swift;
 
@@ -37,7 +39,7 @@ class SemaAnnotator : public ASTWalker {
   SmallVector<ExtensionDecl *, 2> ExtDecls;
   llvm::SmallDenseMap<OpaqueValueExpr *, Expr *, 4> OpaqueValueMap;
   llvm::SmallPtrSet<Expr *, 16> ExprsToSkip;
-  Optional<AccessKind> OpAccess;
+  llvm::Optional<AccessKind> OpAccess;
 
 public:
   explicit SemaAnnotator(SourceEntityWalker &SEWalker)
@@ -54,6 +56,10 @@ private:
 
   bool shouldWalkSerializedTopLevelInternalDecls() override {
     return false;
+  }
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return SEWalker.getMacroWalkingBehavior();
   }
 
   PreWalkAction walkToDeclPre(Decl *D) override;
@@ -93,19 +99,6 @@ private:
   bool passCallArgNames(Expr *Fn, ArgumentList *ArgList);
 
   bool shouldIgnore(Decl *D);
-
-  ValueDecl *extractDecl(Expr *Fn) const {
-    Fn = Fn->getSemanticsProvidingExpr();
-    if (auto *DRE = dyn_cast<DeclRefExpr>(Fn))
-      return DRE->getDecl();
-    if (auto ApplyE = dyn_cast<ApplyExpr>(Fn))
-      return extractDecl(ApplyE->getFn());
-    if (auto *ACE = dyn_cast<AutoClosureExpr>(Fn)) {
-      if (auto *Unwrapped = ACE->getUnwrappedCurryThunkExpr())
-        return extractDecl(Unwrapped);
-    }
-    return nullptr;
-  }
 };
 
 } // end anonymous namespace
@@ -182,7 +175,7 @@ ASTWalker::PreWalkAction SemaAnnotator::walkToDeclPreProper(Decl *D) {
           auto Continue = passReference(
               assocTypeDecl, assocTypeDecl->getDeclaredInterfaceType(),
               DeclNameLoc(loc),
-              ReferenceMetaData(SemaReferenceKind::TypeRef, None));
+              ReferenceMetaData(SemaReferenceKind::TypeRef, llvm::None));
           if (!Continue)
             return Action::Stop();
         }
@@ -219,6 +212,15 @@ ASTWalker::PreWalkAction SemaAnnotator::walkToDeclPreProper(Decl *D) {
       }
       return Action::SkipChildren();
     }
+  } else if (auto *MD = dyn_cast<MacroExpansionDecl>(D)) {
+    if (auto *macro =
+            dyn_cast_or_null<MacroDecl>(MD->getMacroRef().getDecl())) {
+      auto macroRefType = macro->getDeclaredInterfaceType();
+      if (!passReference(
+              macro, macroRefType, MD->getMacroNameLoc(),
+              ReferenceMetaData(SemaReferenceKind::DeclRef, llvm::None)))
+        return Action::Stop();
+    }
   }
 
   CharSourceRange Range = (Loc.isValid()) ? CharSourceRange(Loc, NameLen)
@@ -235,6 +237,22 @@ ASTWalker::PreWalkAction SemaAnnotator::walkToDeclPreProper(Decl *D) {
 ASTWalker::PostWalkAction SemaAnnotator::walkToDeclPost(Decl *D) {
   auto Action = walkToDeclPostProper(D);
   SEWalker.endBalancedASTOrderDeclVisit(D);
+
+  if (Action.Action == PostWalkAction::Stop)
+    return Action;
+
+  // Walk into peer and conformance expansions if walking expansions
+  if (shouldWalkMacroArgumentsAndExpansion().second) {
+    D->visitAuxiliaryDecls([&](Decl *auxDecl) {
+      if (Action.Action == PostWalkAction::Stop)
+        return;
+
+      if (auxDecl->walk(*this)) {
+        Action = Action::Stop();
+      }
+    }, /*visitFreestandingExpanded=*/false);
+  }
+
   return Action;
 }
 
@@ -402,7 +420,7 @@ ASTWalker::PreWalkResult<Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
     {
       // This could be made more accurate if the member is nonmutating,
       // or whatever.
-      Optional<AccessKind> NewOpAccess;
+      llvm::Optional<AccessKind> NewOpAccess;
       if (OpAccess) {
         if (*OpAccess == AccessKind::Write)
           NewOpAccess = AccessKind::ReadWrite;
@@ -410,8 +428,8 @@ ASTWalker::PreWalkResult<Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
           NewOpAccess = OpAccess;
       }
 
-      llvm::SaveAndRestore<Optional<AccessKind>>
-        C(this->OpAccess, NewOpAccess);
+      llvm::SaveAndRestore<llvm::Optional<AccessKind>> C(this->OpAccess,
+                                                         NewOpAccess);
 
       // Visit in source order.
       if (!MRE->getBase()->walk(*this))
@@ -506,8 +524,8 @@ ASTWalker::PreWalkResult<Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
     // We already visited the children.
     return doSkipChildren();
   } else if (auto IOE = dyn_cast<InOutExpr>(E)) {
-    llvm::SaveAndRestore<Optional<AccessKind>>
-      C(this->OpAccess, AccessKind::ReadWrite);
+    llvm::SaveAndRestore<llvm::Optional<AccessKind>> C(this->OpAccess,
+                                                       AccessKind::ReadWrite);
 
     if (!IOE->getSubExpr()->walk(*this))
       return Action::Stop();
@@ -515,8 +533,8 @@ ASTWalker::PreWalkResult<Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
     // We already visited the children.
     return doSkipChildren();
   } else if (auto LE = dyn_cast<LoadExpr>(E)) {
-    llvm::SaveAndRestore<Optional<AccessKind>>
-      C(this->OpAccess, AccessKind::Read);
+    llvm::SaveAndRestore<llvm::Optional<AccessKind>> C(this->OpAccess,
+                                                       AccessKind::Read);
 
     if (!LE->getSubExpr()->walk(*this))
       return Action::Stop();
@@ -525,8 +543,8 @@ ASTWalker::PreWalkResult<Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
     return doSkipChildren();
   } else if (auto AE = dyn_cast<AssignExpr>(E)) {
     {
-      llvm::SaveAndRestore<Optional<AccessKind>>
-        C(this->OpAccess, AccessKind::Write);
+      llvm::SaveAndRestore<llvm::Optional<AccessKind>> C(this->OpAccess,
+                                                         AccessKind::Write);
 
       if (AE->getDest() && !AE->getDest()->walk(*this))
         return Action::Stop();
@@ -590,6 +608,16 @@ ASTWalker::PreWalkResult<Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
       return Action::Stop();
     // We already visited the children.
     return doSkipChildren();
+  } else if (auto ME = dyn_cast<MacroExpansionExpr>(E)) {
+    // Add a reference to the macro
+    auto macroRef = ME->getMacroRef();
+    if (auto *macroDecl = dyn_cast_or_null<MacroDecl>(macroRef.getDecl())) {
+      auto macroRefType = macroDecl->getDeclaredInterfaceType();
+      if (!passReference(
+              macroDecl, macroRefType, ME->getMacroNameLoc(),
+              ReferenceMetaData(SemaReferenceKind::DeclRef, llvm::None)))
+        return Action::Stop();
+    }
   }
 
   return Action::Continue(E);
@@ -610,16 +638,36 @@ ASTWalker::PreWalkAction SemaAnnotator::walkToTypeReprPre(TypeRepr *T) {
   if (!Continue)
     return Action::Stop();
 
-  if (auto IdT = dyn_cast<ComponentIdentTypeRepr>(T)) {
+  if (auto IdT = dyn_cast<IdentTypeRepr>(T)) {
     if (ValueDecl *VD = IdT->getBoundDecl()) {
       if (auto *ModD = dyn_cast<ModuleDecl>(VD)) {
         auto ident = IdT->getNameRef().getBaseIdentifier();
         auto Continue = passReference(ModD, {ident, IdT->getLoc()});
         return Action::StopIf(!Continue);
       }
-      auto Continue =
-          passReference(VD, Type(), IdT->getNameLoc(),
-                        ReferenceMetaData(SemaReferenceKind::TypeRef, None));
+      auto Continue = passReference(
+          VD, Type(), IdT->getNameLoc(),
+          ReferenceMetaData(SemaReferenceKind::TypeRef, llvm::None));
+      return Action::StopIf(!Continue);
+    }
+  } else if (auto FT = dyn_cast<FixedTypeRepr>(T)) {
+    if (ValueDecl *VD = FT->getType()->getAnyGeneric()) {
+      auto Data = ReferenceMetaData(SemaReferenceKind::TypeRef, llvm::None);
+      Data.isImplicitCtorType = true;
+      auto Continue = passReference(VD, FT->getType(), FT->getLoc(),
+                                    FT->getSourceRange(), Data);
+      return Action::StopIf(!Continue);
+    }
+  } else if (auto ST = dyn_cast<SelfTypeRepr>(T)) {
+    ValueDecl *VD = ST->getType()->getAnyGeneric();
+    if (auto DT = ST->getType()->getAs<DynamicSelfType>())
+      VD = DT->getSelfType()->getAnyGeneric();
+
+    if (VD) {
+      auto Data = ReferenceMetaData(SemaReferenceKind::TypeRef, llvm::None);
+      Data.isImplicitCtorType = true;
+      auto Continue = passReference(VD, ST->getType(), ST->getLoc(),
+                                    ST->getSourceRange(), Data);
       return Action::StopIf(!Continue);
     }
   }
@@ -647,7 +695,7 @@ SemaAnnotator::walkToPatternPre(Pattern *P) {
     Type T = EP->hasType() ? EP->getType() : Type();
     auto Continue = passReference(
         Element, T, DeclNameLoc(EP->getLoc()),
-        ReferenceMetaData(SemaReferenceKind::EnumElementRef, None));
+        ReferenceMetaData(SemaReferenceKind::EnumElementRef, llvm::None));
     return Action::StopIf(!Continue, P);
   }
 
@@ -680,11 +728,37 @@ bool SemaAnnotator::handleCustomAttributes(Decl *D) {
       return true;
     }
   }
-  for (auto *customAttr : D->getAttrs().getAttributes<CustomAttr, true>()) {
+
+  ModuleDecl *MD = D->getModuleContext();
+  for (auto *customAttr :
+       D->getSemanticAttrs().getAttributes<CustomAttr, true>()) {
+    SourceFile *SF =
+        MD->getSourceFileContainingLocation(customAttr->getLocation());
+    ASTNode expansion = SF ? SF->getMacroExpansion() : nullptr;
+    if (!shouldWalkMacroArgumentsAndExpansion().second && expansion)
+      continue;
+
     if (auto *Repr = customAttr->getTypeRepr()) {
+      // It's a little weird that attached macros have a `TypeRepr` to begin
+      // with, but given they aren't types they then don't get bound. So check
+      // for a macro here and and pass a reference to it.
+      auto *mutableAttr = const_cast<CustomAttr *>(customAttr);
+      if (auto macroDecl = D->getResolvedMacro(mutableAttr)) {
+        Type macroRefType = macroDecl->getDeclaredInterfaceType();
+        auto customAttrRef =
+            std::make_pair(customAttr, expansion ? expansion.get<Decl *>() : D);
+        auto refMetadata =
+            ReferenceMetaData(SemaReferenceKind::DeclRef, llvm::None,
+                              /*isImplicit=*/false, customAttrRef);
+        if (!passReference(macroDecl, macroRefType,
+                           DeclNameLoc(Repr->getStartLoc()), refMetadata))
+          return false;
+      }
+
       if (!Repr->walk(*this))
         return false;
     }
+
     if (auto *SemaInit = customAttr->getSemanticInit()) {
       if (!SemaInit->isImplicit()) {
         assert(customAttr->hasArgs());
@@ -699,6 +773,7 @@ bool SemaAnnotator::handleCustomAttributes(Decl *D) {
         return false;
     }
   }
+
   return true;
 }
 
@@ -720,8 +795,9 @@ bool SemaAnnotator::handleImports(ImportDecl *Import) {
   if (Decls.size() == 1) {
     // FIXME: ImportDecl should store a DeclNameLoc.
     // FIXME: Handle overloaded funcs too by passing a reference for each?
-    if (!passReference(Decls.front(), Type(), DeclNameLoc(Import->getEndLoc()),
-        ReferenceMetaData(SemaReferenceKind::DeclRef, None)))
+    if (!passReference(
+            Decls.front(), Type(), DeclNameLoc(Import->getEndLoc()),
+            ReferenceMetaData(SemaReferenceKind::DeclRef, llvm::None)))
       return false;
   }
 
@@ -777,9 +853,26 @@ passReference(ValueDecl *D, Type Ty, SourceLoc BaseNameLoc, SourceRange Range,
 
   if (auto *TD = dyn_cast<TypeDecl>(D)) {
     if (!CtorRefs.empty() && BaseNameLoc.isValid()) {
-      Expr *Fn = CtorRefs.back()->getFn();
-      if (Fn->getLoc() == BaseNameLoc) {
-        D = extractDecl(Fn);
+      ConstructorRefCallExpr *Ctor = CtorRefs.back();
+      SourceLoc CtorLoc = Ctor->getFn()->getLoc();
+      // Get the location of the type, ignoring parens, rather than the start of
+      // the Expr, to match the lookup.
+      if (auto *TE = dyn_cast<TypeExpr>(Ctor->getBase()))
+        CtorLoc = TE->getTypeRepr()->getWithoutParens()->getLoc();
+
+      bool isImplicit = false;
+      Expr *Fn = Ctor->getFn();
+      while (auto *ICE = dyn_cast<ImplicitConversionExpr>(Fn))
+        Fn = ICE->getSubExpr();
+      if (auto *DRE = dyn_cast<DeclRefExpr>(Fn))
+        isImplicit = DRE->isImplicit();
+
+      if (isImplicit && CtorLoc == BaseNameLoc) {
+        D = ide::getReferencedDecl(Ctor->getFn()).second.getDecl();
+        if (D == nullptr) {
+          assert(false && "Unhandled constructor reference");
+          return true;
+        }
         CtorTyRef = TD;
       }
     }
@@ -792,12 +885,6 @@ passReference(ValueDecl *D, Type Ty, SourceLoc BaseNameLoc, SourceRange Range,
         ExtDecl = ExtDecls.back();
       }
     }
-  }
-
-  if (D == nullptr) {
-    // FIXME: When does this happen?
-    assert(false && "unhandled reference");
-    return true;
   }
 
   CharSourceRange CharRange =
@@ -818,7 +905,7 @@ bool SemaAnnotator::passReference(ModuleEntity Mod,
 }
 
 bool SemaAnnotator::passCallArgNames(Expr *Fn, ArgumentList *ArgList) {
-  ValueDecl *D = extractDecl(Fn);
+  ValueDecl *D = ide::getReferencedDecl(Fn).second.getDecl();
   if (!D)
     return true; // continue.
 
@@ -841,9 +928,23 @@ bool SemaAnnotator::passCallArgNames(Expr *Fn, ArgumentList *ArgList) {
 }
 
 bool SemaAnnotator::shouldIgnore(Decl *D) {
+  if (!D->isImplicit())
+    return false;
+
   // TODO: There should really be a separate field controlling whether
   //       constructors are visited or not
-  return D->isImplicit() && !isa<ConstructorDecl>(D);
+  if (isa<ConstructorDecl>(D))
+    return false;
+
+  // Walk into missing decls to visit their attributes if they were generated
+  // by a member attribute expansion. Note that we would have already skipped
+  // this decl if we were ignoring expansions, so no need to check that.
+  if (auto *missing = dyn_cast<MissingDecl>(D)) {
+    if (D->isInMacroExpansionInContext())
+      return false;
+  }
+
+  return true;
 }
 
 bool SourceEntityWalker::walk(SourceFile &SrcFile) {

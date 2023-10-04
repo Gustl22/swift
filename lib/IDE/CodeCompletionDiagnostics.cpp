@@ -86,34 +86,30 @@ bool CodeCompletionDiagnostics::getDiagnosticForDeprecated(
   if (!Attr)
     return true;
 
-  DeclName Name;
-  unsigned RawAccessorKind;
-  std::tie(RawAccessorKind, Name) = getAccessorKindAndNameForDiagnostics(D);
-  // FIXME: 'RawAccessorKind' is always 2 (NOT_ACCESSOR_INDEX).
-  // Code completion doesn't offer accessors. It only emits 'VarDecl's.
+  // FIXME: Code completion doesn't offer accessors. It only emits 'VarDecl's.
   // So getter/setter specific availability doesn't work in code completion.
 
   StringRef Platform = Attr->prettyPlatformString();
   llvm::VersionTuple DeprecatedVersion;
   if (Attr->Deprecated)
-    DeprecatedVersion = Attr->Deprecated.getValue();
+    DeprecatedVersion = Attr->Deprecated.value();
 
   if (!isSoftDeprecated) {
     if (Attr->Message.empty() && Attr->Rename.empty()) {
       getDiagnostics(severity, Out, diag::availability_deprecated,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
-                     Attr->Deprecated.hasValue(), DeprecatedVersion,
+                     D, Attr->hasPlatform(), Platform,
+                     Attr->Deprecated.has_value(), DeprecatedVersion,
                      /*message*/ StringRef());
     } else if (!Attr->Message.empty()) {
       EncodedDiagnosticMessage EncodedMessage(Attr->Message);
       getDiagnostics(severity, Out, diag::availability_deprecated,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
-                     Attr->Deprecated.hasValue(), DeprecatedVersion,
+                     D, Attr->hasPlatform(), Platform,
+                     Attr->Deprecated.has_value(), DeprecatedVersion,
                      EncodedMessage.Message);
     } else {
       getDiagnostics(severity, Out, diag::availability_deprecated_rename,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
-                     Attr->Deprecated.hasValue(), DeprecatedVersion, false,
+                     D, Attr->hasPlatform(), Platform,
+                     Attr->Deprecated.has_value(), DeprecatedVersion, false,
                      /*ReplaceKind*/ 0, Attr->Rename);
     }
   } else {
@@ -125,18 +121,18 @@ bool CodeCompletionDiagnostics::getDiagnosticForDeprecated(
 
     if (Attr->Message.empty() && Attr->Rename.empty()) {
       getDiagnostics(severity, Out, diag::ide_availability_softdeprecated,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
+                     D, Attr->hasPlatform(), Platform,
                      !isDistantFuture, DeprecatedVersion,
                      /*message*/ StringRef());
     } else if (!Attr->Message.empty()) {
       EncodedDiagnosticMessage EncodedMessage(Attr->Message);
       getDiagnostics(severity, Out, diag::ide_availability_softdeprecated,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
+                     D, Attr->hasPlatform(), Platform,
                      !isDistantFuture, DeprecatedVersion,
                      EncodedMessage.Message);
     } else {
       getDiagnostics(severity, Out, diag::ide_availability_softdeprecated_rename,
-                     RawAccessorKind, Name, Attr->hasPlatform(), Platform,
+                     D, Attr->hasPlatform(), Platform,
                      !isDistantFuture, DeprecatedVersion, Attr->Rename);
     }
   }

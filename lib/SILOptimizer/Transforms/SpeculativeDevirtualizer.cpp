@@ -162,7 +162,8 @@ static FullApplySite speculateMonomorphicTarget(FullApplySite AI,
   // class instance is identical to the SILType.
 
   CCBI = Builder.createCheckedCastBranch(AI.getLoc(), /*exact*/ true,
-                                      CMI->getOperand(),
+                                      CMI->getOperand(), 
+                                      CMI->getOperand()->getType().getASTType(),
                                       SILType::getPrimitiveObjectType(SubType),
                                       SubType, Iden, Virt);
   It = CCBI->getIterator();
@@ -305,6 +306,7 @@ static bool isDefaultCaseKnown(ClassHierarchyAnalysis *CHA,
   case AccessLevel::Open:
     return false;
   case AccessLevel::Public:
+  case AccessLevel::Package:
   case AccessLevel::Internal:
     if (!AI.getModule().isWholeModule())
       return false;

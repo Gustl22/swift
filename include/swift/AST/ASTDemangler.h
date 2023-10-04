@@ -22,12 +22,13 @@
 #ifndef SWIFT_AST_ASTDEMANGLER_H
 #define SWIFT_AST_ASTDEMANGLER_H
 
-#include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/StringRef.h"
 #include "swift/AST/Types.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/NamespaceMacros.h"
 #include "swift/Demangling/TypeDecoder.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/Optional.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace swift {
  
@@ -37,13 +38,16 @@ namespace Demangle {
 SWIFT_BEGIN_INLINE_NAMESPACE
 
 Type getTypeForMangling(ASTContext &ctx,
-                        llvm::StringRef mangling);
+                        llvm::StringRef mangling,
+                        GenericSignature genericSig=GenericSignature());
 
 TypeDecl *getTypeDeclForMangling(ASTContext &ctx,
-                                 llvm::StringRef mangling);
+                                 llvm::StringRef mangling,
+                                 GenericSignature genericSig=GenericSignature());
 
 TypeDecl *getTypeDeclForUSR(ASTContext &ctx,
-                            llvm::StringRef usr);
+                            llvm::StringRef usr,
+                            GenericSignature genericSig=GenericSignature());
 
 /// An implementation of MetadataReader's BuilderType concept that
 /// just finds and builds things in the AST.
@@ -55,18 +59,41 @@ class ASTBuilder {
   /// Created lazily.
   DeclContext *NotionalDC = nullptr;
 
+  /// The depth and index of each parameter pack in the current generic
+  /// signature. We need this because the mangling for a type parameter
+  /// doesn't record whether it is a pack or not; we find the correct
+  /// depth and index in this array, and use its pack-ness.
+  llvm::SmallVector<std::pair<unsigned, unsigned>, 2> ParameterPacks;
+
+  /// For saving and restoring generic parameters.
+  llvm::SmallVector<decltype(ParameterPacks), 2> ParameterPackStack;
+
+  /// This builder doesn't perform "on the fly" substitutions, so we preserve
+  /// all pack expansions. We still need an active expansion stack though,
+  /// for the dummy implementation of these methods:
+  /// - beginPackExpansion()
+  /// - advancePackExpansion()
+  /// - createExpandedPackElement()
+  /// - endPackExpansion()
+  llvm::SmallVector<Type, 2> ActivePackExpansions;
+
 public:
   using BuiltType = swift::Type;
   using BuiltTypeDecl = swift::GenericTypeDecl *; // nominal or type alias
   using BuiltProtocolDecl = swift::ProtocolDecl *;
   using BuiltGenericSignature = swift::GenericSignature;
-  using BuiltGenericTypeParam = swift::GenericTypeParamType *;
   using BuiltRequirement = swift::Requirement;
   using BuiltSubstitutionMap = swift::SubstitutionMap;
 
   static constexpr bool needsToPrecomputeParentGenericContextShapes = false;
 
-  explicit ASTBuilder(ASTContext &ctx) : Ctx(ctx) {}
+  explicit ASTBuilder(ASTContext &ctx, GenericSignature genericSig)
+    : Ctx(ctx) {
+    for (auto *paramTy : genericSig.getGenericParams()) {
+      if (paramTy->isParameterPack())
+        ParameterPacks.emplace_back(paramTy->getDepth(), paramTy->getIndex());
+    }
+  }
 
   ASTContext &getASTContext() { return Ctx; }
   DeclContext *getNotionalDC();
@@ -100,7 +127,19 @@ public:
   Type createBoundGenericType(GenericTypeDecl *decl, ArrayRef<Type> args,
                               Type parent);
 
-  Type createTupleType(ArrayRef<Type> eltTypes, StringRef labels);
+  Type createTupleType(ArrayRef<Type> eltTypes, ArrayRef<StringRef> labels);
+
+  Type createPackType(ArrayRef<Type> eltTypes);
+
+  Type createSILPackType(ArrayRef<Type> eltTypes, bool isElementAddress);
+
+  size_t beginPackExpansion(Type countType);
+
+  void advancePackExpansion(size_t index);
+
+  Type createExpandedPackElement(Type patternType);
+
+  void endPackExpansion();
 
   Type createFunctionType(
       ArrayRef<Demangle::FunctionParam<Type>> params,
@@ -108,11 +147,11 @@ public:
       FunctionMetadataDifferentiabilityKind diffKind, Type globalActor);
 
   Type createImplFunctionType(
-    Demangle::ImplParameterConvention calleeConvention,
-    ArrayRef<Demangle::ImplFunctionParam<Type>> params,
-    ArrayRef<Demangle::ImplFunctionResult<Type>> results,
-    Optional<Demangle::ImplFunctionResult<Type>> errorResult,
-    ImplFunctionTypeFlags flags);
+      Demangle::ImplParameterConvention calleeConvention,
+      ArrayRef<Demangle::ImplFunctionParam<Type>> params,
+      ArrayRef<Demangle::ImplFunctionResult<Type>> results,
+      llvm::Optional<Demangle::ImplFunctionResult<Type>> errorResult,
+      ImplFunctionTypeFlags flags);
 
   Type createProtocolCompositionType(ArrayRef<ProtocolDecl *> protocols,
                                      Type superclass,
@@ -127,11 +166,16 @@ public:
   Type createSymbolicExtendedExistentialType(NodePointer shapeNode,
                                              ArrayRef<Type> genArgs);
 
-  Type createExistentialMetatypeType(Type instance,
-                     Optional<Demangle::ImplMetatypeRepresentation> repr=None);
+  Type createExistentialMetatypeType(
+      Type instance,
+      llvm::Optional<Demangle::ImplMetatypeRepresentation> repr = llvm::None);
 
-  Type createMetatypeType(Type instance,
-                     Optional<Demangle::ImplMetatypeRepresentation> repr=None);
+  Type createMetatypeType(
+      Type instance,
+      llvm::Optional<Demangle::ImplMetatypeRepresentation> repr = llvm::None);
+
+  void pushGenericParams(ArrayRef<std::pair<unsigned, unsigned>> parameterPacks);
+  void popGenericParams();
 
   Type createGenericTypeParameterType(unsigned depth, unsigned index);
 
@@ -207,8 +251,7 @@ private:
     SynthesizedByImporter
   };
 
-  Optional<ForeignModuleKind>
-  getForeignModuleKind(NodePointer node);
+  llvm::Optional<ForeignModuleKind> getForeignModuleKind(NodePointer node);
 
   GenericTypeDecl *findTypeDecl(DeclContext *dc,
                                 Identifier name,

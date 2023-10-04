@@ -12,6 +12,7 @@
 
 #include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/DynamicCasts.h"
 #include "llvm/Support/CommandLine.h"
@@ -79,26 +80,29 @@ static SILValue stripRCIdentityPreservingInsts(SILValue V) {
   // the struct is equivalent to a ref count operation on the extracted
   // member. Strip off the extract.
   if (auto *SEI = dyn_cast<StructExtractInst>(V))
-    if (SEI->isFieldOnlyNonTrivialField())
+    if (SEI->isFieldOnlyNonTrivialField() && !hasValueDeinit(SEI->getOperand()))
       return SEI->getOperand();
 
   // If we have a struct instruction with only one non-trivial stored field, the
   // only reference count that can be modified is the non-trivial field. Return
   // the non-trivial field.
-  if (auto *SI = dyn_cast<StructInst>(V))
-    if (SILValue NewValue = SI->getUniqueNonTrivialFieldValue())
-      return NewValue;
-
+  if (auto *SI = dyn_cast<StructInst>(V)) {
+    if (!hasValueDeinit(SI)) {
+      if (SILValue NewValue = SI->getUniqueNonTrivialFieldValue())
+        return NewValue;
+    }
+  }
   // If we have an unchecked_enum_data, strip off the unchecked_enum_data.
-  if (auto *UEDI = dyn_cast<UncheckedEnumDataInst>(V))
-    return UEDI->getOperand();
-
+  if (auto *UEDI = dyn_cast<UncheckedEnumDataInst>(V)) {
+    if (!hasValueDeinit(UEDI->getOperand()))
+      return UEDI->getOperand();
+  }
   // If we have an enum instruction with a payload, strip off the enum to
   // expose the enum's payload.
-  if (auto *EI = dyn_cast<EnumInst>(V))
-    if (EI->hasOperand())
+  if (auto *EI = dyn_cast<EnumInst>(V)) {
+    if (EI->hasOperand() && !hasValueDeinit(EI))
       return EI->getOperand();
-
+  }
   // If we have a tuple_extract that is extracting the only non trivial member
   // of a tuple, a retain_value on the tuple is equivalent to a retain_value on
   // the extracted value.
@@ -113,25 +117,18 @@ static SILValue stripRCIdentityPreservingInsts(SILValue V) {
     if (SILValue NewValue = TI->getUniqueNonTrivialElt())
       return NewValue;
 
-  // Any SILArgument with a single predecessor from a "phi" perspective is
-  // dead. In such a case, the SILArgument must be rc-identical.
-  //
-  // This is the easy case. The difficult case is when you have an argument with
-  // /multiple/ predecessors.
-  //
-  // We do not need to insert this SILArgument into the visited SILArgument set
-  // since we will only visit it twice if we go around a back edge due to a
-  // different SILArgument that is actually being used for its phi node like
-  // purposes.
-  if (auto *A = dyn_cast<SILPhiArgument>(V)) {
-    if (SILValue Result = A->getSingleTerminatorOperand()) {
-      // In case the terminator is a conditional cast, Result is the source of
-      // the cast.
-      auto dynCast = SILDynamicCastInst::getAs(A->getSingleTerminator());
-      if (dynCast && !dynCast.isRCIdentityPreserving())
-        return SILValue();
-      return Result;
+  if (auto *result = SILArgument::isTerminatorResult(V)) {
+    if (auto *forwardedOper = result->forwardedTerminatorResultOperand()) {
+      if (!hasValueDeinit(forwardedOper->get()))
+        return forwardedOper->get();
     }
+  }
+
+  // Handle useless single-predecessor phis for legacy reasons. (Although these
+  // should have been removed as a standard SIL cleanup).
+  if (auto phi = PhiValue(V)) {
+    if (auto *singlePred = phi.phiBlock->getSinglePredecessorBlock())
+      return phi.getOperand(singlePred)->get();
   }
 
   return SILValue();
@@ -182,20 +179,20 @@ static llvm::Optional<bool> proveNonPayloadedEnumCase(SILBasicBlock *BB,
   // keep searching up the domtree.
   SILBasicBlock *SinglePred = BB->getSinglePredecessorBlock();
   if (!SinglePred)
-    return None;
+    return llvm::None;
 
   // Check if SinglePred has a switch_enum terminator switching on
   // RCIdentity... If it does not, return None so we keep searching up the
   // domtree.
   auto *SEI = dyn_cast<SwitchEnumInst>(SinglePred->getTerminator());
   if (!SEI || SEI->getOperand() != RCIdentity)
-    return None;
+    return llvm::None;
 
   // Then return true if along the edge from the SEI to BB, RCIdentity has a
   // non-payloaded enum value.
   NullablePtr<EnumElementDecl> Decl = SEI->getUniqueCaseForDestination(BB);
   if (Decl.isNull())
-    return None;
+    return llvm::None;
   return !Decl.get()->hasAssociatedValues();
 }
 
@@ -252,8 +249,8 @@ findDominatingNonPayloadedEdge(SILBasicBlock *IncomingEdgeBB,
 
     // If we found either a signal of a payloaded or a non-payloaded enum,
     // return that value.
-    if (Result.hasValue())
-      return Result.getValue();
+    if (Result.has_value())
+      return Result.value();
 
     // If we didn't reach RCIdentityBB, keep processing up the DomTree.
     if (DominatingBB != RCIdentityBB)
@@ -316,7 +313,7 @@ static SILValue allIncomingValuesEqual(
 SILValue RCIdentityFunctionInfo::stripRCIdentityPreservingArgs(SILValue V,
                                                       unsigned RecursionDepth) {
   auto *A = dyn_cast<SILPhiArgument>(V);
-  if (!A) {
+  if (!A || !A->isPhi()) {
     return SILValue();
   }
 
@@ -512,7 +509,7 @@ static bool isNonOverlappingTrivialAccess(SILValue value) {
   if (auto *SEI = dyn_cast<StructExtractInst>(value)) {
     // If the struct we are extracting from only has one non trivial element and
     // we are not extracting from that element, this is an ARC escape.
-    return SEI->isTrivialFieldOfOneRCIDStruct();
+    return SEI->isTrivialFieldOfOneRCIDStruct() && !hasValueDeinit(SEI);
   }
 
   return false;

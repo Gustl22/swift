@@ -25,6 +25,8 @@ toolchain as a one-off, there are a couple of differences:
 - [Editing code](#editing-code)
   - [Setting up your fork](#setting-up-your-fork)
   - [Using Ninja with Xcode](#using-ninja-with-xcode)
+    - [Regenerating the Xcode project](#regenerating-the-xcode-project)
+    - [Troubleshooting editing issues in Xcode](#troubleshooting-editing-issues-in-xcode)
   - [Other IDEs setup](#other-ides-setup)
   - [Editing](#editing)
   - [Incremental builds with Ninja](#incremental-builds-with-ninja)
@@ -45,12 +47,15 @@ toolchain as a one-off, there are a couple of differences:
    system. Experimental instructions for Windows are available under
    [Windows.md](/docs/Windows.md).
 2. Python 3: Several utility scripts are written in Python.
-3. Disk space:
+3. Git 2.x to check out the sources. We find that older versions of Git
+   can't successfully check out all of the required repositories or
+   fail during a rebase when switching between checkout schemes.
+4. Disk space:
    Make sure that you have enough available disk space before starting.
    The source code, including full git history, requires about 3.5 GB.
    Build artifacts take anywhere between 5 GB to 70 GB, depending on the
    build settings.
-4. Time:
+5. Time:
    Depending on your machine and build settings,
    a from-scratch build can take a few minutes to several hours,
    so you might want to grab a beverage while you follow the instructions.
@@ -63,6 +68,11 @@ toolchain as a one-off, there are a couple of differences:
    mkdir swift-project
    cd swift-project
    ```
+   
+    > **Warning**  
+    > Make sure the absolute path to your `swift-project` directory **does not** contain spaces, 
+        since that might cause issues during the build step.
+    
 2. Clone the sources:
    - Via SSH (recommended):
      If you plan on contributing regularly, cloning over SSH provides a better
@@ -81,9 +91,10 @@ toolchain as a one-off, there are a couple of differences:
      cd swift
      utils/update-checkout --clone
      ```
-   **Note:** If you've already forked the project on GitHub at this stage,
-   **do not clone your fork** to start off. We describe
-   [how to setup your fork](#setting-up-your-fork) in a subsection below.
+   > **Note**  
+   > If you've already forked the project on GitHub at this stage, **do not
+   > clone your fork** to start off. We describe [how to setup your fork](#setting-up-your-fork)
+   > in a subsection below.
    <!-- Recommending against cloning the fork due to https://github.com/apple/swift/issues/55918 and https://github.com/apple/swift/issues/55947. -->
 3. Double-check that `swift`'s sibling directories are present.
    ```sh
@@ -106,10 +117,10 @@ toolchain as a one-off, there are a couple of differences:
    Detailed branching information, including names for release branches, can
    be found in [Branches.md](/docs/Branches.md).
 
-**Note:**
-The commands used in the rest of this guide assumes that the absolute path
-to your working directory is something like `/path/to/swift-project/swift`.
-Double-check that running `pwd` prints a path ending with `swift`.
+> **Note**  
+> The commands used in the rest of this guide assumes that the absolute path
+> to your working directory is something like `/path/to/swift-project/swift`.
+> Double-check that running `pwd` prints a path ending with `swift`.
 
 [uploaded your SSH keys to GitHub]: https://help.github.com/articles/adding-a-new-ssh-key-to-your-github-account/
 
@@ -117,9 +128,6 @@ Double-check that running `pwd` prints a path ending with `swift`.
 
 - If `update-checkout` failed, double-check that the absolute path to your
   working directory does not have non-ASCII characters.
-- If `update-checkout` failed and the absolute path to your working directory
-  had spaces in it, please [file a bug report][Swift Issues] and change the path
-  to work around it.
 - Before running `update-checkout`, double-check that `swift` is the only
   repository inside the `swift-project` directory. Otherwise,
   `update-checkout` may not clone the necessary dependencies.
@@ -128,11 +136,10 @@ Double-check that running `pwd` prints a path ending with `swift`.
 
 ### macOS
 
-1. Install [Xcode 13 beta 4][Xcode] or newer:
-   The required version of Xcode changes frequently and is often a beta release.
-   Check this document or the host information on <https://ci.swift.org> for the
-   current required version.
-2. Install [CMake][], [Ninja][] and [Sccache][]:
+1. Install Xcode. The minimum required version is specified in the node
+   information on <https://ci.swift.org>, may change frequently, and is often
+   a beta release.
+1. Install [CMake][], [Ninja][] and [Sccache][]:
    - Via [Homebrew][] (recommended):
      ```sh
      brew install cmake ninja sccache
@@ -145,45 +152,59 @@ Double-check that running `pwd` prints a path ending with `swift`.
 [Xcode]: https://developer.apple.com/xcode/resources/
 [CMake]: https://cmake.org
 [Ninja]: https://ninja-build.org
-[Sccache]: https://github.com/mozilla/sccache
 [Homebrew]: https://brew.sh/
 [Homebrew Bundle]: https://github.com/Homebrew/homebrew-bundle
 
 ### Linux
 
 1. The latest Linux dependencies are listed in the respective Dockerfiles:
+   * [Ubuntu 18.04](https://github.com/apple/swift-docker/blob/main/swift-ci/master/ubuntu/18.04/Dockerfile)
    * [Ubuntu 20.04](https://github.com/apple/swift-docker/blob/main/swift-ci/master/ubuntu/20.04/Dockerfile)
    * [Ubuntu 22.04](https://github.com/apple/swift-docker/blob/main/swift-ci/master/ubuntu/22.04/Dockerfile)
    * [CentOS 7](https://github.com/apple/swift-docker/blob/main/swift-ci/master/centos/7/Dockerfile)
    * [Amazon Linux 2](https://github.com/apple/swift-docker/blob/main/swift-ci/master/amazon-linux/2/Dockerfile)
 
-2. To install `sccache` (optional):
-  * If you're not building within a Docker container:
-   ```
-   sudo snap install sccache --candidate --classic
-   ```
-   * If you're building within a Docker container, you'll have to install `sccache` manually, since [`snap`
-   is not available in environments without `systemd`](https://unix.stackexchange.com/questions/541230/do-snaps-require-systemd):
+2. To install [Sccache][] (optional):
+   * If you're not building within a Docker container:
+     ```sh
+     sudo snap install sccache --candidate --classic
+     ```
+   * If you're building within a Docker container, you'll have to install
+     `sccache` manually, since [`snap` is not available in environments
+     without `systemd`](https://unix.stackexchange.com/questions/541230/do-snaps-require-systemd):
 
-   ```
-   SCCACHE_VERSION=v0.3.0
-   curl -L "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-$(uname -m)-unknown-linux-musl.tar.gz" -o sccache.tar.gz
-   tar xzpvf sccache.tar.gz
-   sudo cp "sccache-${SCCACHE_VERSION}-$(uname -m)-unknown-linux-musl/sccache" /usr/local/bin
-   sudo chmod +x /usr/local/bin/sccache
-   ```
+     ```sh
+     SCCACHE_VERSION=v0.3.0
+     curl -L "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-$(uname -m)-unknown-linux-musl.tar.gz" -o sccache.tar.gz
+     tar xzpvf sccache.tar.gz
+     sudo cp "sccache-${SCCACHE_VERSION}-$(uname -m)-unknown-linux-musl/sccache" /usr/local/bin
+     sudo chmod +x /usr/local/bin/sccache
+     ```
 
-   **Note:** LLDB currently requires at least `swig-1.3.40` but will
-   successfully build with version 2 shipped with Ubuntu.
+> **Note**  
+> LLDB currently requires at least `swig-1.3.40` but will successfully build
+> with version 2 shipped with Ubuntu.
+
+[Sccache]: https://github.com/mozilla/sccache
 
 ## Building the project for the first time
 
 ### Spot check dependencies
 
-* Run `cmake --version`: This should be 3.19.6 or higher.
-* Run `python3 --version`: Check that this succeeds.
-* Run `ninja --version`: Check that this succeeds.
-* Run `sccache --version`: Check that this succeeds.
+* Run `cmake --version`; this should be at least 3.19.6 (3.24.2 if you want to use Xcode for editing on macOS).
+* Run `python3 --version`; this should be at least 3.6.
+* Run `ninja --version`; check that this succeeds.
+* If you installed and want to use Sccache: Run `sccache --version`; check
+  that this succeeds.
+
+> **Note**  
+> If you are running on Apple Silicon hardware (M1, M2, etc), ensure you have
+> the native arm64 build of these dependencies installed and configured in your PATH.
+>
+> e.g. running `file $(which python3)` should print "arm64".
+>
+> If it prints "x86_64", you are running Python in compatibility mode (Rosetta), and building Swift will fail.
+> Running `uname -m` should also print "arm64", otherwise your terminal is running in Rosetta mode.
 
 ### The roles of different tools
 
@@ -206,6 +227,11 @@ to understand what the different tools do:
    (i.e. do a "clean build"), Sccache can accelerate the new build
    significantly. There are few things more satisfying than seeing Sccache
    cut through build times.
+
+   > **Note**
+   > Sccache defaults to a cache size of 10GB, which is relatively small
+   > compared to build artifacts. You can bump it up, say, by setting
+   > `export SCCACHE_CACHE_SIZE="50G"` in your dotfile(s).
 5. `utils/update-checkout` is a script to help you work with all the individual
    git repositories together, instead of manually cloning/updating each one.
 6. `utils/build-script` (we will introduce this shortly)
@@ -222,15 +248,7 @@ Phew, that's a lot to digest! Now let's proceed to the actual build itself!
 
 ### The actual build
 
-1. Make sure you have Sccache running.
-   ```sh
-   sccache --start-server
-   ```
-   (Optional) Sccache defaults to a cache size of 10GB, which is relatively
-   small compared to build artifacts. You can bump it up, say by setting
-   `export SCCACHE_CACHE_SIZE="50G"` in your dotfile(s). For more details,
-   see the [Sccache README][Sccache].
-2. Build the toolchain with optimizations, debuginfo, and assertions, using
+1. Build the toolchain with optimizations, debuginfo, and assertions, using
    Ninja.
    - macOS:
      ```sh
@@ -238,28 +256,32 @@ Phew, that's a lot to digest! Now let's proceed to the actual build itself!
        --skip-ios --skip-watchos --skip-tvos --swift-darwin-supported-archs "$(uname -m)" \
        --sccache --release-debuginfo --swift-disable-dead-stripping
      ```
-     > **Warning**  
-     > On Macs with Apple silicon (arm64), pass `--bootstrapping=off`.
-     > (https://github.com/apple/swift/issues/62017)
-
    - Linux:
      ```sh
      utils/build-script --release-debuginfo --skip-early-swift-driver \
        --skip-early-swiftsyntax
      ```
+     If you installed and want to use Sccache, include the `--sccache` option in
+     the invocation as well.
+   <!-- FIXME: Without this "hard" line break, the note doesn’t get properly spaced from the bullet -->
+   <br />
 
    > **Note**  
-   > If you aren't planning to edit the parts of the compiler that are written
-   > in Swift, pass `--bootstrapping=off` to speed up local development.
+   > If you are planning to work on the compiler, but not the parts that are
+   > written in Swift, pass `--bootstrapping=hosttools` to speed up local
+   > development. Note that on Linux — unlike macOS, where the toolchain already
+   > comes with Xcode — this option additionally requires
+   > [a recent Swift toolchain](https://www.swift.org/download/) to be
+   > installed.
 
    This will create a directory `swift-project/build/Ninja-RelWithDebInfoAssert`
    containing the Swift compiler and standard library and clang/LLVM build artifacts.
    If the build fails, see [Troubleshooting build issues](#troubleshooting-build-issues).
 
-   > **Note:**
+   > **Note**  
    > `--release-debuginfo` means that although debug information will be produced, all targets will
    > be compiled in release mode, meaning optimized code, which can affect your debugging experience.
-   > Consider [`--debug-swift` to build a debug variant of the compiler](#debugging-issues) and have 
+   > Consider [`--debug-swift` to build a debug variant of the compiler](#debugging-issues) and have
    > the swift targets (including `swift-frontend`) built in debug mode.
 
    If you would like to additionally build the Swift corelibs,
@@ -267,9 +289,8 @@ Phew, that's a lot to digest! Now let's proceed to the actual build itself!
    on Linux, add the `--xctest` flag to `build-script`.
 
 In the following sections, for simplicity, we will assume that you are using a
-`Ninja-RelWithDebInfoAssert` build on macOS running on an Intel-based Mac,
-unless explicitly mentioned otherwise. You will need to slightly tweak the paths
-for other build configurations.
+`Ninja-RelWithDebInfoAssert` build on macOS, unless explicitly mentioned otherwise.
+You will need to slightly tweak the paths for other build configurations.
 
 ### Troubleshooting build issues
 
@@ -345,77 +366,77 @@ whenever the heading is modified.
 -->
 ### Using Ninja with Xcode
 
-This workflow enables you to navigate, edit, build, run, and debug in Xcode
-while retaining the option of building with Ninja on the command line.
+This workflow enables you to edit, build, run, and debug in Xcode. The
+following steps assume that you have already [built the toolchain with Ninja](#the-actual-build).
 
-Assuming that you have already [built the toolchain via Ninja](#the-actual-build),
-several more steps are necessary to set up this environment:
-* Generate Xcode projects with `utils/build-script --release --swift-darwin-supported-archs "$(uname -m)" --xcode`.
-  This will first build a few LLVM files that are needed to configure the
-  projects.
-* Create a new Xcode workspace.
-* Add the generated Xcode projects or Swift packages that are relevant to your
-  tasks to your workspace. All the Xcode projects can be found among the
-  build artifacts under `build/Xcode-DebugAssert`. For example:
-  * If you are aiming for the compiler, add `build/Xcode-DebugAssert/swift-macosx-*/Swift.xcodeproj`.
-    This project also includes the standard library and runtime sources. If you
-    need the parts of the compiler that are implemented in Swift itself, add the
-    `swift/SwiftCompilerSources/Package.swift` package as well.
-  * If you are aiming for just the standard library or runtime, add
-    `build/Xcode-DebugAssert/swift-macosx-*/stdlib/Swift-stdlib.xcodeproj`.
-  <!-- FIXME: Without this "hard" line break, the note doesn’t get properly spaced from the bullet -->
-  <br />
+> **Note**  
+> A seamless LLDB debugging experience requires that your `build-script`
+  invocation for Ninja is tuned to produce build rules for the
+  [debug variant](#debugging-issues) of the component you intend to debug.
 
-  > **Warning**  
-  > Adding both `Swift.xcodeproj` and `LLVM.xcodeproj` *might* slow down the IDE
-    and is not recommended unless you know what you're doing.
+* <p id="generate-xcode">
+  Generate the Xcode project with
 
-  In general, we encourage you to add only what you need. Keep in mind that none
-  of the generated Xcode projects are required to build or run with this setup
-  because we are using Ninja—an *external* build system; rather, they should be
-  viewed as a means of leveraging the navigation, editing and debugging features
-  of the IDE in relation to the source code they wrap.
+  ```sh
+  utils/build-script --swift-darwin-supported-archs "$(uname -m)" --xcode --clean
+  ```
 
-* Create an empty Xcode project in the workspace, using the
-  _External Build System_ template.
-* For a Ninja target that you want to build (e.g. `swift-frontend`), add a
-  target to the empty project, using the _External Build System_ template.
+  This can take a few minutes due to metaprogrammed sources that depend on LLVM
+  tools that are built from source.
+  </p>
+* Create an empty Xcode workspace.
+* Add `build/Xcode-*/swift-macosx-*/Swift.xcodeproj` to the workspace. If Xcode
+  prompts to autocreate schemes, select *Manually Manage Schemes* and don't
+  create any schemes just yet.
+
+  This project includes the sources for almost everything in the repository,
+  including the compiler, standard library and runtime. If you intend to work on
+  a compiler subcomponent that is written in Swift and has a `Package.swift`
+  file (e.g. `lib/ASTGen`), first choose *Product > Scheme > Manage Schemes...*
+  and select the *Autocreate schemes* checkbox, then add the package directory
+  to the workspace by choosing *File > Add Files to "\<workspace name>"*. Xcode
+  will automatically create schemes for package manifest.
+* Create an Xcode project using the _External Build System_ template, and add
+  it to the workspace.
+* Create a target in the new project, using the _External Build System_
+  template.
 * In the _Info_ pane of the target settings, set
   * _Build Tool_ to the absolute path of the `ninja` executable (the output of
     `which ninja` on the command line)
-  * _Arguments_ to the Ninja target name (e.g. `swift-frontend`)
-  * _Directory_ to the absolute path of the directory where the Ninja target
-    lives. For Swift targets (the compiler, standard library, runtime, and
-    related tooling), this is the `build/Ninja-*/swift-macosx-*` directory.
-* Add a scheme for the target. In the drop-down menu, be careful not to mistake
-  your target for a similar one that belongs to a generated Xcode project.
-* > **Note**  
-  > Ignore this step if the target associates to a non-executable Ninja target
-    like `swift-stdlib`.
+  * _Arguments_ to a Ninja target (e.g. `bin/swift-frontend` is the compiler)
+  * _Directory_ to the absolute path of the `build/Ninja-*/swift-macosx-*`
+    directory
+* Create a scheme in the workspace, making sure to select the target you just
+  created. Be *extra* careful not to choose a target from the generated Xcode
+  project you added to the workspace.
+* Spot-check your target in the settings for the _Build_ scheme action.
+* If the target is executable, adjust the settings for the _Run_ scheme action:
+  * In the _Info_ pane, select the _Executable_ produced by the Ninja target
+    from `build/Ninja-*/swift-macosx-*/bin` (e.g. `swift-frontend`).
+  * In the _Arguments_ pane, add command line arguments that you want to pass to
+    the executable on launch (e.g. `path/to/file.swift -typecheck` for
+    `bin/swift-frontend`).
+  * Optionally set a custom working directory in the _Options_ pane.
+* Follow the previous steps to create more targets and schemes per your line
+  of work.
 
-  Adjust the _Run_ action settings of the scheme:
-  * In the _Info_ pane, select the _Executable_ built by the Ninja target from
-    the appropriate `bin` directory (e.g. `build/Ninja-*/swift-macosx-*/bin/swift-frontend`).
-  * In the _Arguments_ pane, add the command line arguments that you want to
-    pass to the executable on launch (e.g. `path/to/file.swift -typecheck` for
-    `swift-frontend`).
-  * You can optionally set the working directory for debugging in the
-    _Options_ pane.
-* Configure as many more target-scheme pairs as you need.
+#### Regenerating the Xcode project
 
-Now you are all set! You can build, run and debug as with a native Xcode
-project. If an `update-checkout` routine or a structural change—such as when
-source files are added or deleted—happens to impact your editing experience,
-simply regenerate the Xcode projects.
+The structure of the generated Xcode project is distinct from the underlying
+organization of the files on disk, and does not adapt to changes in the file
+system, such as file/directory additions/deletions/renames. Over the course of
+multiple `update-checkout` rounds, the resulting divergence is likely to begin
+affecting your editing experience. To fix this, regenerate the project by
+running the invocation from the <a href="#generate-xcode">first step</a>.
 
-> **Note**  
-> * For debugging to *fully* work for a given component—say, the compiler—the
-    `build-script` invocation for the Ninja build must be arranged to
-    [build a debug variant of that component](#debugging-issues).
-> * Xcode's indexing can occasionally start slipping after switching to and back
-    from a distant branch, resulting in a noticeable slowdown. To sort things
-    out, close the workspace and delete the _Index_ directory from the
-    workspace's derived data before reopening.
+#### Troubleshooting editing issues in Xcode
+
+* If a syntax highlighting or code action issue does not resolve itself after
+  regenerating the Xcode project, select a scheme that covers the affected area
+  and try *Product > Analyze*.
+* Xcode has been seen to sometimes get stuck on indexing after switching back
+  and forth between distant branches. To sort things out, close the workspace
+  and delete the _Index_ directory from its derived data.
 
 ### Other IDEs setup
 
@@ -433,7 +454,8 @@ In project settings, locate `Build, Execution, Deployment > CMake`. You will nee
 - Toolchain: Default should be fine
 - Generator: Ninja
 - CMake options: You want to duplicate the essential CMake flags that `build-script` had used here, so CLion understands the build configuration. You can get the full list of CMake arguments from `build-script` by providing the `-n` dry-run flag; look for the last `cmake` command with a `-G Ninja`. Here is a minimal list of what you should provide to CLion here for this setting:
-    - `-D SWIFT_PATH_TO_CMARK_BUILD=SOME_PATH/swift-project/build/Ninja-RelWithDebInfoAssert/cmark-macosx-arm64 -D LLVM_DIR=SOME_PATH/swift-project/build/Ninja-RelWithDebInfoAssert/llvm-macosx-arm64/lib/cmake/llvm -D Clang_DIR=SOME_PATH/swift-project/build/Ninja-RelWithDebInfoAssert/llvm-macosx-arm64/lib/cmake/clang -D CMAKE_BUILD_TYPE=RelWithDebInfoAssert -G Ninja -S .`
+    - `-D SWIFT_PATH_TO_CMARK_BUILD=SOME_PATH/swift-project/build/Ninja-RelWithDebInfoAssert/cmark-macosx-arm64 -D LLVM_DIR=SOME_PATH/swift-project/build/Ninja-RelWithDebInfoAssert/llvm-macosx-arm64/lib/cmake/llvm -D Clang_DIR=SOME_PATH/swift-project/build/Ninja-RelWithDebInfoAssert/llvm-macosx-arm64/lib/cmake/clang -D CMAKE_BUILD_TYPE=RelWithDebInfoAssert -D
+SWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE=SOME_PATH/swift-project/swift-syntax -G Ninja -S .`
     - replace the `SOME_PATH` to the path where your `swift-project` directory is
     - the CMAKE_BUILD_TYPE should match the build configuration name, so if you named this profile `RelWithDebInfo` the CMAKE_BUILD_TYPE should also be `RelWithDebInfo`
     - **Note**: If you're using an Intel machine to build swift, you'll need to replace the architecture in the options. (ex: `arm64` with `x86_64`)
@@ -453,37 +475,45 @@ Now that you have made some changes, you will need to rebuild...
 
 ### Incremental builds with Ninja
 
-To rebuild the compiler:
+Subsequent steps in this and the next subsections are specific to the platform you're building on, so we'll try to detect it first and reuse as a shell variable:
+
 ```sh
-ninja -C ../build/Ninja-RelWithDebInfoAssert/swift-macosx-$(uname -m) swift-frontend
+platform=$([[ $(uname) == Darwin ]] && echo macosx || echo linux)
 ```
 
-To rebuild everything, including the standard library:
+After setting that variable you can rebuild the compiler incrementally with this command:
 ```sh
-ninja -C ../build/Ninja-RelWithDebInfoAssert/swift-macosx-$(uname -m)
+ninja -C ../build/Ninja-RelWithDebInfoAssert/swift-${platform}-$(uname -m) bin/swift-frontend
 ```
+
+To rebuild everything that has its sources located in the `swift` repository, including the standard library:
+```sh
+ninja -C ../build/Ninja-RelWithDebInfoAssert/swift-${platform}-$(uname -m)
+```
+
+Similarly, you can rebuild other projects like Foundation or Dispatch by substituting their respective subdirectories in the commands above.
 
 ### Spot checking an incremental build
 
 As a quick test, go to `lib/Basic/Version.cpp` and tweak the version
 printing code slightly. Next, do an incremental build as above. This incremental
 build should be much faster than the from-scratch build at the beginning.
-Now check if the version string has been updated:
+Now check if the version string has been updated (assumes you have `platform` shell variable
+defined as specified in the previous subsection:
 
 ```sh
-../build/Ninja-RelWithDebInfoAssert/swift-macosx-$(uname -m)/bin/swift-frontend --version
+../build/Ninja-RelWithDebInfoAssert/swift-$(platform)-$(uname -m)/bin/swift-frontend --version
 ```
 
 This should print your updated version string.
 
 ## Reproducing an issue
 
-Starter bugs typically have small code examples that fit within a single file.
-You can reproduce such an issue in various ways, such as compiling it from the
-command line using `/path/to/swiftc MyFile.swift`, pasting the code into
-[Compiler Explorer][] (aka godbolt) or using an Xcode Playground.
-
-[Compiler Explorer]: https://godbolt.org
+[Good first issues](https://github.com/apple/swift/contribute) typically have
+small code examples that fit within a single file. You can reproduce such an
+issue in various ways, such as compiling it from the command line using
+`/path/to/swiftc MyFile.swift`, pasting the code into [Compiler Explorer](https://godbolt.org)
+(aka godbolt) or using an Xcode Playground.
 
 For files using frameworks from an SDK bundled with Xcode, you need the pass
 the SDK explicitly. Here are a couple of examples:

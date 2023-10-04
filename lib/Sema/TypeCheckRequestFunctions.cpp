@@ -17,6 +17,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericSignature.h"
+#include "swift/AST/MacroDefinition.h"
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/TypeLoc.h"
@@ -51,24 +52,26 @@ Type InheritedTypeRequest::evaluate(
     context = TypeResolverContext::Inherited;
   }
 
-  Optional<TypeResolution> resolution;
+  llvm::Optional<TypeResolution> resolution;
   switch (stage) {
   case TypeResolutionStage::Structural:
     resolution =
         TypeResolution::forStructural(dc, context,
                                       /*unboundTyOpener*/ nullptr,
-                                      /*placeholderHandler*/ nullptr);
+                                      /*placeholderHandler*/ nullptr,
+                                      /*packElementOpener*/ nullptr);
     break;
 
   case TypeResolutionStage::Interface:
     resolution =
         TypeResolution::forInterface(dc, context,
                                      /*unboundTyOpener*/ nullptr,
-                                     /*placeholderHandler*/ nullptr);
+                                     /*placeholderHandler*/ nullptr,
+                                     /*packElementOpener*/ nullptr);
     break;
   }
 
-  const TypeLoc &typeLoc = getInheritedTypeLocAtIndex(decl, index);
+  const TypeLoc &typeLoc = InheritedTypes(decl).getEntry(index);
 
   Type inheritedType;
   if (typeLoc.getTypeRepr())
@@ -100,7 +103,7 @@ SuperclassTypeRequest::evaluate(Evaluator &evaluator,
       return Type();
   }
 
-  for (unsigned int idx : indices(nominalDecl->getInherited())) {
+  for (unsigned int idx : nominalDecl->getInherited().getIndices()) {
     auto result = evaluator(InheritedTypeRequest{nominalDecl, idx, stage});
 
     if (auto err = result.takeError()) {
@@ -137,7 +140,7 @@ SuperclassTypeRequest::evaluate(Evaluator &evaluator,
 
 Type EnumRawTypeRequest::evaluate(Evaluator &evaluator,
                                   EnumDecl *enumDecl) const {
-  for (unsigned int idx : indices(enumDecl->getInherited())) {
+  for (unsigned int idx : enumDecl->getInherited().getIndices()) {
     auto inheritedTypeResult = evaluator(
         InheritedTypeRequest{enumDecl, idx, TypeResolutionStage::Interface});
 
@@ -171,11 +174,10 @@ AttachedResultBuilderRequest::evaluate(Evaluator &evaluator,
   for (auto attr : decl->getAttrs().getAttributes<CustomAttr>()) {
     auto mutableAttr = const_cast<CustomAttr *>(attr);
     // Figure out which nominal declaration this custom attribute refers to.
-    auto nominal = evaluateOrDefault(ctx.evaluator,
-                                     CustomAttrNominalRequest{mutableAttr, dc},
-                                     nullptr);
+    auto *nominal = evaluateOrDefault(ctx.evaluator,
+                                      CustomAttrNominalRequest{mutableAttr, dc},
+                                      nullptr);
 
-    // Ignore unresolvable custom attributes.
     if (!nominal)
       continue;
 

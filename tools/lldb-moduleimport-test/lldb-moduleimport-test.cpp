@@ -44,14 +44,15 @@ void anchorForGetMainExecutable() {}
 
 using namespace llvm::MachO;
 
-static bool
-validateModule(llvm::StringRef data, bool Verbose, bool requiresOSSAModules,
-               swift::serialization::ValidationInfo &info,
-               swift::serialization::ExtendedValidationInfo &extendedInfo) {
+static bool validateModule(
+    llvm::StringRef data, bool Verbose, bool requiresOSSAModules,
+    swift::serialization::ValidationInfo &info,
+    swift::serialization::ExtendedValidationInfo &extendedInfo,
+    llvm::SmallVectorImpl<swift::serialization::SearchPath> &searchPaths) {
   info = swift::serialization::validateSerializedAST(
       data, requiresOSSAModules,
       /*requiredSDK*/ StringRef(), /*requiresRevisionMatch*/ false,
-      &extendedInfo);
+      &extendedInfo, /* dependencies*/ nullptr, &searchPaths);
   if (info.status != swift::serialization::Status::Valid) {
     llvm::outs() << "error: validateSerializedAST() failed\n";
     return false;
@@ -62,6 +63,7 @@ validateModule(llvm::StringRef data, bool Verbose, bool requiresOSSAModules,
     llvm::outs() << "error: loadFromSerializedAST() failed\n";
     return false;
   }
+  CI.getLangOptions().EnableDeserializationSafety = false;
 
   if (Verbose) {
     if (!info.shortVersion.empty())
@@ -78,6 +80,33 @@ validateModule(llvm::StringRef data, bool Verbose, bool requiresOSSAModules,
       for (llvm::StringRef option : extendedInfo.getExtraClangImporterOptions())
         llvm::outs() << " " << option;
       llvm::outs() << "\n";
+    }
+    llvm::outs() << "- Search Paths:\n";
+    for (auto searchPath : searchPaths) {
+      llvm::outs() << "    Path: " << searchPath.Path;
+      llvm::outs() << ", framework="
+                   << (searchPath.IsFramework ? "true" : "false");
+      llvm::outs() << ", system=" << (searchPath.IsSystem ? "true" : "false")
+                   << "\n";
+    }
+    llvm::outs() << "- Plugin Search Options:\n";
+    for (auto opt : extendedInfo.getPluginSearchOptions()) {
+      StringRef optStr;
+      switch (opt.first) {
+      case swift::PluginSearchOption::Kind::PluginPath:
+        optStr = "-plugin-path";
+        break;
+      case swift::PluginSearchOption::Kind::ExternalPluginPath:
+        optStr = "-external-plugin-path";
+        break;
+      case swift::PluginSearchOption::Kind::LoadPluginLibrary:
+        optStr = "-load-plugin-library";
+        break;
+      case swift::PluginSearchOption::Kind::LoadPluginExecutable:
+        optStr = "-load-plugin-executable";
+        break;
+      }
+      llvm::outs() << "    " << optStr << " " << opt.second << "\n";
     }
   }
 
@@ -220,6 +249,9 @@ int main(int argc, char **argv) {
   opt<bool> Verbose("verbose", desc("Dump informations on the loaded module"),
                     cat(Visible));
 
+  opt<std::string> Filter("filter", desc("triple for filtering modules"),
+                          cat(Visible));
+
   opt<std::string> ModuleCachePath(
       "module-cache-path", desc("Clang module cache path"), cat(Visible));
 
@@ -285,11 +317,12 @@ int main(int argc, char **argv) {
 
   swift::serialization::ValidationInfo info;
   swift::serialization::ExtendedValidationInfo extendedInfo;
+  llvm::SmallVector<swift::serialization::SearchPath> searchPaths;
   for (auto &Module : Modules) {
     info = {};
     extendedInfo = {};
     if (!validateModule(StringRef(Module.first, Module.second), Verbose,
-                        EnableOSSAModules, info, extendedInfo)) {
+                        EnableOSSAModules, info, extendedInfo, searchPaths)) {
       llvm::errs() << "Malformed module!\n";
       return 1;
     }
@@ -331,12 +364,20 @@ int main(int argc, char **argv) {
     ClangImporter->setDWARFImporterDelegate(dummyDWARFImporter);
   }
 
-  for (auto &Module : Modules)
-    if (!parseASTSection(*CI.getMemoryBufferSerializedModuleLoader(),
-                         StringRef(Module.first, Module.second), modules)) {
-      llvm::errs() << "error: Failed to parse AST section!\n";
+  llvm::SmallString<0> error;
+  llvm::raw_svector_ostream errs(error);
+  llvm::Triple filter(Filter);
+  for (auto &Module : Modules) {
+    auto Result = parseASTSection(
+        *CI.getMemoryBufferSerializedModuleLoader(),
+        StringRef(Module.first, Module.second), filter);
+    if (auto E = Result.takeError()) {
+      std::string error = toString(std::move(E));
+      llvm::errs() << "error: Failed to parse AST section! " << error << "\n";
       return 1;
     }
+    modules.insert(modules.end(), Result->begin(), Result->end());
+  }
 
   // Attempt to import all modules we found.
   for (auto path : modules) {

@@ -26,6 +26,7 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Initializer.h"
+#include "swift/AST/MacroDiscriminatorContext.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Pattern.h"
@@ -33,6 +34,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Subsystems.h"
@@ -196,7 +198,7 @@ class Verifier : public ASTWalker {
   SmallVector<ScopeLike, 4> Scopes;
 
   /// The stack of generic contexts.
-  using GenericLike = llvm::PointerUnion<DeclContext *, GenericSignature>;
+  using GenericLike = llvm::PointerUnion<DeclContext *, GenericEnvironment *>;
   SmallVector<GenericLike, 2> Generics;
 
   /// The stack of optional evaluations active at this point.
@@ -232,6 +234,11 @@ class Verifier : public ASTWalker {
       ClosureDiscriminators;
   DeclContext *CanonicalTopLevelSubcontext = nullptr;
 
+  typedef std::pair</*MacroDiscriminatorContext*/const void *, Identifier>
+      MacroExpansionDiscriminatorKey;
+  llvm::DenseMap<MacroExpansionDiscriminatorKey, SmallBitVector>
+      MacroExpansionDiscriminators;
+
   Verifier(PointerUnion<ModuleDecl *, SourceFile *> M, DeclContext *DC)
       : M(M),
         Ctx(M.is<ModuleDecl *>() ? M.get<ModuleDecl *>()->getASTContext()
@@ -262,6 +269,10 @@ public:
     if (auto SF = dyn_cast<SourceFile>(topDC))
       return Verifier(*SF, DC);
     return Verifier(topDC->getParentModule(), DC);
+  }
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::None;
   }
 
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
@@ -466,7 +477,7 @@ public:
         // For @objc enums, we serialize the pre-type-checked integer
         // literal raw values, and thus when they are deserialized
         // they do not have a type on them.
-        if (!isa<IntegerLiteralExpr>(E)) {
+        if (!isa<IntegerLiteralExpr>(E) && !isa<MacroExpansionExpr>(E)) {
           Out << "expression has no type\n";
           E->dump(Out);
           abort();
@@ -475,7 +486,7 @@ public:
       return true;
     }
     bool shouldVerifyChecked(Stmt *S) { return true; }
-    bool shouldVerifyChecked(Pattern *S) { return S->hasType(); }
+    bool shouldVerifyChecked(Pattern *S) { return true; }
     bool shouldVerifyChecked(Decl *S) { return true; }
 
     // Only verify functions if they have bodies we can safely walk.
@@ -485,7 +496,6 @@ public:
       switch (afd->getBodyKind()) {
       case AbstractFunctionDecl::BodyKind::None:
       case AbstractFunctionDecl::BodyKind::TypeChecked:
-      case AbstractFunctionDecl::BodyKind::Skipped:
       case AbstractFunctionDecl::BodyKind::SILSynthesize:
       case AbstractFunctionDecl::BodyKind::Deserialized:
         return true;
@@ -571,8 +581,14 @@ public:
         return;
       }
     }
+    void verifyChecked(Pattern *P) {
+      if (!P->hasType()) {
+        Out << "pattern has no type\n";
+        P->dump(Out);
+        abort();
+      }
+    }
     void verifyChecked(Stmt *S) {}
-    void verifyChecked(Pattern *P) { }
     void verifyChecked(Decl *D) {}
 
     void verifyChecked(Type type) {
@@ -590,6 +606,17 @@ public:
       if (type->hasTypeVariable()) {
         Out << "a type variable escaped the type checker\n";
         abort();
+      }
+
+      // Check for invalid pack expansion shape types.
+      if (auto *expansion = type->getAs<PackExpansionType>()) {
+        auto countType = expansion->getCountType();
+        if (!(countType->is<PackType>() ||
+              countType->is<PackArchetypeType>() ||
+              countType->isRootParameterPack())) {
+          Out << "non-pack shape type" << countType->getString() << "\n";
+          abort();
+        }
       }
 
       if (!type->hasArchetype())
@@ -634,10 +661,21 @@ public:
 
           auto genericCtx = Generics.back();
           GenericSignature genericSig;
-          if (auto *genericDC = genericCtx.dyn_cast<DeclContext *>())
+          if (auto *genericDC = genericCtx.dyn_cast<DeclContext *>()) {
             genericSig = genericDC->getGenericSignatureOfContext();
-          else
-            genericSig = genericCtx.get<GenericSignature>();
+          } else {
+            auto *genericEnv = genericCtx.get<GenericEnvironment *>();
+            genericSig = genericEnv->getGenericSignature();
+
+            // Check whether this archetype is a substitution from the
+            // outer generic context of an opened element environment.
+            if (genericEnv->getKind() == GenericEnvironment::Kind::OpenedElement) {
+              auto contextSubs = genericEnv->getPackElementContextSubstitutions();
+              QuerySubstitutionMap isInContext{contextSubs};
+              if (isInContext(root->getInterfaceType()->castTo<GenericTypeParamType>()))
+                return false;
+            }
+          }
 
           if (genericSig.getPointer() != archetypeSig.getPointer()) {
             Out << "Archetype " << root->getString() << " not allowed "
@@ -735,6 +773,7 @@ public:
     FUNCTION_LIKE(FuncDecl)
     FUNCTION_LIKE(EnumElementDecl)
     FUNCTION_LIKE(SubscriptDecl)
+    FUNCTION_LIKE(MacroDecl)
     TYPE_LIKE(NominalTypeDecl)
     TYPE_LIKE(ExtensionDecl)
 
@@ -824,30 +863,14 @@ public:
       if (!shouldVerify(cast<Expr>(expr)))
         return false;
 
-      Generics.push_back(expr->getGenericEnvironment()->getGenericSignature());
-
-      for (auto *placeholder : expr->getOpaqueValues()) {
-        assert(!OpaqueValues.count(placeholder));
-        OpaqueValues[placeholder] = 0;
-      }
-
+      Generics.push_back(expr->getGenericEnvironment());
       return true;
     }
 
-    void verifyCheckedAlways(PackExpansionExpr *E) {
-      // Remove the element generic environment before verifying
-      // the pack expansion type, which contains pack archetypes.
-      assert(Generics.back().get<GenericSignature>().getPointer() ==
-             E->getGenericEnvironment()->getGenericSignature().getPointer());
+    void cleanup(PackExpansionExpr *E) {
+      assert(Generics.back().get<GenericEnvironment *>() ==
+             E->getGenericEnvironment());
       Generics.pop_back();
-      verifyCheckedAlwaysBase(E);
-    }
-
-    void cleanup(PackExpansionExpr *expr) {
-      for (auto *placeholder : expr->getOpaqueValues()) {
-        assert(OpaqueValues.count(placeholder));
-        OpaqueValues.erase(placeholder);
-      }
     }
 
     bool shouldVerify(MakeTemporarilyEscapableExpr *expr) {
@@ -944,12 +967,13 @@ public:
 
       if (D->hasAccess()) {
         PrettyStackTraceDecl debugStack("verifying access", D);
-        if (!D->getASTContext().isAccessControlDisabled() &&
-            D->getFormalAccessScope().isPublic() &&
-            D->getFormalAccess() < AccessLevel::Public) {
-          Out << "non-public decl has no formal access scope\n";
-          D->dump(Out);
-          abort();
+        if (!D->getASTContext().isAccessControlDisabled()) {
+          if (D->getFormalAccessScope().isPublic() &&
+              D->getFormalAccess() < AccessLevel::Public) {
+            Out << "non-public decl has no formal access scope\n";
+            D->dump(Out);
+            abort();
+          }
         }
         if (D->getEffectiveAccess() == AccessLevel::Private) {
           Out << "effective access should use 'fileprivate' for 'private'\n";
@@ -989,9 +1013,15 @@ public:
     }
 
     void verifyChecked(ThrowStmt *S) {
-      checkSameType(S->getSubExpr()->getType(),
-                    checkExceptionTypeExists("throw expression"),
-                    "throw operand");
+      Type thrownError;
+      if (!Functions.empty()) {
+        if (auto fn = AnyFunctionRef::fromDeclContext(Functions.back()))
+          thrownError = fn->getThrownErrorType();
+      }
+
+      if (!thrownError)
+        thrownError = checkExceptionTypeExists("throw expression");
+      checkSameType(S->getSubExpr()->getType(), thrownError, "throw operand");
       verifyCheckedBase(S);
     }
 
@@ -1184,6 +1214,31 @@ public:
       
       checkSameType(DestTy, srcObj, "object types for InOutExpr");
       verifyCheckedBase(E);
+    }
+
+    void verifyChecked(SingleValueStmtExpr *E) {
+      using Kind = IsSingleValueStmtResult::Kind;
+      switch (E->getStmt()->mayProduceSingleValue(Ctx).getKind()) {
+      case Kind::NoResult:
+        // These are allowed as long as the type is Void.
+        checkSameType(
+            E->getType(), Ctx.getVoidType(),
+            "SingleValueStmtExpr with no expression branches must be Void");
+        break;
+      case Kind::UnterminatedBranches:
+      case Kind::NonExhaustiveIf:
+      case Kind::UnhandledStmt:
+      case Kind::CircularReference:
+      case Kind::HasLabel:
+      case Kind::InvalidJumps:
+        // These should have been diagnosed.
+        Out << "invalid SingleValueStmtExpr should be been diagnosed:\n";
+        E->dump(Out);
+        Out << "\n";
+        abort();
+      case Kind::Valid:
+        break;
+      }
     }
 
     void verifyParsed(AbstractClosureExpr *E) {
@@ -2374,6 +2429,50 @@ public:
 
         if (!strippedFrom->isEqual(strippedTo))
           error("possibly non-ABI safe conversion", E);
+      }
+    }
+
+    void verifyChecked(MacroExpansionExpr *expansion) {
+      MacroExpansionDiscriminatorKey key{
+        MacroDiscriminatorContext::getParentOf(expansion).getOpaqueValue(),
+        expansion->getMacroName().getBaseName().getIdentifier()
+      };
+      auto &discriminatorSet = MacroExpansionDiscriminators[key];
+      unsigned discriminator = expansion->getDiscriminator();
+
+      if (discriminator >= discriminatorSet.size()) {
+        discriminatorSet.resize(discriminator+1);
+        discriminatorSet.set(discriminator);
+      } else if (discriminatorSet.test(discriminator)) {
+        Out << "a macro expansion must have a unique discriminator "
+            << "in its context\n";
+        expansion->dump(Out);
+        Out << "\n";
+        abort();
+      } else {
+        discriminatorSet.set(discriminator);
+      }
+    }
+
+    void verifyChecked(MacroExpansionDecl *expansion) {
+      MacroExpansionDiscriminatorKey key{
+        MacroDiscriminatorContext::getParentOf(expansion).getOpaqueValue(),
+        expansion->getMacroName().getBaseName().getIdentifier()
+      };
+      auto &discriminatorSet = MacroExpansionDiscriminators[key];
+      unsigned discriminator = expansion->getDiscriminator();
+
+      if (discriminator >= discriminatorSet.size()) {
+        discriminatorSet.resize(discriminator+1);
+        discriminatorSet.set(discriminator);
+      } else if (discriminatorSet.test(discriminator)) {
+        Out << "a macro expansion must have a unique discriminator "
+            << "in its context\n";
+        expansion->dump(Out);
+        Out << "\n";
+        abort();
+      } else {
+        discriminatorSet.set(discriminator);
       }
     }
 
@@ -3659,12 +3758,13 @@ public:
     void checkSourceRanges(Decl *D) {
       PrettyStackTraceDecl debugStack("verifying ranges", D);
       const auto SR = D->getSourceRange();
+
+      // We don't care about source ranges on implicitly-generated
+      // decls.
+      if (D->isImplicit())
+        return;
+
       if (!SR.isValid()) {
-        // We don't care about source ranges on implicitly-generated
-        // decls.
-        if (D->isImplicit())
-          return;
-        
         Out << "invalid source range for decl: ";
         D->print(Out);
         Out << "\n";
@@ -3696,6 +3796,18 @@ public:
         return;
       } else if (Decl *D = Parent.getAsDecl()) {
         Enclosing = D->getSourceRange();
+
+        // If the current source range is in a macro expansion buffer, its enclosing
+        // context can be in the source file where the macro expansion originated. In
+        // this case, grab the source range of the original ASTNode that was expanded.
+        if (!Ctx.SourceMgr.rangeContains(Enclosing, Current)) {
+          auto *expansionBuffer =
+              D->getModuleContext()->getSourceFileContainingLocation(Current.Start);
+          if (auto expansion = expansionBuffer->getMacroExpansion()) {
+            Current = expansion.getSourceRange();
+          }
+        }
+
         if (D->isImplicit())
           return;
         // FIXME: This is not working well for decl parents.

@@ -28,6 +28,7 @@
 // %l = load %s                               the access
 // ```
 //===----------------------------------------------------------------------===//
+
 import SIL
 
 /// AccessBase describes the base address of a memory access (e.g. of a `load` or `store``).
@@ -68,7 +69,7 @@ enum AccessBase : CustomStringConvertible, Hashable {
   case argument(FunctionArgument)
   
   /// An indirect result of a `begin_apply`.
-  case yield(BeginApplyInst)
+  case yield(MultipleValueInstructionResult)
 
   /// An address which is derived from a `Builtin.RawPointer`.
   case pointer(PointerToAddressInst)
@@ -86,8 +87,8 @@ enum AccessBase : CustomStringConvertible, Hashable {
     case let arg as FunctionArgument     : self = .argument(arg)
     case let ga as GlobalAddrInst        : self = .global(ga.global)
     case let mvr as MultipleValueInstructionResult:
-      if let ba = mvr.instruction as? BeginApplyInst, baseAddress.type.isAddress {
-        self = .yield(ba)
+      if mvr.parentInstruction is BeginApplyInst && baseAddress.type.isAddress {
+        self = .yield(mvr)
       } else {
         self = .unidentified
       }
@@ -103,9 +104,9 @@ enum AccessBase : CustomStringConvertible, Hashable {
       case .stack(let asi):    return "stack - \(asi)"
       case .global(let gl):    return "global - @\(gl.name)"
       case .class(let rea):    return "class  - \(rea)"
-      case .tail(let rta):     return "tail - \(rta.operand)"
+      case .tail(let rta):     return "tail - \(rta.instance)"
       case .argument(let arg): return "argument - \(arg)"
-      case .yield(let ba):     return "yield - \(ba)"
+      case .yield(let result): return "yield - \(result)"
       case .pointer(let p):    return "pointer - \(p)"
     }
   }
@@ -123,13 +124,32 @@ enum AccessBase : CustomStringConvertible, Hashable {
   /// The reference value if this is an access to a referenced objecct (class, box, tail).
   var reference: Value? {
     switch self {
-      case .box(let pbi):      return pbi.operand
-      case .class(let rea):    return rea.operand
-      case .tail(let rta):     return rta.operand
+      case .box(let pbi):      return pbi.box
+      case .class(let rea):    return rea.instance
+      case .tail(let rta):     return rta.instance
       case .stack, .global, .argument, .yield, .pointer, .unidentified:
         return nil
     }
   }
+
+  /// True if this access base may be derived from a reference that is only valid within a locally
+  /// scoped OSSA lifetime. For example:
+  ///
+  ///   %reference = begin_borrow %1
+  ///   %base = ref_tail_addr %reference     <- %base must not be used outside the borrow scope
+  ///   end_borrow %reference
+  ///
+  /// This is not true for scoped storage such as alloc_stack and @in arguments.
+  ///
+  var hasLocalOwnershipLifetime: Bool {
+    if let reference = reference {
+      // Conservatively assume that everything which is a ref-counted object is within an ownership scope.
+      // TODO: we could e.g. exclude guaranteed function arguments.
+      return reference.ownership != .none
+    }
+    return false
+  }
+
   /// True, if the baseAddress is of an immutable property or global variable
   var isLet: Bool {
     switch self {
@@ -143,9 +163,9 @@ enum AccessBase : CustomStringConvertible, Hashable {
   /// True, if the address is immediately produced by an allocation in its function.
   var isLocal: Bool {
     switch self {
-      case .box(let pbi):      return pbi.operand is AllocBoxInst
-      case .class(let rea):    return rea.operand is AllocRefInstBase
-      case .tail(let rta):     return rta.operand is AllocRefInstBase
+      case .box(let pbi):      return pbi.box is AllocBoxInst
+      case .class(let rea):    return rea.instance is AllocRefInstBase
+      case .tail(let rta):     return rta.instance is AllocRefInstBase
       case .stack:             return true
       case .global, .argument, .yield, .pointer, .unidentified:
         return false
@@ -159,6 +179,36 @@ enum AccessBase : CustomStringConvertible, Hashable {
         return true
       case .argument, .yield, .pointer, .unidentified:
         return false
+    }
+  }
+
+  /// Returns true if it's guaranteed that this access has the same base address as the `other` access.
+  ///
+  /// `isEqual` abstracts away the projection instructions that are included as part of the AccessBase:
+  /// multiple `project_box` and `ref_element_addr` instructions are equivalent bases as long as they
+  /// refer to the same variable or class property.
+  func isEqual(to other: AccessBase) -> Bool {
+    switch (self, other) {
+    case (.box(let pb1), .box(let pb2)):
+      return pb1.box.referenceRoot == pb2.box.referenceRoot
+    case (.class(let rea1), .class(let rea2)):
+      return rea1.fieldIndex == rea2.fieldIndex &&
+             rea1.instance.referenceRoot == rea2.instance.referenceRoot
+    case (.tail(let rta1), .tail(let rta2)):
+      return rta1.instance.referenceRoot == rta2.instance.referenceRoot &&
+             rta1.type == rta2.type
+    case (.stack(let as1), .stack(let as2)):
+      return as1 == as2
+    case (.global(let gl1), .global(let gl2)):
+      return gl1 == gl2
+    case (.argument(let arg1), .argument(let arg2)):
+      return arg1 == arg2
+    case (.yield(let baResult1), .yield(let baResult2)):
+      return baResult1 == baResult2
+    case (.pointer(let p1), .pointer(let p2)):
+      return p1 == p2
+    default:
+      return false
     }
   }
 
@@ -193,16 +243,16 @@ enum AccessBase : CustomStringConvertible, Hashable {
     // First handle all pairs of the same kind (except `yield` and `pointer`).
     case (.box(let pb), .box(let otherPb)):
       return pb.fieldIndex != otherPb.fieldIndex ||
-             isDifferentAllocation(pb.operand, otherPb.operand)
+             isDifferentAllocation(pb.box, otherPb.box)
     case (.stack(let asi), .stack(let otherAsi)):
       return asi != otherAsi
     case (.global(let global), .global(let otherGlobal)):
       return global != otherGlobal
     case (.class(let rea), .class(let otherRea)):
       return rea.fieldIndex != otherRea.fieldIndex ||
-             isDifferentAllocation(rea.operand, otherRea.operand)
+             isDifferentAllocation(rea.instance, otherRea.instance)
     case (.tail(let rta), .tail(let otherRta)):
-      return isDifferentAllocation(rta.operand, otherRta.operand)
+      return isDifferentAllocation(rta.instance, otherRta.instance)
     case (.argument(let arg), .argument(let otherArg)):
       return (arg.convention.isExclusiveIndirect || otherArg.convention.isExclusiveIndirect) && arg != otherArg
       
@@ -251,6 +301,51 @@ struct AccessPath : CustomStringConvertible {
     }
     return false
   }
+
+  /// Returns true if this access addresses the same memory location as `other` or if `other`
+  /// is a sub-field of this access.
+
+  /// Note that this access _contains_ `other` if `other` has a _larger_ projection path than this acccess.
+  /// For example:
+  ///   `%value.s0` contains `%value.s0.s1`
+  func isEqualOrContains(_ other: AccessPath) -> Bool {
+    return getProjection(to: other) != nil
+  }
+
+  var materializableProjectionPath: SmallProjectionPath? {
+    if projectionPath.isMaterializable {
+      return projectionPath
+    }
+    return nil
+  }
+
+  /// Returns the projection path to `other` if this access path is equal or contains `other`.
+  ///
+  /// For example,
+  ///   `%value.s0`.getProjection(to: `%value.s0.s1`)
+  /// yields
+  ///   `s1`
+  func getProjection(to other: AccessPath) -> SmallProjectionPath? {
+    if !base.isEqual(to: other.base) {
+      return nil
+    }
+    if let resultPath = projectionPath.subtract(from: other.projectionPath),
+       // Indexing is not a projection where the base overlaps the projected address.
+       !resultPath.pop().kind.isIndexedElement
+    {
+      return resultPath
+    }
+    return nil
+  }
+
+  /// Like `getProjection`, but also requires that the resulting projection path is materializable.
+  func getMaterializableProjection(to other: AccessPath) -> SmallProjectionPath? {
+    if let projectionPath = getProjection(to: other),
+       projectionPath.isMaterializable {
+      return projectionPath
+    }
+    return nil
+  }
 }
 
 private func canBeOperandOfIndexAddr(_ value: Value) -> Bool {
@@ -279,14 +374,14 @@ extension PointerToAddressInst {
 
       mutating func rootDef(value: Value, path: SmallProjectionPath) -> WalkResult {
         if let atp = value as? AddressToPointerInst {
-          if let res = result, atp.operand != res {
+          if let res = result, atp.address != res {
             return .abortWalk
           }
 
-          if addrType != atp.operand.type { return .abortWalk }
+          if addrType != atp.address.type { return .abortWalk }
           if !path.isEmpty { return .abortWalk }
 
-          self.result = atp.operand
+          self.result = atp.address
           return .continueWalk
         }
         return .abortWalk
@@ -294,9 +389,8 @@ extension PointerToAddressInst {
 
       mutating func walkUp(value: Value, path: SmallProjectionPath) -> WalkResult {
         switch value {
-        case is BlockArgument, is MarkDependenceInst, is CopyValueInst,
-             is StructExtractInst, is TupleExtractInst, is StructInst, is TupleInst,
-             is FunctionArgument, is AddressToPointerInst:
+        case is Argument, is MarkDependenceInst, is CopyValueInst,
+             is StructExtractInst, is TupleExtractInst, is StructInst, is TupleInst, is AddressToPointerInst:
           return walkUpDefault(value: value, path: path)
         default:
           return .abortWalk
@@ -305,7 +399,7 @@ extension PointerToAddressInst {
     }
 
     var walker = Walker(addrType: type)
-    if walker.walkUp(value: operand, path: SmallProjectionPath()) == .abortWalk {
+    if walker.walkUp(value: pointer, path: SmallProjectionPath()) == .abortWalk {
       return nil
     }
     return walker.result
@@ -449,6 +543,27 @@ extension Value {
     }
     return .base(walker.result.base)
   }
+
+  /// The root definition of a reference, obtained by skipping casts, etc.
+  var referenceRoot: Value {
+    var value: Value = self
+    while true {
+      switch value {
+      case is BeginBorrowInst, is CopyValueInst, is MoveValueInst,
+           is EndInitLetRefInst,
+           is BeginDeallocRefInst,
+           is UpcastInst, is UncheckedRefCastInst, is EndCOWMutationInst:
+        value = (value as! Instruction).operands[0].value
+      case let mvr as MultipleValueInstructionResult:
+        guard  let bcm = mvr.parentInstruction as? BeginCOWMutationInst else {
+          return value
+        }
+        value = bcm.instance
+      default:
+        return value
+      }
+    }
+  }
 }
 
 /// A ValueUseDef walker that that visits access storage paths of an address.
@@ -473,11 +588,11 @@ extension ValueUseDefWalker where Path == SmallProjectionPath {
     let path = accessPath.projectionPath
     switch accessPath.base {
       case .box(let pbi):
-        return walkUp(value: pbi.operand, path: path.push(.classField, index: pbi.fieldIndex)) != .abortWalk
+        return walkUp(value: pbi.box, path: path.push(.classField, index: pbi.fieldIndex)) != .abortWalk
       case .class(let rea):
-        return walkUp(value: rea.operand, path: path.push(.classField, index: rea.fieldIndex)) != .abortWalk
+        return walkUp(value: rea.instance, path: path.push(.classField, index: rea.fieldIndex)) != .abortWalk
       case .tail(let rta):
-        return walkUp(value: rta.operand, path: path.push(.tailElements, index: 0)) != .abortWalk
+        return walkUp(value: rta.instance, path: path.push(.tailElements, index: 0)) != .abortWalk
       case .stack, .global, .argument, .yield, .pointer, .unidentified:
         return false
     }

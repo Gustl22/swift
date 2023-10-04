@@ -10,7 +10,7 @@ extension extension_for_invalid_type_3 { // expected-error {{cannot find type 'e
   init() {}
 }
 extension extension_for_invalid_type_4 { // expected-error {{cannot find type 'extension_for_invalid_type_4' in scope}}
-  deinit {} // expected-error {{deinitializers may only be declared within a class or actor}}
+  deinit {} // expected-error {{deinitializers may only be declared within a class, actor, or noncopyable type}}
 }
 extension extension_for_invalid_type_5 { // expected-error {{cannot find type 'extension_for_invalid_type_5' in scope}}
   typealias X = Int
@@ -87,11 +87,6 @@ protocol P1 {}
 
 protocol P2 {}
 
-extension () {} // expected-error {{non-nominal type '()' cannot be extended}} {{educational-notes=nominal-types}}
-
-typealias TupleAlias = (x: Int, y: Int)
-extension TupleAlias {} // expected-error{{non-nominal type 'TupleAlias' (aka '(x: Int, y: Int)') cannot be extended}} {{educational-notes=nominal-types}}
-
 // Test property accessors in extended types
 class C {}
 extension C {
@@ -143,7 +138,7 @@ class JustAClass: DoesNotImposeClassReq_1 {
   var property: String = ""
 }
 
-extension DoesNotImposeClassReq_1 where Self: JustAClass {
+extension DoesNotImposeClassReq_1 where Self: JustAClass { // expected-warning{{redundant conformance constraint 'JustAClass' : 'DoesNotImposeClassReq_1'}}
   var wrappingProperty1: String {
     get { return property }
     set { property = newValue } // Okay
@@ -244,7 +239,7 @@ class JustAClass1: DoesNotImposeClassReq_3 {
   var someProperty = 0
 }
 
-extension DoesNotImposeClassReq_3 where Self: JustAClass1 {
+extension DoesNotImposeClassReq_3 where Self: JustAClass1 { // expected-warning {{redundant conformance constraint 'JustAClass1' : 'DoesNotImposeClassReq_3'}}
   var anotherProperty1: Int {
     get { return someProperty }
     set { someProperty = newValue } // Okay
@@ -349,7 +344,7 @@ extension Tree.LimbContent.Contents {
 
 extension Tree.BoughPayload.Contents {
   // expected-error@-1 {{extension of type 'Tree.BoughPayload.Contents' (aka 'Nest<Int>') must be declared as an extension of 'Nest<Int>'}}
-  // expected-note@-2 {{did you mean to extend 'Nest<Int>' instead?}}
+  // expected-note@-2 {{did you mean to extend 'Nest<Int>' instead?}} {{11-37=Nest<Int>}}
 }
 
 // https://github.com/apple/swift/issues/52866
@@ -367,3 +362,25 @@ protocol Rdar66943328 {
 }
 extension Rdar66943328 where Assoc == Int // expected-error {{expected '{' in extension}}
 #endif
+
+// Reject extension of existential type
+
+protocol P4 {}
+
+extension any P4 {
+// expected-error@-1 {{extension of existential type 'any P4' is not supported}}
+// expected-note@-2 {{did you mean to extend 'P4' instead?}} {{11-17=P4}}
+}
+
+typealias A4 = P4
+
+extension any A4 {
+// expected-error@-1 {{extension of existential type 'any A4' (aka 'any P4') is not supported}}
+// expected-note@-2 {{did you mean to extend 'P4' instead?}} {{11-17=P4}}
+}
+
+typealias B4 = any P4
+extension B4 {
+// expected-error@-1 {{extension of existential type 'B4' (aka 'any P4') is not supported}}
+// expected-note@-2 {{did you mean to extend 'P4' instead?}} {{11-13=P4}}
+}

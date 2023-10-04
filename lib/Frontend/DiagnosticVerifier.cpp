@@ -26,38 +26,107 @@
 
 using namespace swift;
 
+namespace {
+
+struct ExpectedCheckMatchStartParser {
+  StringRef MatchStart;
+  const char *ClassificationStartLoc = nullptr;
+  std::optional<DiagnosticKind> ExpectedClassification;
+
+  ExpectedCheckMatchStartParser(StringRef MatchStart)
+      : MatchStart(MatchStart) {}
+
+  bool tryParseClassification() {
+    if (MatchStart.startswith("note")) {
+      ClassificationStartLoc = MatchStart.data();
+      ExpectedClassification = DiagnosticKind::Note;
+      MatchStart = MatchStart.substr(strlen("note"));
+      return true;
+    }
+
+    if (MatchStart.startswith("warning")) {
+      ClassificationStartLoc = MatchStart.data();
+      ExpectedClassification = DiagnosticKind::Warning;
+      MatchStart = MatchStart.substr(strlen("warning"));
+      return true;
+    }
+
+    if (MatchStart.startswith("error")) {
+      ClassificationStartLoc = MatchStart.data();
+      ExpectedClassification = DiagnosticKind::Error;
+      MatchStart = MatchStart.substr(strlen("error"));
+      return true;
+    }
+
+    if (MatchStart.startswith("remark")) {
+      ClassificationStartLoc = MatchStart.data();
+      ExpectedClassification = DiagnosticKind::Remark;
+      MatchStart = MatchStart.substr(strlen("remark"));
+      return true;
+    }
+
+    return false;
+  }
+
+  bool parse(ArrayRef<std::string> prefixes) {
+    // First try to parse as if we did not have a prefix. We always parse at
+    // least expected-*.
+    if (tryParseClassification())
+      return true;
+
+    // Otherwise, walk our prefixes until we find one that matches and attempt
+    // to check for a note, warning, error, or remark.
+    //
+    // TODO: We could make this more flexible, but this should work in the
+    // short term.
+    for (auto &p : prefixes) {
+      if (MatchStart.starts_with(p)) {
+        MatchStart = MatchStart.substr(p.size());
+        return tryParseClassification();
+      }
+    }
+
+    return false;
+  }
+};
+
+} // anonymous namespace
+
 namespace swift {
+
 struct ExpectedFixIt {
   const char *StartLoc, *EndLoc; // The loc of the {{ and }}'s.
   LineColumnRange Range;
 
   std::string Text;
 };
-} // end namespace swift
 
-constexpr unsigned LineColumnRange::NoValue;
+} // end namespace swift
 
 const LineColumnRange &
 CapturedFixItInfo::getLineColumnRange(const SourceManager &SM,
-                                      unsigned BufferID,
-                                      bool ComputeStartLocLine,
-                                      bool ComputeEndLocLine) const {
-  if (LineColRange.StartLine == LineColumnRange::NoValue &&
-      ComputeStartLocLine) {
-    std::tie(LineColRange.StartLine, LineColRange.StartCol) =
-        SM.getPresumedLineAndColumnForLoc(getSourceRange().getStart(),
-                                          BufferID);
-  } else if (LineColRange.StartCol == LineColumnRange::NoValue) {
-    LineColRange.StartCol =
-        SM.getColumnInBuffer(getSourceRange().getStart(), BufferID);
+                                      unsigned BufferID) const {
+  if (LineColRange.StartLine != 0) {
+    // Already computed.
+    return LineColRange;
   }
 
-  if (LineColRange.EndLine == LineColumnRange::NoValue && ComputeEndLocLine) {
+  auto SrcRange = FixIt.getRange();
+
+  std::tie(LineColRange.StartLine, LineColRange.StartCol) =
+      SM.getPresumedLineAndColumnForLoc(SrcRange.getStart(), BufferID);
+
+  // We don't have to compute much if the end location is on the same line.
+  if (SrcRange.getByteLength() == 0) {
+    LineColRange.EndLine = LineColRange.StartLine;
+    LineColRange.EndCol = LineColRange.StartCol;
+  } else if (SM.extractText(SrcRange, BufferID).find_first_of("\n\r") ==
+             StringRef::npos) {
+    LineColRange.EndLine = LineColRange.StartLine;
+    LineColRange.EndCol = LineColRange.StartCol + SrcRange.getByteLength();
+  } else {
     std::tie(LineColRange.EndLine, LineColRange.EndCol) =
-        SM.getPresumedLineAndColumnForLoc(FixIt.getRange().getEnd(), BufferID);
-  } else if (LineColRange.EndCol == LineColumnRange::NoValue) {
-    LineColRange.EndCol =
-        SM.getColumnInBuffer(getSourceRange().getEnd(), BufferID);
+        SM.getPresumedLineAndColumnForLoc(SrcRange.getEnd(), BufferID);
   }
 
   return LineColRange;
@@ -92,7 +161,7 @@ struct ExpectedDiagnosticInfo {
   // This is the message string with escapes expanded.
   std::string MessageStr;
   unsigned LineNo = ~0U;
-  Optional<unsigned> ColumnNo;
+  llvm::Optional<unsigned> ColumnNo;
 
   using AlternativeExpectedFixIts = std::vector<ExpectedFixIt>;
   std::vector<AlternativeExpectedFixIts> Fixits = {};
@@ -109,7 +178,7 @@ struct ExpectedDiagnosticInfo {
                              llvm::SmallVector<StringRef, 1> Names)
         : StartLoc(StartLoc), EndLoc(EndLoc), Names(Names) {}
   };
-  Optional<ExpectedEducationalNotes> EducationalNotes;
+  llvm::Optional<ExpectedEducationalNotes> EducationalNotes;
 
   ExpectedDiagnosticInfo(const char *ExpectedStart,
                          const char *ClassificationStart,
@@ -162,7 +231,7 @@ findDiagnostic(std::vector<CapturedDiagnosticInfo> &CapturedDiagnostics,
       continue;
 
     // If a specific column was expected, verify it.
-    if (Expected.ColumnNo.hasValue() && I->Column != *Expected.ColumnNo)
+    if (Expected.ColumnNo.has_value() && I->Column != *Expected.ColumnNo)
       continue;
 
     // Verify the classification and string.
@@ -293,23 +362,11 @@ bool DiagnosticVerifier::checkForFixIt(
       if (ActualFixIt.getText() != Expected.Text)
         continue;
 
-      LineColumnRange ActualRange = ActualFixIt.getLineColumnRange(
-          SM, BufferID,
-          // Don't compute line numbers unless we have to.
-          /*ComputeStartLocLine=*/Expected.Range.StartLine !=
-              LineColumnRange::NoValue,
-          /*ComputeEndLocLine=*/Expected.Range.EndLine !=
-              LineColumnRange::NoValue);
+      auto &ActualRange = ActualFixIt.getLineColumnRange(SM, BufferID);
 
       if (Expected.Range.StartCol != ActualRange.StartCol ||
-          Expected.Range.EndCol != ActualRange.EndCol) {
-        continue;
-      }
-      if (Expected.Range.StartLine != LineColumnRange::NoValue &&
-          Expected.Range.StartLine != ActualRange.StartLine) {
-        continue;
-      }
-      if (Expected.Range.EndLine != LineColumnRange::NoValue &&
+          Expected.Range.EndCol != ActualRange.EndCol ||
+          Expected.Range.StartLine != ActualRange.StartLine ||
           Expected.Range.EndLine != ActualRange.EndLine) {
         continue;
       }
@@ -329,10 +386,7 @@ DiagnosticVerifier::renderFixits(ArrayRef<CapturedFixItInfo> ActualFixIts,
   interleave(
       ActualFixIts,
       [&](const CapturedFixItInfo &ActualFixIt) {
-        LineColumnRange ActualRange =
-            ActualFixIt.getLineColumnRange(SM, BufferID,
-                                           /*ComputeStartLocLine=*/true,
-                                           /*ComputeEndLocLine=*/true);
+        auto &ActualRange = ActualFixIt.getLineColumnRange(SM, BufferID);
         OS << "{{";
 
         if (ActualRange.StartLine != DiagnosticLineNo)
@@ -367,24 +421,28 @@ DiagnosticVerifier::renderFixits(ArrayRef<CapturedFixItInfo> ActualFixIts,
 ///
 /// \param DiagnosticLineNo The line number of the associated expected
 /// diagnostic; used to turn line offsets into line numbers.
-static Optional<LineColumnRange> parseExpectedFixItRange(
+static llvm::Optional<LineColumnRange> parseExpectedFixItRange(
     StringRef &Str, unsigned DiagnosticLineNo,
     llvm::function_ref<void(const char *, const Twine &)> diagnoseError) {
   assert(!Str.empty());
 
-  const auto parseLineAndColumn =
-      [&]() -> Optional<std::pair<unsigned, unsigned>> {
-    enum class LineOffsetKind : uint8_t { None, Plus, Minus };
+  struct ParsedLineAndColumn {
+    llvm::Optional<unsigned> Line;
+    unsigned Column;
+  };
 
-    LineOffsetKind lineOffsetKind = LineOffsetKind::None;
+  const auto parseLineAndColumn = [&]() -> llvm::Optional<ParsedLineAndColumn> {
+    enum class OffsetKind : uint8_t { None, Plus, Minus };
+
+    OffsetKind LineOffsetKind = OffsetKind::None;
     if (!Str.empty()) {
       switch (Str.front()) {
       case '+':
-        lineOffsetKind = LineOffsetKind::Plus;
+        LineOffsetKind = OffsetKind::Plus;
         Str = Str.drop_front();
         break;
       case '-':
-        lineOffsetKind = LineOffsetKind::Minus;
+        LineOffsetKind = OffsetKind::Minus;
         Str = Str.drop_front();
         break;
       default:
@@ -392,63 +450,63 @@ static Optional<LineColumnRange> parseExpectedFixItRange(
       }
     }
 
-    unsigned firstNumber = LineColumnRange::NoValue;
-    if (Str.consumeInteger(10, firstNumber)) {
-      if (lineOffsetKind > LineOffsetKind::None) {
+    unsigned FirstVal = 0;
+    if (Str.consumeInteger(10, FirstVal)) {
+      if (LineOffsetKind == OffsetKind::None) {
+        diagnoseError(Str.data(),
+                      "expected line or column number in fix-it verification");
+      } else {
         diagnoseError(Str.data(),
                       "expected line offset after leading '+' or '-' in fix-it "
                       "verification");
-      } else {
-        diagnoseError(Str.data(),
-                      "expected line or column number in fix-it verification");
       }
-      return None;
+      return llvm::None;
     }
 
-    unsigned secondNumber = LineColumnRange::NoValue;
-    if (!Str.empty() && Str.front() == ':') {
-      Str = Str.drop_front();
-
-      if (Str.consumeInteger(10, secondNumber)) {
-        diagnoseError(
-            Str.data(),
-            "expected column number after ':' in fix-it verification");
-        return None;
+    // If the first value is not followed by a colon, it is either a column or a
+    // line offset that is missing a column.
+    if (Str.empty() || Str.front() != ':') {
+      if (LineOffsetKind == OffsetKind::None) {
+        return ParsedLineAndColumn{llvm::None, FirstVal};
       }
-    } else if (lineOffsetKind > LineOffsetKind::None) {
+
       diagnoseError(Str.data(),
                     "expected colon-separated column number after line offset "
                     "in fix-it verification");
-      return None;
+      return llvm::None;
     }
 
-    if (secondNumber == LineColumnRange::NoValue) {
-      // If only one value is specified, it's a column number;
-      return std::make_pair(LineColumnRange::NoValue, firstNumber);
+    unsigned Column = 0;
+    Str = Str.drop_front();
+    if (Str.consumeInteger(10, Column)) {
+      diagnoseError(Str.data(),
+                    "expected column number after ':' in fix-it verification");
+      return llvm::None;
     }
 
-    unsigned lineNo = DiagnosticLineNo;
-    switch (lineOffsetKind) {
-    case LineOffsetKind::None:
-      lineNo = firstNumber;
+    // Apply the offset relative to the line of the expected diagnostic.
+    switch (LineOffsetKind) {
+    case OffsetKind::None:
       break;
-    case LineOffsetKind::Plus:
-      lineNo += firstNumber;
+    case OffsetKind::Plus:
+      FirstVal += DiagnosticLineNo;
       break;
-    case LineOffsetKind::Minus:
-      lineNo -= firstNumber;
+    case OffsetKind::Minus:
+      FirstVal = DiagnosticLineNo - FirstVal;
       break;
     }
 
-    return std::make_pair(lineNo, secondNumber);
+    return ParsedLineAndColumn{FirstVal, Column};
   };
 
   LineColumnRange Range;
 
-  if (const auto lineAndCol = parseLineAndColumn()) {
-    std::tie(Range.StartLine, Range.StartCol) = lineAndCol.getValue();
+  if (const auto LineAndCol = parseLineAndColumn()) {
+    // The start line defaults to the line of the expected diagnostic.
+    Range.StartLine = LineAndCol->Line.value_or(DiagnosticLineNo);
+    Range.StartCol = LineAndCol->Column;
   } else {
-    return None;
+    return llvm::None;
   }
 
   if (!Str.empty() && Str.front() == '-') {
@@ -456,16 +514,40 @@ static Optional<LineColumnRange> parseExpectedFixItRange(
   } else {
     diagnoseError(Str.data(),
                   "expected '-' range separator in fix-it verification");
-    return None;
+    return llvm::None;
   }
 
-  if (const auto lineAndCol = parseLineAndColumn()) {
-    std::tie(Range.EndLine, Range.EndCol) = lineAndCol.getValue();
+  if (const auto LineAndCol = parseLineAndColumn()) {
+    // The end line defaults to the start line.
+    Range.EndLine = LineAndCol->Line.value_or(Range.StartLine);
+    Range.EndCol = LineAndCol->Column;
   } else {
-    return None;
+    return llvm::None;
   }
 
   return Range;
+}
+
+/// Before we do anything, check if any of our prefixes are prefixes of later
+/// prefixes. In such a case, we will never actually pattern match the later
+/// prefix. In such a case, crash with a nice error message.
+static void validatePrefixList(ArrayRef<std::string> prefixes) {
+  // Work backwards through the prefix list.
+  while (!prefixes.empty()) {
+    auto target = StringRef(prefixes.front());
+    prefixes = prefixes.drop_front();
+
+    for (auto &p : prefixes) {
+      if (StringRef(p).starts_with(target)) {
+        llvm::errs() << "Error! Found a verifier diagnostic additional prefix "
+                        "that is a prefix of a later prefix. The later prefix "
+                        "will never be pattern matched!\n"
+                     << "First Prefix: " << target << '\n'
+                     << "Second Prefix: " << p << '\n';
+        llvm::report_fatal_error("Standard compiler error!\n");
+      }
+    }
+  }
 }
 
 /// After the file has been processed, check to see if we got all of
@@ -494,6 +576,10 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
     Errors.push_back(diag);
   };
 
+  // Validate that earlier prefixes are not prefixes of alter
+  // prefixes... otherwise, we will never pattern match the later prefix.
+  validatePrefixList(AdditionalExpectedPrefixes);
+
   // Scan the memory buffer looking for expected-note/warning/error.
   for (size_t Match = InputFile.find("expected-");
        Match != StringRef::npos; Match = InputFile.find("expected-", Match+1)) {
@@ -502,23 +588,21 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
     StringRef MatchStart = InputFile.substr(Match);
     const char *DiagnosticLoc = MatchStart.data();
     MatchStart = MatchStart.substr(strlen("expected-"));
-    const char *ClassificationStartLoc = MatchStart.data();
 
-    DiagnosticKind ExpectedClassification;
-    if (MatchStart.startswith("note")) {
-      ExpectedClassification = DiagnosticKind::Note;
-      MatchStart = MatchStart.substr(strlen("note"));
-    } else if (MatchStart.startswith("warning")) {
-      ExpectedClassification = DiagnosticKind::Warning;
-      MatchStart = MatchStart.substr(strlen("warning"));
-    } else if (MatchStart.startswith("error")) {
-      ExpectedClassification = DiagnosticKind::Error;
-      MatchStart = MatchStart.substr(strlen("error"));
-    } else if (MatchStart.startswith("remark")) {
-      ExpectedClassification = DiagnosticKind::Remark;
-      MatchStart = MatchStart.substr(strlen("remark"));
-    } else
-      continue;
+    const char *ClassificationStartLoc = nullptr;
+    std::optional<DiagnosticKind> ExpectedClassification;
+    {
+      ExpectedCheckMatchStartParser parser(MatchStart);
+      // If we fail to parse... continue.
+      if (!parser.parse(AdditionalExpectedPrefixes)) {
+        continue;
+      }
+      MatchStart = parser.MatchStart;
+      ClassificationStartLoc = parser.ClassificationStartLoc;
+      ExpectedClassification = parser.ExpectedClassification;
+    }
+    assert(ClassificationStartLoc);
+    assert(bool(ExpectedClassification));
 
     // Skip any whitespace before the {{.
     MatchStart = MatchStart.substr(MatchStart.find_first_not_of(" \t"));
@@ -533,7 +617,7 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
 
     ExpectedDiagnosticInfo Expected(DiagnosticLoc, ClassificationStartLoc,
                                     /*ClassificationEndLoc=*/MatchStart.data(),
-                                    ExpectedClassification);
+                                    *ExpectedClassification);
     int LineOffset = 0;
 
     if (TextStartIdx > 0 && MatchStart[0] == '@') {
@@ -684,7 +768,7 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
       // If this check starts with 'educational-notes=', check for one or more
       // educational notes instead of a fix-it.
       if (CheckStr.startswith(educationalNotesSpecifier)) {
-        if (Expected.EducationalNotes.hasValue()) {
+        if (Expected.EducationalNotes.has_value()) {
           addError(CheckStr.data(),
                    "each verified diagnostic may only have one "
                    "{{educational-notes=<#notes#>}} declaration");
@@ -739,7 +823,7 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
 
       if (const auto range =
               parseExpectedFixItRange(CheckStr, Expected.LineNo, addError)) {
-        FixIt.Range = range.getValue();
+        FixIt.Range = range.value();
       } else {
         continue;
       }

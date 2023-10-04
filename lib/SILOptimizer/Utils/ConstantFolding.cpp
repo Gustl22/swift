@@ -173,7 +173,7 @@ static SILValue constructResultWithOverflowTuple(BuiltinInst *BI,
 static SILValue
 constantFoldBinaryWithOverflow(BuiltinInst *BI, llvm::Intrinsic::ID ID,
                                bool ReportOverflow,
-                               Optional<bool> &ResultsInError) {
+                               llvm::Optional<bool> &ResultsInError) {
   OperandValueArrayRef Args = BI->getArguments();
   assert(Args.size() >= 2);
 
@@ -192,7 +192,7 @@ constantFoldBinaryWithOverflow(BuiltinInst *BI, llvm::Intrinsic::ID ID,
 
   // If we can statically determine that the operation overflows,
   // warn about it if warnings are not disabled by ResultsInError being null.
-  if (ResultsInError.hasValue() && Overflow && ReportOverflow) {
+  if (ResultsInError.has_value() && Overflow && ReportOverflow) {
     if (BI->getFunction()->isSpecialization()) {
       // Do not report any constant propagation issues in specializations,
       // because they are eventually not present in the original function.
@@ -265,7 +265,7 @@ constantFoldBinaryWithOverflow(BuiltinInst *BI, llvm::Intrinsic::ID ID,
           .highlight(LHSRange)
           .highlight(RHSRange);
     }
-    ResultsInError = Optional<bool>(true);
+    ResultsInError = llvm::Optional<bool>(true);
   }
 
   return constructResultWithOverflowTuple(BI, Res, Overflow);
@@ -273,7 +273,7 @@ constantFoldBinaryWithOverflow(BuiltinInst *BI, llvm::Intrinsic::ID ID,
 
 static SILValue
 constantFoldBinaryWithOverflow(BuiltinInst *BI, BuiltinValueKind ID,
-                               Optional<bool> &ResultsInError) {
+                               llvm::Optional<bool> &ResultsInError) {
   OperandValueArrayRef Args = BI->getArguments();
   auto *ShouldReportFlag = dyn_cast<IntegerLiteralInst>(Args[2]);
   return constantFoldBinaryWithOverflow(BI,
@@ -317,7 +317,7 @@ constantFoldCountLeadingOrTrialingZeroIntrinsic(BuiltinInst *bi,
 }
 
 static SILValue constantFoldIntrinsic(BuiltinInst *BI, llvm::Intrinsic::ID ID,
-                                      Optional<bool> &ResultsInError) {
+                                      llvm::Optional<bool> &ResultsInError) {
   switch (ID) {
   default: break;
   case llvm::Intrinsic::expect: {
@@ -482,7 +482,7 @@ static SILValue constantFoldCompare(BuiltinInst *BI, BuiltinValueKind ID) {
 
 static SILValue
 constantFoldAndCheckDivision(BuiltinInst *BI, BuiltinValueKind ID,
-                             Optional<bool> &ResultsInError) {
+                             llvm::Optional<bool> &ResultsInError) {
   assert(ID == BuiltinValueKind::SDiv ||
          ID == BuiltinValueKind::SRem ||
          ID == BuiltinValueKind::UDiv ||
@@ -500,13 +500,13 @@ constantFoldAndCheckDivision(BuiltinInst *BI, BuiltinValueKind ID,
   // If the denominator is zero...
   if (DenomVal == 0) {
     // And if we are not asked to report errors, just return nullptr.
-    if (!ResultsInError.hasValue())
+    if (!ResultsInError.has_value())
       return nullptr;
 
     // Otherwise emit a diagnosis error and set ResultsInError to true.
     diagnose(M.getASTContext(), BI->getLoc().getSourceLoc(),
              diag::division_by_zero);
-    ResultsInError = Optional<bool>(true);
+    ResultsInError = llvm::Optional<bool>(true);
     return nullptr;
   }
 
@@ -522,7 +522,7 @@ constantFoldAndCheckDivision(BuiltinInst *BI, BuiltinValueKind ID,
   // If we overflowed...
   if (Overflowed) {
     // And we are not asked to produce diagnostics, just return nullptr...
-    if (!ResultsInError.hasValue())
+    if (!ResultsInError.has_value())
       return nullptr;
 
     bool IsRem = ID == BuiltinValueKind::SRem || ID == BuiltinValueKind::URem;
@@ -534,7 +534,7 @@ constantFoldAndCheckDivision(BuiltinInst *BI, BuiltinValueKind ID,
              llvm::toString(NumVal, /*Radix*/ 10, /*Signed*/ true),
              IsRem ? "%" : "/",
              llvm::toString(DenomVal, /*Radix*/ 10, /*Signed*/ true));
-    ResultsInError = Optional<bool>(true);
+    ResultsInError = llvm::Optional<bool>(true);
     return nullptr;
   }
 
@@ -561,12 +561,11 @@ static SILValue specializePolymorphicBuiltin(BuiltinInst *bi,
 ///
 /// The list of operations we constant fold might not be complete. Start with
 /// folding the operations used by the standard library.
-static SILValue constantFoldBinary(BuiltinInst *BI,
-                                   BuiltinValueKind ID,
-                                   Optional<bool> &ResultsInError) {
+static SILValue constantFoldBinary(BuiltinInst *BI, BuiltinValueKind ID,
+                                   llvm::Optional<bool> &ResultsInError) {
   switch (ID) {
   default:
-    llvm_unreachable("Not all BUILTIN_BINARY_OPERATIONs are covered!");
+    return nullptr;
 
   // Not supported yet (not easily computable for APInt).
   case BuiltinValueKind::ExactSDiv:
@@ -588,8 +587,31 @@ static SILValue constantFoldBinary(BuiltinInst *BI,
   // Are there valid uses for these in stdlib?
   case BuiltinValueKind::Add:
   case BuiltinValueKind::Mul:
-  case BuiltinValueKind::Sub:
-    return nullptr;
+  case BuiltinValueKind::Sub: {
+    OperandValueArrayRef Args = BI->getArguments();
+    auto *LHS = dyn_cast<IntegerLiteralInst>(Args[0]);
+    auto *RHS = dyn_cast<IntegerLiteralInst>(Args[1]);
+    if (!RHS || !LHS)
+      return nullptr;
+    APInt LHSI = LHS->getValue();
+    APInt RHSI = RHS->getValue();
+
+    switch (ID) {
+    default: llvm_unreachable("Not all cases are covered!");
+    case BuiltinValueKind::Add:
+      LHSI += RHSI;
+      break;
+    case BuiltinValueKind::Mul:
+      LHSI *= RHSI;
+      break;
+    case BuiltinValueKind::Sub:
+      LHSI -= RHSI;
+      break;
+    }
+
+    SILBuilderWithScope B(BI);
+    return B.createIntegerLiteral(BI->getLoc(), BI->getType(), LHSI);
+  }
 
   case BuiltinValueKind::And:
   case BuiltinValueKind::AShr:
@@ -615,7 +637,7 @@ static SILValue constantFoldBinary(BuiltinInst *BI,
                RHS->getLoc().getSourceLoc(),
                diag::shifting_all_significant_bits);
 
-      ResultsInError = Optional<bool>(true);
+      ResultsInError = llvm::Optional<bool>(true);
       return nullptr;
     }
 
@@ -661,7 +683,7 @@ static SILValue constantFoldBinary(BuiltinInst *BI,
 static SILValue
 constantFoldAndCheckIntegerConversions(BuiltinInst *BI,
                                        const BuiltinInfo &Builtin,
-                                       Optional<bool> &ResultsInError) {
+                                       llvm::Optional<bool> &ResultsInError) {
   assert(Builtin.ID == BuiltinValueKind::SToSCheckedTrunc ||
          Builtin.ID == BuiltinValueKind::UToUCheckedTrunc ||
          Builtin.ID == BuiltinValueKind::SToUCheckedTrunc ||
@@ -725,7 +747,7 @@ constantFoldAndCheckIntegerConversions(BuiltinInst *BI,
   if (OverflowError) {
     // If we are not asked to emit overflow diagnostics, just return nullptr on
     // overflow.
-    if (!ResultsInError.hasValue())
+    if (!ResultsInError.has_value())
       return nullptr;
 
     SILLocation Loc = BI->getLoc();
@@ -765,7 +787,7 @@ constantFoldAndCheckIntegerConversions(BuiltinInst *BI,
                  UserSrcTy.isNull() ? SrcTy : UserSrcTy,
                  UserDstTy.isNull() ? DstTy : UserDstTy);
 
-      ResultsInError = Optional<bool>(true);
+      ResultsInError = llvm::Optional<bool>(true);
       return nullptr;
     }
 
@@ -808,13 +830,12 @@ constantFoldAndCheckIntegerConversions(BuiltinInst *BI,
       }
     }
 
-    ResultsInError = Optional<bool>(true);
+    ResultsInError = llvm::Optional<bool>(true);
     return nullptr;
   }
 
   // The call to the builtin should be replaced with the constant value.
   return constructResultWithOverflowTuple(BI, Result, false);
-
 }
 
 /// A utility function that extracts the literal text corresponding
@@ -839,7 +860,8 @@ static bool tryExtractLiteralText(FloatLiteralInst *flitInst,
 }
 
 static SILValue foldFPToIntConversion(BuiltinInst *BI,
-      const BuiltinInfo &Builtin, Optional<bool> &ResultsInError) {
+                                      const BuiltinInfo &Builtin,
+                                      llvm::Optional<bool> &ResultsInError) {
 
   assert(Builtin.ID == BuiltinValueKind::FPToSI ||
          Builtin.ID == BuiltinValueKind::FPToUI);
@@ -856,7 +878,7 @@ static SILValue foldFPToIntConversion(BuiltinInst *BI,
   // Check non-negativeness of 'fpVal' for conversion to unsigned int.
   if (conversionToUnsigned && fpVal.isNegative() && !fpVal.isZero()) {
     // Stop folding and emit diagnostics if enabled.
-    if (ResultsInError.hasValue()) {
+    if (ResultsInError.has_value()) {
       SILModule &M = BI->getModule();
       const ApplyExpr *CE = BI->getLoc().getAsASTNode<ApplyExpr>();
 
@@ -868,7 +890,7 @@ static SILValue foldFPToIntConversion(BuiltinInst *BI,
                diag::negative_fp_literal_overflow_unsigned, fpStr,
                CE ? CE->getType() : destTy,
                CE ? false : conversionToUnsigned);
-      ResultsInError = Optional<bool>(true);
+      ResultsInError = llvm::Optional<bool>(true);
     }
     return nullptr;
   }
@@ -880,7 +902,7 @@ static SILValue foldFPToIntConversion(BuiltinInst *BI,
 
   if (status & APFloat::opStatus::opInvalidOp) {
     // Stop folding and emit diagnostics if enabled.
-    if (ResultsInError.hasValue()) {
+    if (ResultsInError.has_value()) {
       SILModule &M = BI->getModule();
       const ApplyExpr *CE = BI->getLoc().getAsASTNode<ApplyExpr>();
 
@@ -892,7 +914,7 @@ static SILValue foldFPToIntConversion(BuiltinInst *BI,
                diag::float_to_int_overflow, fpStr,
                CE ? CE->getType() : destTy,
                CE ? CE->isImplicit() : false);
-      ResultsInError = Optional<bool>(true);
+      ResultsInError = llvm::Optional<bool>(true);
     }
     return nullptr;
   }
@@ -1034,7 +1056,7 @@ bool maybeExplicitFPCons(BuiltinInst *BI, const BuiltinInfo &Builtin) {
 }
 
 static SILValue foldFPTrunc(BuiltinInst *BI, const BuiltinInfo &Builtin,
-                            Optional<bool> &ResultsInError) {
+                            llvm::Optional<bool> &ResultsInError) {
 
   assert(Builtin.ID == BuiltinValueKind::FPTrunc);
 
@@ -1059,7 +1081,7 @@ static SILValue foldFPTrunc(BuiltinInst *BI, const BuiltinInfo &Builtin,
   // represented in the destination type.
   // Suppress all warnings if the conversion is made through an explicit
   // constructor invocation.
-  if (ResultsInError.hasValue() && !maybeExplicitFPCons(BI, Builtin)) {
+  if (ResultsInError.has_value() && !maybeExplicitFPCons(BI, Builtin)) {
     bool overflow = opStatus & APFloat::opStatus::opOverflow;
     bool tinynInexact =
         isLossyUnderflow(flitInst->getValue(), srcType, destType);
@@ -1084,7 +1106,7 @@ static SILValue foldFPTrunc(BuiltinInst *BI, const BuiltinInfo &Builtin,
       diagnose(M.getASTContext(), Loc.getSourceLoc(), diagId, fplitStr,
                userType, truncVal.isNegative());
 
-      ResultsInError = Optional<bool>(true);
+      ResultsInError = llvm::Optional<bool>(true);
     }
   }
   // Abort folding if we have subnormality, NaN or opInvalid status.
@@ -1111,8 +1133,8 @@ static SILValue constantFoldIsConcrete(BuiltinInst *BI) {
   return inst;
 }
 
-static SILValue constantFoldBuiltin(BuiltinInst *BI,
-                                    Optional<bool> &ResultsInError) {
+SILValue swift::constantFoldBuiltin(BuiltinInst *BI,
+                                    llvm::Optional<bool> &ResultsInError) {
   const IntrinsicInfo &Intrinsic = BI->getIntrinsicInfo();
   SILModule &M = BI->getModule();
 
@@ -1200,7 +1222,7 @@ case BuiltinValueKind::id:
       // Check if diagnostics is enabled. If so, make sure to suppress
       // warnings for conversions through explicit initializers,
       // but do not suppress errors.
-      if (ResultsInError.hasValue() &&
+      if (ResultsInError.has_value() &&
           (overflow || !maybeExplicitFPCons(BI, Builtin))) {
         SmallString<10> SrcAsString;
         SrcVal.toString(SrcAsString, /*radix*/ 10, true /*isSigned*/);
@@ -1219,7 +1241,7 @@ case BuiltinValueKind::id:
                    diag::warning_int_to_fp_inexact, CE ? CE->getType() : DestTy,
                    SrcAsString, destStr);
         }
-        ResultsInError = Optional<bool>(true);
+        ResultsInError = llvm::Optional<bool>(true);
       }
       // If there is an overflow, just return nullptr as this is undefined
       // behavior. Otherwise, continue folding as in the normal workflow.
@@ -1276,11 +1298,11 @@ case BuiltinValueKind::id:
       return nullptr;
 
     APInt VInt = V->getValue();
-    if (VInt.isNegative() && ResultsInError.hasValue()) {
+    if (VInt.isNegative() && ResultsInError.has_value()) {
       diagnose(M.getASTContext(), BI->getLoc().getSourceLoc(),
                diag::wrong_non_negative_assumption,
                llvm::toString(VInt, /*Radix*/ 10, /*Signed*/ true));
-      ResultsInError = Optional<bool>(true);
+      ResultsInError = llvm::Optional<bool>(true);
     }
     return V;
   }
@@ -1293,7 +1315,8 @@ case BuiltinValueKind::id:
 /// as results of User. If we could only simplify /some/ of an instruction's
 /// results, we still return true, but signal that we couldn't simplify by
 /// placing SILValue() in that position instead.
-static bool constantFoldInstruction(Operand *Op, Optional<bool> &ResultsInError,
+static bool constantFoldInstruction(Operand *Op,
+                                    llvm::Optional<bool> &ResultsInError,
                                     SmallVectorImpl<SILValue> &Results) {
   auto *User = Op->getUser();
 
@@ -1566,7 +1589,7 @@ void ConstantFolder::initializeWorklist(SILFunction &f) {
 
       if (auto *bi = dyn_cast<BuiltinInst>(inst)) {
         if (auto kind = bi->getBuiltinKind()) {
-          if (isPolymorphicBuiltin(kind.getValue())) {
+          if (isPolymorphicBuiltin(kind.value())) {
             WorkList.insert(bi);
             continue;
           }
@@ -1809,7 +1832,7 @@ ConstantFolder::processWorkList() {
 
     if (auto *bi = dyn_cast<BuiltinInst>(I)) {
       if (auto kind = bi->getBuiltinKind()) {
-        if (SILValue v = specializePolymorphicBuiltin(bi, kind.getValue())) {
+        if (SILValue v = specializePolymorphicBuiltin(bi, kind.value())) {
           // If bi had a result, RAUW.
           if (bi->getResult(0)->getType() !=
               bi->getModule().Types.getEmptyTupleType())
@@ -1874,7 +1897,7 @@ ConstantFolder::processWorkList() {
         //
         // We are essentially using this optional to represent 3 states: true,
         // false, and n/a.
-        Optional<bool> ResultsInError;
+        llvm::Optional<bool> ResultsInError;
 
         // If we are asked to emit diagnostics, override ResultsInError with a
         // Some optional initialized to false.
@@ -1890,7 +1913,7 @@ ConstantFolder::processWorkList() {
 
         // If we did not pass in a None and the optional is set to true, add the
         // user to our error set.
-        if (ResultsInError.hasValue() && ResultsInError.getValue())
+        if (ResultsInError.has_value() && ResultsInError.value())
           ErrorSet.insert(User);
 
         // We failed to constant propagate... continue...

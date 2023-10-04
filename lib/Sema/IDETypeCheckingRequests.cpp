@@ -192,13 +192,13 @@ IsDeclApplicableRequest::evaluate(Evaluator &evaluator,
 bool
 TypeRelationCheckRequest::evaluate(Evaluator &evaluator,
                                    TypeRelationCheckInput Owner) const {
-  Optional<constraints::ConstraintKind> CKind;
+  llvm::Optional<constraints::ConstraintKind> CKind;
   switch (Owner.Relation) {
   case TypeRelation::ConvertTo:
     CKind = constraints::ConstraintKind::Conversion;
     break;
   }
-  assert(CKind.hasValue());
+  assert(CKind.has_value());
   return TypeChecker::typesSatisfyConstraint(Owner.Pair.FirstTy,
                                              Owner.Pair.SecondTy,
                                              Owner.OpenArchetypes,
@@ -212,7 +212,7 @@ RootAndResultTypeOfKeypathDynamicMemberRequest::evaluate(Evaluator &evaluator,
     return TypePair();
 
   const auto *param = subscript->getIndices()->get(0);
-  auto keyPathType = param->getType()->getAs<BoundGenericType>();
+  auto keyPathType = param->getTypeInContext()->getAs<BoundGenericType>();
   if (!keyPathType)
     return TypePair();
   auto genericArgs = keyPathType->getGenericArgs();

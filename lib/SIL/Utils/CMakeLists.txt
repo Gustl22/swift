@@ -4,12 +4,16 @@ target_sources(swiftSIL PRIVATE
   DebugUtils.cpp
   Dominance.cpp
   DynamicCasts.cpp
+  FieldSensitivePrunedLiveness.cpp
   GenericSpecializationMangler.cpp
   InstructionUtils.cpp
+  InstWrappers.cpp
   LoopInfo.cpp
   MemAccessUtils.cpp
   MemoryLocations.cpp
   OptimizationRemark.cpp
+  OSSALifetimeCompletion.cpp
+  OwnershipLiveness.cpp
   OwnershipUtils.cpp
   PrettyStackTrace.cpp
   Projection.cpp
@@ -18,4 +22,6 @@ target_sources(swiftSIL PRIVATE
   SILBridging.cpp
   SILInstructionWorklist.cpp
   SILRemarkStreamer.cpp
-  ValueUtils.cpp)
+  Test.cpp
+  ValueUtils.cpp
+)

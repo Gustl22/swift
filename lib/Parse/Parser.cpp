@@ -22,10 +22,11 @@
 #include "swift/AST/ParseRequests.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Parse/Lexer.h"
-#include "swift/Parse/CodeCompletionCallbacks.h"
+#include "swift/Parse/IDEInspectionCallbacks.h"
 #include "swift/Parse/ParseSILSupport.h"
 #include "swift/SymbolGraphGen/SymbolGraphOptions.h"
 #include "llvm/Support/Compiler.h"
@@ -101,40 +102,43 @@ using ParsingFlags = SourceFile::ParsingFlags;
 
 void SILParserStateBase::anchor() { }
 
-void swift::performCodeCompletionSecondPass(
-    SourceFile &SF, CodeCompletionCallbacksFactory &Factory) {
+void swift::performIDEInspectionSecondPass(
+    SourceFile &SF, IDEInspectionCallbacksFactory &Factory) {
   return (void)evaluateOrDefault(SF.getASTContext().evaluator,
-                                 CodeCompletionSecondPassRequest{&SF, &Factory},
+                                 IDEInspectionSecondPassRequest{&SF, &Factory},
                                  false);
 }
 
-bool CodeCompletionSecondPassRequest::evaluate(
+bool IDEInspectionSecondPassRequest::evaluate(
     Evaluator &evaluator, SourceFile *SF,
-    CodeCompletionCallbacksFactory *Factory) const {
+    IDEInspectionCallbacksFactory *Factory) const {
   // If we didn't find the code completion token, bail.
   auto *parserState = SF->getDelayedParserState();
-  if (!parserState->hasCodeCompletionDelayedDeclState())
+  if (!parserState->hasIDEInspectionDelayedDeclState())
     return true;
 
-  auto state = parserState->takeCodeCompletionDelayedDeclState();
+  // Decrement the closure discriminator index by one so a top-level closure
+  // gets the same discriminator as before when being re-parsed in the second
+  // pass.
+  auto state = parserState->takeIDEInspectionDelayedDeclState();
   auto &Ctx = SF->getASTContext();
 
-  auto BufferID = Ctx.SourceMgr.getCodeCompletionBufferID();
+  auto BufferID = Ctx.SourceMgr.getIDEInspectionTargetBufferID();
   Parser TheParser(BufferID, *SF, nullptr, parserState);
 
-  std::unique_ptr<CodeCompletionCallbacks> CodeCompletion(
-      Factory->createCodeCompletionCallbacks(TheParser));
-  TheParser.setCodeCompletionCallbacks(CodeCompletion.get());
+  auto Callbacks = Factory->createCallbacks(TheParser);
+  TheParser.setCodeCompletionCallbacks(Callbacks.CompletionCallbacks.get());
+  TheParser.setDoneParsingCallback(Callbacks.DoneParsingCallback.get());
 
-  TheParser.performCodeCompletionSecondPassImpl(*state);
+  TheParser.performIDEInspectionSecondPassImpl(*state);
   return true;
 }
 
-void Parser::performCodeCompletionSecondPassImpl(
-    CodeCompletionDelayedDeclState &info) {
+void Parser::performIDEInspectionSecondPassImpl(
+    IDEInspectionDelayedDeclState &info) {
   // Disable updating the interface hash
-  llvm::SaveAndRestore<Optional<StableHasher>> CurrentTokenHashSaver(
-      CurrentTokenHash, None);
+  llvm::SaveAndRestore<llvm::Optional<StableHasher>> CurrentTokenHashSaver(
+      CurrentTokenHash, llvm::None);
 
   auto BufferID = L->getBufferID();
   auto startLoc = SourceMgr.getLocForOffset(BufferID, info.StartOffset);
@@ -146,12 +150,19 @@ void Parser::performCodeCompletionSecondPassImpl(
 
   DeclContext *DC = info.ParentContext;
 
+  // Forget about the fact that we may have already computed local
+  // discriminators.
+  Context.evaluator.clearCachedOutput(LocalDiscriminatorsRequest{DC});
+
+  // Clear any ASTScopes that were expanded.
+  SF.clearScope();
+
   switch (info.Kind) {
-  case CodeCompletionDelayedDeclKind::TopLevelCodeDecl: {
+  case IDEInspectionDelayedDeclKind::TopLevelCodeDecl: {
     // Re-enter the top-level code decl context.
     // FIXME: this can issue discriminators out-of-order?
     auto *TLCD = cast<TopLevelCodeDecl>(DC);
-    ContextChange CC(*this, TLCD, &State->getTopLevelContext());
+    ContextChange CC(*this, TLCD);
 
     SourceLoc StartLoc = Tok.getLoc();
     ASTNode Result;
@@ -163,7 +174,7 @@ void Parser::performCodeCompletionSecondPassImpl(
     break;
   }
 
-  case CodeCompletionDelayedDeclKind::Decl: {
+  case IDEInspectionDelayedDeclKind::Decl: {
     assert((DC->isTypeContext() || DC->isModuleScopeContext()) &&
            "Delayed decl must be a type member or a top-level decl");
     ContextChange CC(*this, DC);
@@ -185,19 +196,19 @@ void Parser::performCodeCompletionSecondPassImpl(
     break;
   }
 
-  case CodeCompletionDelayedDeclKind::FunctionBody: {
+  case IDEInspectionDelayedDeclKind::FunctionBody: {
     auto *AFD = cast<AbstractFunctionDecl>(DC);
     (void)parseAbstractFunctionBodyImpl(AFD);
     break;
   }
   }
 
-  assert(!State->hasCodeCompletionDelayedDeclState() &&
+  assert(!State->hasIDEInspectionDelayedDeclState() &&
          "Second pass should not set any code completion info");
 
-  CodeCompletion->doneParsing();
+  DoneParsingCallback->doneParsing(DC->getParentSourceFile());
 
-  State->restoreCodeCompletionDelayedDeclState(info);
+  State->restoreIDEInspectionDelayedDeclState(info);
 }
 
 swift::Parser::BacktrackingScopeImpl::~BacktrackingScopeImpl() {
@@ -396,7 +407,7 @@ public:
   TokenRecorder(ASTContext &ctx, Lexer &BaseLexer)
       : Ctx(ctx), BaseLexer(BaseLexer), BufferID(BaseLexer.getBufferID()) {}
 
-  Optional<std::vector<Token>> finalize() override {
+  llvm::Optional<std::vector<Token>> finalize() override {
     auto &SM = Ctx.SourceMgr;
 
     // We should consume the comments at the end of the file that don't attach
@@ -486,6 +497,9 @@ Parser::Parser(std::unique_ptr<Lexer> Lex, SourceFile &SF,
   // Set the token to a sentinel so that we know the lexer isn't primed yet.
   // This cannot be tok::unknown, since that is a token the lexer could produce.
   Tok.setKind(tok::NUM_TOKENS);
+
+  EnabledNoncopyableGenerics =
+      Context.LangOpts.hasFeature(Feature::NoncopyableGenerics);
 }
 
 Parser::~Parser() {
@@ -496,8 +510,8 @@ Parser::~Parser() {
 bool Parser::isInSILMode() const { return SF.Kind == SourceFileKind::SIL; }
 
 bool Parser::isDelayedParsingEnabled() const {
-  // Do not delay parsing during code completion's second pass.
-  if (CodeCompletion)
+  // Do not delay parsing during IDE inspection's second pass.
+  if (DoneParsingCallback)
     return false;
 
   return SF.hasDelayedBodyParsing();
@@ -510,6 +524,18 @@ bool Parser::shouldEvaluatePoundIfDecls() const {
 
 bool Parser::allowTopLevelCode() const {
   return SF.isScriptMode();
+}
+
+bool Parser::isInMacroExpansion(SourceLoc loc) const {
+  if (loc.isInvalid())
+    return false;
+
+  auto bufferID = SourceMgr.findBufferContainingLoc(loc);
+  auto generatedSourceInfo = SourceMgr.getGeneratedSourceInfo(bufferID);
+  if (!generatedSourceInfo)
+    return false;
+
+  return true;
 }
 
 const Token &Parser::peekToken() {
@@ -684,8 +710,10 @@ SourceLoc Parser::skipUntilGreaterInTypeList(bool protocolComposition) {
     // 'Self' can appear in types, skip it.
     if (Tok.is(tok::kw_Self))
       break;
-    if (isStartOfStmt() || isStartOfSwiftDecl() || Tok.is(tok::pound_endif))
+    if (isStartOfStmt(/*preferExpr*/ false) || isStartOfSwiftDecl() ||
+        Tok.is(tok::pound_endif)) {
       return lastLoc;
+    }
     break;
 
     case tok::l_paren:
@@ -727,7 +755,9 @@ void Parser::skipListUntilDeclRBrace(SourceLoc startLoc, tok T1, tok T2) {
       
       // Could have encountered something like `_ var:` 
       // or `let foo:` or `var:`
-      if (Tok.isAny(tok::kw_var, tok::kw_let)) {
+      if (Tok.isAny(tok::kw_var, tok::kw_let) ||
+          (Context.LangOpts.hasFeature(Feature::ReferenceBindings) &&
+           Tok.isAny(tok::kw_inout))) {
         if (possibleDeclStartsLine && !hasDelimiter) {
           break;
         }
@@ -801,7 +831,7 @@ getStructureMarkerKindForToken(const Token &tok) {
 Parser::StructureMarkerRAII::StructureMarkerRAII(Parser &parser, SourceLoc loc,
                                                  StructureMarkerKind kind)
     : StructureMarkerRAII(parser) {
-  parser.StructureMarkers.push_back({loc, kind, None});
+  parser.StructureMarkers.push_back({loc, kind, llvm::None});
   if (parser.StructureMarkers.size() > MaxDepth) {
     parser.diagnose(loc, diag::structure_overflow, MaxDepth);
     // We need to cut off parsing or we will stack-overflow.
@@ -994,8 +1024,8 @@ Parser::parseListItem(ParserStatus &Status, tok RightK, SourceLoc LeftLoc,
   }
   // If we're in a comma-separated list, the next token is at the
   // beginning of a new line and can never start an element, break.
-  if (Tok.isAtStartOfLine() &&
-      (Tok.is(tok::r_brace) || isStartOfSwiftDecl() || isStartOfStmt())) {
+  if (Tok.isAtStartOfLine() && (Tok.is(tok::r_brace) || isStartOfSwiftDecl() ||
+                                isStartOfStmt(/*preferExpr*/ false))) {
     return ParseListItemResult::Finished;
   }
   // If we found EOF or such, bailout.
@@ -1051,15 +1081,14 @@ Parser::parseList(tok RightK, SourceLoc LeftLoc, SourceLoc &RightLoc,
   return Status;
 }
 
-Optional<StringRef>
-Parser::getStringLiteralIfNotInterpolated(SourceLoc Loc,
-                                          StringRef DiagText) {
+llvm::Optional<StringRef>
+Parser::getStringLiteralIfNotInterpolated(SourceLoc Loc, StringRef DiagText) {
   assert(Tok.is(tok::string_literal));
 
   // FIXME: Support extended escaping string literal.
   if (Tok.getCustomDelimiterLen()) {
     diagnose(Loc, diag::forbidden_extended_escaping_string, DiagText);
-    return None;
+    return llvm::None;
   }
 
   SmallVector<Lexer::StringSegment, 1> Segments;
@@ -1067,36 +1096,11 @@ Parser::getStringLiteralIfNotInterpolated(SourceLoc Loc,
   if (Segments.size() != 1 ||
       Segments.front().Kind == Lexer::StringSegment::Expr) {
     diagnose(Loc, diag::forbidden_interpolated_string, DiagText);
-    return None;
+    return llvm::None;
   }
 
   return SourceMgr.extractText(CharSourceRange(Segments.front().Loc,
                                                Segments.front().Length));
-}
-
-bool Parser::shouldReturnSingleExpressionElement(ArrayRef<ASTNode> Body) {
-  // If the body consists of an #if declaration with a single
-  // expression active clause, find a single expression.
-  if (Body.size() == 2) {
-    if (auto *D = Body.front().dyn_cast<Decl *>()) {
-      // Step into nested active clause.
-      while (auto *ICD = dyn_cast<IfConfigDecl>(D)) {
-        auto ACE = ICD->getActiveClauseElements();
-        if (ACE.size() == 1) {
-          assert(Body.back() == ACE.back() &&
-                 "active clause not found in body");
-          return true;
-        } else if (ACE.size() == 2) {
-          if (auto *ND = ACE.front().dyn_cast<Decl *>()) {
-            D = ND;
-            continue;
-          }
-        }
-        break;
-      }
-    }
-  }
-  return Body.size() == 1;
 }
 
 struct ParserUnit::Implementation {
@@ -1118,6 +1122,8 @@ struct ParserUnit::Implementation {
         TypeCheckerOpts(TyOpts), SILOpts(silOpts), Diags(SM),
         Ctx(*ASTContext::get(LangOpts, TypeCheckerOpts, SILOpts, SearchPathOpts,
                              clangImporterOpts, symbolGraphOpts, SM, Diags)) {
+    registerParseRequestFunctions(Ctx.evaluator);
+
     auto parsingOpts = SourceFile::getDefaultParsingOptions(LangOpts);
     parsingOpts |= ParsingFlags::DisableDelayedBodies;
     parsingOpts |= ParsingFlags::DisablePoundIfEvaluation;
@@ -1175,7 +1181,7 @@ void ParserUnit::parse() {
   SmallVector<ASTNode, 128> items;
   P.parseTopLevelItems(items);
 
-  Optional<ArrayRef<Token>> tokensRef;
+  llvm::Optional<ArrayRef<Token>> tokensRef;
   if (auto tokens = P.takeTokenReceiver()->finalize())
     tokensRef = ctx.AllocateCopy(*tokens);
 
@@ -1311,14 +1317,17 @@ ParsedDeclName swift::parseDeclName(StringRef name) {
   return result;
 }
 
-DeclName ParsedDeclName::formDeclName(ASTContext &ctx, bool isSubscript) const {
-  return formDeclNameRef(ctx, isSubscript).getFullName();
+DeclName ParsedDeclName::formDeclName(ASTContext &ctx, bool isSubscript,
+                                      bool isCxxClassTemplateSpec) const {
+  return formDeclNameRef(ctx, isSubscript, isCxxClassTemplateSpec).getFullName();
 }
 
 DeclNameRef ParsedDeclName::formDeclNameRef(ASTContext &ctx,
-                                            bool isSubscript) const {
+                                            bool isSubscript,
+                                            bool isCxxClassTemplateSpec) const {
   return swift::formDeclNameRef(ctx, BaseName, ArgumentLabels, IsFunctionName,
-                                /*IsInitializer=*/true, isSubscript);
+                                /*IsInitializer=*/true, isSubscript,
+                                isCxxClassTemplateSpec);
 }
 
 DeclName swift::formDeclName(ASTContext &ctx,
@@ -1326,9 +1335,11 @@ DeclName swift::formDeclName(ASTContext &ctx,
                              ArrayRef<StringRef> argumentLabels,
                              bool isFunctionName,
                              bool isInitializer,
-                             bool isSubscript) {
+                             bool isSubscript,
+                             bool isCxxClassTemplateSpec) {
   return formDeclNameRef(ctx, baseName, argumentLabels, isFunctionName,
-                         isInitializer, isSubscript).getFullName();
+                         isInitializer, isSubscript,
+                         isCxxClassTemplateSpec).getFullName();
 }
 
 DeclNameRef swift::formDeclNameRef(ASTContext &ctx,
@@ -1336,11 +1347,14 @@ DeclNameRef swift::formDeclNameRef(ASTContext &ctx,
                                    ArrayRef<StringRef> argumentLabels,
                                    bool isFunctionName,
                                    bool isInitializer,
-                                   bool isSubscript) {
+                                   bool isSubscript,
+                                   bool isCxxClassTemplateSpec) {
   // We cannot import when the base name is not an identifier.
   if (baseName.empty())
     return DeclNameRef();
-  if (!Lexer::isIdentifier(baseName) && !Lexer::isOperator(baseName))
+
+  if (!Lexer::isIdentifier(baseName) && !Lexer::isOperator(baseName) &&
+      !isCxxClassTemplateSpec)
     return DeclNameRef();
 
   // Get the identifier for the base name. Special-case `init`.

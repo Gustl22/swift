@@ -19,172 +19,308 @@ public struct Builder {
   public enum InsertionPoint {
     case before(Instruction)
     case atEndOf(BasicBlock)
+    case staticInitializer(GlobalVariable)
   }
 
   let insertAt: InsertionPoint
   let location: Location
-  private let passContext: BridgedPassContext
+  private let notificationHandler: BridgedChangeNotificationHandler
+  private let notifyNewInstruction: (Instruction) -> ()
 
-  private var bridged: BridgedBuilder {
+  public var bridged: BridgedBuilder {
     switch insertAt {
     case .before(let inst):
-      return BridgedBuilder(insertBefore: inst.bridged.optional,
-                            insertAtEnd: OptionalBridgedBasicBlock.none,
+      return BridgedBuilder(insertAt: .beforeInst, insertionObj: inst.bridged.obj,
                             loc: location.bridged)
     case .atEndOf(let block):
-      return BridgedBuilder(insertBefore: OptionalBridgedInstruction.none,
-                            insertAtEnd: block.bridged.optional,
+      return BridgedBuilder(insertAt: .endOfBlock, insertionObj: block.bridged.obj,
+                            loc: location.bridged)
+    case .staticInitializer(let global):
+      return BridgedBuilder(insertAt: .intoGlobal, insertionObj: global.bridged.obj,
                             loc: location.bridged)
     }
   }
 
-  private func notifyInstructionsChanged() {
-    PassContext_notifyChanges(passContext, instructionsChanged)
-  }
-
-  private func notifyCallsChanged() {
-    PassContext_notifyChanges(passContext, callsChanged)
-  }
-
-  private func notifyBranchesChanged() {
-    PassContext_notifyChanges(passContext, branchesChanged)
+  private func notifyNew<I: Instruction>(_ instruction: I) -> I {
+    notificationHandler.notifyChanges(.instructionsChanged)
+    if instruction is FullApplySite {
+      notificationHandler.notifyChanges(.callsChanged)
+    }
+    if instruction is TermInst {
+      notificationHandler.notifyChanges(.branchesChanged)
+    }
+    notifyNewInstruction(instruction)
+    return instruction
   }
 
   public init(insertAt: InsertionPoint, location: Location,
-              passContext: BridgedPassContext) {
+              _ notifyNewInstruction: @escaping (Instruction) -> (),
+              _ notificationHandler: BridgedChangeNotificationHandler) {
     self.insertAt = insertAt
     self.location = location;
-    self.passContext = passContext
+    self.notifyNewInstruction = notifyNewInstruction
+    self.notificationHandler = notificationHandler
   }
 
   public func createBuiltinBinaryFunction(name: String,
       operandType: Type, resultType: Type, arguments: [Value]) -> BuiltinInst {
-    notifyInstructionsChanged()
     return arguments.withBridgedValues { valuesRef in
       return name._withStringRef { nameStr in
-        let bi = SILBuilder_createBuiltinBinaryFunction(
-          bridged, nameStr, operandType.bridged, resultType.bridged, valuesRef)
-        return bi.getAs(BuiltinInst.self)
+        let bi = bridged.createBuiltinBinaryFunction(
+          nameStr, operandType.bridged, resultType.bridged, valuesRef)
+        return notifyNew(bi.getAs(BuiltinInst.self))
       }
     }
   }
 
   public func createCondFail(condition: Value, message: String) -> CondFailInst {
-    notifyInstructionsChanged()
     return message._withStringRef { messageStr in
-      let cf = SILBuilder_createCondFail(bridged, condition.bridged, messageStr)
-      return cf.getAs(CondFailInst.self)
+      let cf = bridged.createCondFail(condition.bridged, messageStr)
+      return notifyNew(cf.getAs(CondFailInst.self))
     }
   }
 
   public func createIntegerLiteral(_ value: Int, type: Type) -> IntegerLiteralInst {
-    notifyInstructionsChanged()
-    let literal = SILBuilder_createIntegerLiteral(bridged, type.bridged, value)
-    return literal.getAs(IntegerLiteralInst.self)
+    let literal = bridged.createIntegerLiteral(type.bridged, value)
+    return notifyNew(literal.getAs(IntegerLiteralInst.self))
   }
 
   public func createAllocStack(_ type: Type, hasDynamicLifetime: Bool = false,
-                               isLexical: Bool = false, wasMoved: Bool = false) -> AllocStackInst {
-    notifyInstructionsChanged()
-    let dr = SILBuilder_createAllocStack(bridged, type.bridged, hasDynamicLifetime ? 1 : 0,
-                                         isLexical ? 1 : 0, wasMoved ? 1 : 0)
-    return dr.getAs(AllocStackInst.self)
+                               isLexical: Bool = false, usesMoveableValueDebugInfo: Bool = false) -> AllocStackInst {
+    let dr = bridged.createAllocStack(type.bridged, hasDynamicLifetime, isLexical, usesMoveableValueDebugInfo)
+    return notifyNew(dr.getAs(AllocStackInst.self))
   }
 
   @discardableResult
   public func createDeallocStack(_ operand: Value) -> DeallocStackInst {
-    notifyInstructionsChanged()
-    let dr = SILBuilder_createDeallocStack(bridged, operand.bridged)
-    return dr.getAs(DeallocStackInst.self)
+    let dr = bridged.createDeallocStack(operand.bridged)
+    return notifyNew(dr.getAs(DeallocStackInst.self))
   }
 
   @discardableResult
   public func createDeallocStackRef(_ operand: Value) -> DeallocStackRefInst {
-    notifyInstructionsChanged()
-    let dr = SILBuilder_createDeallocStackRef(bridged, operand.bridged)
-    return dr.getAs(DeallocStackRefInst.self)
+    let dr = bridged.createDeallocStackRef(operand.bridged)
+    return notifyNew(dr.getAs(DeallocStackRefInst.self))
   }
 
-  public func createUncheckedRefCast(object: Value, type: Type) -> UncheckedRefCastInst {
-    notifyInstructionsChanged()
-    let object = SILBuilder_createUncheckedRefCast(bridged, object.bridged, type.bridged)
-    return object.getAs(UncheckedRefCastInst.self)
+  public func createUncheckedRefCast(from value: Value, to type: Type) -> UncheckedRefCastInst {
+    let cast = bridged.createUncheckedRefCast(value.bridged, type.bridged)
+    return notifyNew(cast.getAs(UncheckedRefCastInst.self))
+  }
+
+  public func createUpcast(from value: Value, to type: Type) -> UpcastInst {
+    let cast = bridged.createUpcast(value.bridged, type.bridged)
+    return notifyNew(cast.getAs(UpcastInst.self))
+  }
+
+  public func createLoad(fromAddress: Value, ownership: LoadInst.LoadOwnership) -> LoadInst {
+    let load = bridged.createLoad(fromAddress.bridged, ownership.rawValue)
+    return notifyNew(load.getAs(LoadInst.self))
+  }
+
+  public func createBeginDeallocRef(reference: Value, allocation: AllocRefInstBase) -> BeginDeallocRefInst {
+    let beginDealloc = bridged.createBeginDeallocRef(reference.bridged, allocation.bridged)
+    return notifyNew(beginDealloc.getAs(BeginDeallocRefInst.self))
+  }
+
+  public func createEndInitLetRef(operand: Value) -> EndInitLetRefInst {
+    let endInit = bridged.createEndInitLetRef(operand.bridged)
+    return notifyNew(endInit.getAs(EndInitLetRefInst.self))
   }
 
   @discardableResult
-  public func createSetDeallocating(operand: Value, isAtomic: Bool) -> SetDeallocatingInst {
-    notifyInstructionsChanged()
-    let setDeallocating = SILBuilder_createSetDeallocating(bridged, operand.bridged, isAtomic)
-    return setDeallocating.getAs(SetDeallocatingInst.self)
+  public func createStrongRetain(operand: Value) -> StrongRetainInst {
+    let retain = bridged.createStrongRetain(operand.bridged)
+    return notifyNew(retain.getAs(StrongRetainInst.self))
+  }
+
+  @discardableResult
+  public func createStrongRelease(operand: Value) -> StrongReleaseInst {
+    let release = bridged.createStrongRelease(operand.bridged)
+    return notifyNew(release.getAs(StrongReleaseInst.self))
+  }
+
+  @discardableResult
+  public func createUnownedRetain(operand: Value) -> UnownedRetainInst {
+    let retain = bridged.createUnownedRetain(operand.bridged)
+    return notifyNew(retain.getAs(UnownedRetainInst.self))
+  }
+
+  @discardableResult
+  public func createUnownedRelease(operand: Value) -> UnownedReleaseInst {
+    let release = bridged.createUnownedRelease(operand.bridged)
+    return notifyNew(release.getAs(UnownedReleaseInst.self))
   }
 
   public func createFunctionRef(_ function: Function) -> FunctionRefInst {
-    notifyInstructionsChanged()
-    let functionRef = SILBuilder_createFunctionRef(bridged, function.bridged)
-    return functionRef.getAs(FunctionRefInst.self)
+    let functionRef = bridged.createFunctionRef(function.bridged)
+    return notifyNew(functionRef.getAs(FunctionRefInst.self))
   }
 
   public func createCopyValue(operand: Value) -> CopyValueInst {
-    notifyInstructionsChanged()
-    return SILBuilder_createCopyValue(bridged, operand.bridged).getAs(CopyValueInst.self)
+    return notifyNew(bridged.createCopyValue(operand.bridged).getAs(CopyValueInst.self))
+  }
+
+  public func createBeginBorrow(of value: Value) -> BeginBorrowInst {
+    return notifyNew(bridged.createBeginBorrow(value.bridged).getAs(BeginBorrowInst.self))
+  }
+
+  @discardableResult
+  public func createEndBorrow(of beginBorrow: Value) -> EndBorrowInst {
+    return notifyNew(bridged.createEndBorrow(beginBorrow.bridged).getAs(EndBorrowInst.self))
   }
 
   @discardableResult
   public func createCopyAddr(from fromAddr: Value, to toAddr: Value,
                              takeSource: Bool = false, initializeDest: Bool = false) -> CopyAddrInst {
-    notifyInstructionsChanged()
-    return SILBuilder_createCopyAddr(bridged, fromAddr.bridged, toAddr.bridged,
-                                     takeSource ? 1 : 0, initializeDest ? 1 : 0).getAs(CopyAddrInst.self)
+    return notifyNew(bridged.createCopyAddr(fromAddr.bridged, toAddr.bridged,
+                                            takeSource, initializeDest).getAs(CopyAddrInst.self))
   }
 
   @discardableResult
   public func createDestroyValue(operand: Value) -> DestroyValueInst {
-    notifyInstructionsChanged()
-    return SILBuilder_createDestroyValue(bridged, operand.bridged).getAs(DestroyValueInst.self)
+    return notifyNew(bridged.createDestroyValue(operand.bridged).getAs(DestroyValueInst.self))
+  }
+
+  @discardableResult
+  public func createDestroyAddr(address: Value) -> DestroyAddrInst {
+    return notifyNew(bridged.createDestroyAddr(address.bridged).getAs(DestroyAddrInst.self))
+  }
+
+  @discardableResult
+  public func createDebugStep() -> DebugStepInst {
+    return notifyNew(bridged.createDebugStep().getAs(DebugStepInst.self))
   }
 
   @discardableResult
   public func createApply(
     function: Value,
     _ substitutionMap: SubstitutionMap,
-    arguments: [Value]
+    arguments: [Value],
+    isNonThrowing: Bool = false,
+    isNonAsync: Bool = false,
+    specializationInfo: ApplyInst.SpecializationInfo = nil
   ) -> ApplyInst {
-    notifyInstructionsChanged()
-    notifyCallsChanged()
-
     let apply = arguments.withBridgedValues { valuesRef in
-      SILBuilder_createApply(bridged, function.bridged, substitutionMap.bridged, valuesRef)
+      bridged.createApply(function.bridged, substitutionMap.bridged, valuesRef,
+                          isNonThrowing, isNonAsync, specializationInfo)
     }
-    return apply.getAs(ApplyInst.self)
+    return notifyNew(apply.getAs(ApplyInst.self))
   }
   
   public func createUncheckedEnumData(enum enumVal: Value,
                                       caseIndex: Int,
                                       resultType: Type) -> UncheckedEnumDataInst {
-    notifyInstructionsChanged()
-    let ued = SILBuilder_createUncheckedEnumData(bridged, enumVal.bridged, caseIndex, resultType.bridged)
-    return ued.getAs(UncheckedEnumDataInst.self)
+    let ued = bridged.createUncheckedEnumData(enumVal.bridged, caseIndex, resultType.bridged)
+    return notifyNew(ued.getAs(UncheckedEnumDataInst.self))
   }
+
+  public func createEnum(caseIndex: Int, payload: Value?, enumType: Type) -> EnumInst {
+    let enumInst = bridged.createEnum(caseIndex, payload.bridged, enumType.bridged)
+    return notifyNew(enumInst.getAs(EnumInst.self))
+  }
+
   @discardableResult
   public func createSwitchEnum(enum enumVal: Value,
                                cases: [(Int, BasicBlock)],
                                defaultBlock: BasicBlock? = nil) -> SwitchEnumInst {
-    notifyInstructionsChanged()
-    notifyBranchesChanged()
     let se = cases.withUnsafeBufferPointer { caseBuffer in
-      SILBuilder_createSwitchEnumInst(
-        bridged, enumVal.bridged, defaultBlock.bridged, caseBuffer.baseAddress, caseBuffer.count)
+      bridged.createSwitchEnumInst(enumVal.bridged, defaultBlock.bridged,
+                                   caseBuffer.baseAddress, caseBuffer.count)
     }
-    return se.getAs(SwitchEnumInst.self)
+    return notifyNew(se.getAs(SwitchEnumInst.self))
   }
   
   @discardableResult
   public func createBranch(to destBlock: BasicBlock, arguments: [Value] = []) -> BranchInst {
-    notifyInstructionsChanged()
-    notifyBranchesChanged()
     return arguments.withBridgedValues { valuesRef in
-      let bi = SILBuilder_createBranch(bridged, destBlock.bridged, valuesRef)
-      return bi.getAs(BranchInst.self)
+      let bi = bridged.createBranch(destBlock.bridged, valuesRef)
+      return notifyNew(bi.getAs(BranchInst.self))
     }
+  }
+
+  @discardableResult
+  public func createUnreachable() -> UnreachableInst {
+    let ui = bridged.createUnreachable()
+    return notifyNew(ui.getAs(UnreachableInst.self))
+  }
+
+  @discardableResult
+  public func createObject(type: Type, arguments: [Value], numBaseElements: Int) -> ObjectInst {
+    let objectInst = arguments.withBridgedValues { valuesRef in
+      return bridged.createObject(type.bridged, valuesRef, numBaseElements)
+    }
+    return notifyNew(objectInst.getAs(ObjectInst.self))
+  }
+
+  public func createGlobalAddr(global: GlobalVariable) -> GlobalAddrInst {
+    return notifyNew(bridged.createGlobalAddr(global.bridged).getAs(GlobalAddrInst.self))
+  }
+
+  public func createGlobalValue(global: GlobalVariable, isBare: Bool) -> GlobalValueInst {
+    return notifyNew(bridged.createGlobalValue(global.bridged, isBare).getAs(GlobalValueInst.self))
+  }
+
+  public func createStruct(type: Type, elements: [Value]) -> StructInst {
+    let structInst = elements.withBridgedValues { valuesRef in
+      return bridged.createStruct(type.bridged, valuesRef)
+    }
+    return notifyNew(structInst.getAs(StructInst.self))
+  }
+
+  public func createStructExtract(struct: Value, fieldIndex: Int) -> StructExtractInst {
+    return notifyNew(bridged.createStructExtract(`struct`.bridged, fieldIndex).getAs(StructExtractInst.self))
+  }
+
+  public func createStructElementAddr(structAddress: Value, fieldIndex: Int) -> StructElementAddrInst {
+    return notifyNew(bridged.createStructElementAddr(structAddress.bridged, fieldIndex).getAs(StructElementAddrInst.self))
+  }
+
+  public func createDestructureStruct(struct: Value) -> DestructureStructInst {
+    return notifyNew(bridged.createDestructureStruct(`struct`.bridged).getAs(DestructureStructInst.self))
+  }
+
+  public func createTuple(type: Type, elements: [Value]) -> TupleInst {
+    let tuple = elements.withBridgedValues { valuesRef in
+      return bridged.createTuple(type.bridged, valuesRef)
+    }
+    return notifyNew(tuple.getAs(TupleInst.self))
+  }
+
+  public func createTupleExtract(tuple: Value, elementIndex: Int) -> TupleExtractInst {
+    return notifyNew(bridged.createTupleExtract(tuple.bridged, elementIndex).getAs(TupleExtractInst.self))
+  }
+
+  public func createTupleElementAddr(tupleAddress: Value, elementIndex: Int) -> TupleElementAddrInst {
+    return notifyNew(bridged.createTupleElementAddr(tupleAddress.bridged, elementIndex).getAs(TupleElementAddrInst.self))
+  }
+
+  public func createDestructureTuple(tuple: Value) -> DestructureTupleInst {
+    return notifyNew(bridged.createDestructureTuple(tuple.bridged).getAs(DestructureTupleInst.self))
+  }
+
+  @discardableResult
+  public func createStore(source: Value, destination: Value, ownership: StoreInst.StoreOwnership) -> StoreInst {
+    let store = bridged.createStore(source.bridged, destination.bridged, ownership.rawValue)
+    return notifyNew(store.getAs(StoreInst.self))
+  }
+
+  public func createInitExistentialRef(instance: Value,
+                                       existentialType: Type,
+                                       useConformancesOf: InitExistentialRefInst) -> InitExistentialRefInst {
+    let initExistential = bridged.createInitExistentialRef(instance.bridged,
+                                                           existentialType.bridged,
+                                                           useConformancesOf.bridged)
+    return notifyNew(initExistential.getAs(InitExistentialRefInst.self))
+  }
+
+  public func createMetatype(of type: Type, representation: swift.MetatypeRepresentation) -> MetatypeInst {
+    let metatype = bridged.createMetatype(type.bridged, representation)
+    return notifyNew(metatype.getAs(MetatypeInst.self))
+  }
+
+  public func createEndCOWMutation(instance: Value, keepUnique: Bool = false) -> EndCOWMutationInst {
+    let endMutation = bridged.createEndCOWMutation(instance.bridged, keepUnique)
+    return notifyNew(endMutation.getAs(EndCOWMutationInst.self))
   }
 }

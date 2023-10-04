@@ -86,7 +86,7 @@ static llvm::StructType *createStructType(IRGenModule &IGM,
 }
 
 static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
-                                                 llvm::LLVMContext &LLVMContext,
+                                                      llvm::LLVMContext &LLVMContext,
                                                       const IRGenOptions &Opts,
                                                       StringRef ModuleName,
                                                       StringRef PD) {
@@ -95,9 +95,12 @@ static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
   assert(Importer && "No clang module loader!");
   auto &ClangContext = Importer->getClangASTContext();
 
-  auto &CGO = Importer->getClangCodeGenOpts();
-  if (CGO.OpaquePointers)
+  auto &CGO = Importer->getCodeGenOpts();
+  if (CGO.OpaquePointers) {
     LLVMContext.setOpaquePointers(true);
+  } else {
+    LLVMContext.setOpaquePointers(false);
+  }
 
   CGO.OptimizationLevel = Opts.shouldOptimize() ? 3 : 0;
 
@@ -121,13 +124,15 @@ static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
   case IRGenDebugInfoFormat::DWARF:
     CGO.DebugCompilationDir = Opts.DebugCompilationDir;
     CGO.DwarfVersion = Opts.DWARFVersion;
-    CGO.DwarfDebugFlags = Opts.getDebugFlags(PD);
+    CGO.DwarfDebugFlags =
+        Opts.getDebugFlags(PD, Context.LangOpts.EnableCXXInterop);
     break;
   case IRGenDebugInfoFormat::CodeView:
     CGO.EmitCodeView = true;
     CGO.DebugCompilationDir = Opts.DebugCompilationDir;
     // This actually contains the debug flags for codeview.
-    CGO.DwarfDebugFlags = Opts.getDebugFlags(PD);
+    CGO.DwarfDebugFlags =
+        Opts.getDebugFlags(PD, Context.LangOpts.EnableCXXInterop);
     break;
   }
   if (!Opts.TrapFuncName.empty()) {
@@ -190,6 +195,8 @@ static void sanityCheckStdlib(IRGenModule &IGM) {
 
   // Only run the sanity check when we're building the real stdlib.
   if (!lookupSimple(IGM.getSwiftModule(), { "String" })) return;
+
+  if (!IGM.ObjCInterop) return;
 
   checkPointerAuthAssociatedTypeDiscriminator(IGM, { "_ObjectiveCBridgeable", "_ObjectiveCType" }, SpecialPointerAuthDiscriminators::ObjectiveCTypeDiscriminator);
   checkPointerAuthWitnessDiscriminator(IGM, { "_ObjectiveCBridgeable", "_bridgeToObjectiveC" }, SpecialPointerAuthDiscriminators::bridgeToObjectiveCDiscriminator);
@@ -348,24 +355,36 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   // A full type metadata record is basically just an adjustment to the
   // address point of a type metadata.  Resilience may cause
   // additional data to be laid out prior to this address point.
-  static_assert(MetadataAdjustmentIndex::ValueType == 1,
+  static_assert(MetadataAdjustmentIndex::ValueType == 2,
                 "Adjustment index must be synchronized with this layout");
   FullTypeMetadataStructTy = createStructType(*this, "swift.full_type", {
+    Int8PtrTy,
     WitnessTablePtrTy,
     TypeMetadataStructTy
   });
   FullTypeMetadataPtrTy = FullTypeMetadataStructTy->getPointerTo(DefaultAS);
 
+  FullForeignTypeMetadataStructTy = createStructType(*this, "swift.full_foreign_type", {
+    WitnessTablePtrTy,
+    TypeMetadataStructTy
+  });
+
   DeallocatingDtorTy = llvm::FunctionType::get(VoidTy, RefCountedPtrTy, false);
   llvm::Type *dtorPtrTy = DeallocatingDtorTy->getPointerTo();
+
+  FullExistentialTypeMetadataStructTy = createStructType(*this, "swift.full_existential_type", {
+    WitnessTablePtrTy,
+    TypeMetadataStructTy
+  });
 
   // A full heap metadata is basically just an additional small prefix
   // on a full metadata, used for metadata corresponding to heap
   // allocations.
-  static_assert(MetadataAdjustmentIndex::Class == 2,
+  static_assert(MetadataAdjustmentIndex::Class == 3,
                 "Adjustment index must be synchronized with this layout");
   FullHeapMetadataStructTy =
                   createStructType(*this, "swift.full_heapmetadata", {
+    Int8PtrTy,
     dtorPtrTy,
     WitnessTablePtrTy,
     TypeMetadataStructTy
@@ -553,7 +572,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   InvariantNode = llvm::MDNode::get(getLLVMContext(), {});
   DereferenceableID = getLLVMContext().getMDKindID("dereferenceable");
   
-  C_CC = llvm::CallingConv::C;
+  C_CC = getOptions().PlatformCCallingConvention;
   // TODO: use "tinycc" on platforms that support it
   DefaultCC = SWIFT_DEFAULT_LLVM_CC;
   SwiftCC = llvm::CallingConv::Swift;
@@ -840,6 +859,15 @@ namespace RuntimeConstants {
     return RuntimeAvailability::AlwaysAvailable;
   }
 
+  RuntimeAvailability ConcurrencyDiscardingTaskGroupAvailability(ASTContext &context) {
+    auto featureAvailability =
+        context.getConcurrencyDiscardingTaskGroupAvailability();
+    if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
+      return RuntimeAvailability::ConditionallyAvailable;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
   RuntimeAvailability DifferentiationAvailability(ASTContext &context) {
     auto featureAvailability = context.getDifferentiationAvailability();
     if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
@@ -861,6 +889,24 @@ namespace RuntimeConstants {
   ObjCIsUniquelyReferencedAvailability(ASTContext &context) {
     auto featureAvailability =
         context.getObjCIsUniquelyReferencedAvailability();
+    if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
+      return RuntimeAvailability::ConditionallyAvailable;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
+  RuntimeAvailability SignedConformsToProtocolAvailability(ASTContext &context) {
+    auto featureAvailability =
+        context.getSignedConformsToProtocolAvailability();
+    if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
+      return RuntimeAvailability::ConditionallyAvailable;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
+  RuntimeAvailability SignedDescriptorAvailability(ASTContext &context) {
+    auto featureAvailability =
+        context.getSignedDescriptorAvailability();
     if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
       return RuntimeAvailability::ConditionallyAvailable;
     }
@@ -1131,7 +1177,7 @@ IRGenModule::createStringConstant(StringRef Str, bool willBeRelativelyAddressed,
   llvm::Constant *IRGenModule::get##NAME() {                                   \
     if (NAME)                                                                  \
       return NAME;                                                             \
-    NAME = Module.getOrInsertGlobal(SYM, FullTypeMetadataStructTy);            \
+    NAME = Module.getOrInsertGlobal(SYM, FullExistentialTypeMetadataStructTy);            \
     if (useDllStorage() && !isStandardLibrary())                               \
       ApplyIRLinkage(IRLinkage::ExternalImport)                                \
           .to(cast<llvm::GlobalVariable>(NAME));                               \
@@ -1192,6 +1238,12 @@ Address IRGenModule::getAddrOfObjCISAMask() {
   return Address(ObjCISAMaskPtr, IntPtrTy, getPointerAlignment());
 }
 
+llvm::Constant *
+IRGenModule::getAddrOfAccessibleFunctionRecord(SILFunction *accessibleFn) {
+  auto entity = LinkEntity::forAccessibleFunctionRecord(accessibleFn);
+  return getAddrOfLLVMVariable(entity, ConstantInit(), DebugTypeInfo());
+}
+
 ModuleDecl *IRGenModule::getSwiftModule() const {
   return IRGen.SIL.getSwiftModule();
 }
@@ -1230,10 +1282,7 @@ bool IRGenerator::canEmitWitnessTableLazily(SILWitnessTable *wt) {
   if (wt->getLinkage() == SILLinkage::Shared)
     return true;
 
-  NominalTypeDecl *ConformingTy =
-    wt->getConformingType()->getNominalOrBoundGenericNominal();
-
-  switch (ConformingTy->getEffectiveAccess()) {
+  switch (wt->getConformingNominal()->getEffectiveAccess()) {
     case AccessLevel::Private:
     case AccessLevel::FilePrivate:
       return true;
@@ -1248,6 +1297,8 @@ bool IRGenerator::canEmitWitnessTableLazily(SILWitnessTable *wt) {
 }
 
 void IRGenerator::addLazyWitnessTable(const ProtocolConformance *Conf) {
+  assert(!SIL.getASTContext().LangOpts.hasFeature(Feature::Embedded));
+
   if (auto *wt = SIL.lookUpWitnessTable(Conf)) {
     // Add it to the queue if it hasn't already been put there.
     if (canEmitWitnessTableLazily(wt) &&
@@ -1300,7 +1351,7 @@ bool swift::irgen::shouldRemoveTargetFeature(StringRef feature) {
 }
 
 void IRGenModule::setHasNoFramePointer(llvm::AttrBuilder &Attrs) {
-  Attrs.addAttribute("frame-pointer", "none");
+  Attrs.addAttribute("frame-pointer", "non-leaf");
 }
 
 void IRGenModule::setHasNoFramePointer(llvm::Function *F) {
@@ -1411,6 +1462,9 @@ void IRGenModule::addLinkLibrary(const LinkLibrary &linkLib) {
   // the LinkLibraries of the module, so there's no reason to
   // emit it into the IR of debugger expressions.
   if (Context.LangOpts.DebuggerSupport)
+    return;
+
+  if (Context.LangOpts.hasFeature(Feature::Embedded))
     return;
   
   switch (linkLib.getKind()) {
@@ -1548,8 +1602,7 @@ void AutolinkKind::collectEntriesFromLibraries(
   llvm::LLVMContext &ctx = IGM.getLLVMContext();
 
   switch (Value) {
-  case AutolinkKind::LLVMLinkerOptions:
-  case AutolinkKind::SwiftAutoLinkExtract: {
+  case AutolinkKind::LLVMLinkerOptions: {
     // On platforms that support autolinking, continue to use the metadata.
     for (LinkLibrary linkLib : AutolinkEntries) {
       switch (linkLib.getKind()) {
@@ -1565,6 +1618,24 @@ void AutolinkKind::collectEntriesFromLibraries(
         Entries.insert(llvm::MDNode::get(ctx, args));
         continue;
       }
+      }
+      llvm_unreachable("Unhandled LibraryKind in switch.");
+    }
+    return;
+  }
+  case AutolinkKind::SwiftAutoLinkExtract: {
+    // On platforms that support autolinking, continue to use the metadata.
+    for (LinkLibrary linkLib : AutolinkEntries) {
+      switch (linkLib.getKind()) {
+      case LibraryKind::Library: {
+        llvm::SmallString<32> opt =
+            getTargetDependentLibraryOption(IGM.Triple, linkLib.getName());
+        Entries.insert(llvm::MDNode::get(ctx, llvm::MDString::get(ctx, opt)));
+        continue;
+      }
+      case LibraryKind::Framework:
+        // Frameworks are not supported with Swift Autolink Extract.
+        continue;
       }
       llvm_unreachable("Unhandled LibraryKind in switch.");
     }
@@ -1871,6 +1942,7 @@ bool IRGenModule::canMakeStaticObjectsReadOnly() {
   // rdar://101126543
   return false;
 
+#if 0
   if (getOptions().DisableReadonlyStaticObjects)
     return false;
 
@@ -1881,6 +1953,7 @@ bool IRGenModule::canMakeStaticObjectsReadOnly() {
 
   return getAvailabilityContext().isContainedIn(
           Context.getImmortalRefCountSymbolsAvailability());
+#endif
 }
 
 void IRGenerator::addGenModule(SourceFile *SF, IRGenModule *IGM) {
@@ -1892,14 +1965,26 @@ void IRGenerator::addGenModule(SourceFile *SF, IRGenModule *IGM) {
   Queue.push_back(IGM);
 }
 
+IRGenModule *IRGenerator::getGenModule(SourceFile *SF) {
+  // If we're emitting for a single module, or a single file, we always use the
+  // primary IGM.
+  if (GenModules.size() == 1)
+    return getPrimaryIGM();
+
+ IRGenModule *IGM = GenModules[SF];
+ assert(IGM);
+ return IGM;
+}
+
 IRGenModule *IRGenerator::getGenModule(DeclContext *ctxt) {
   if (GenModules.size() == 1 || !ctxt) {
     return getPrimaryIGM();
   }
-  SourceFile *SF = ctxt->getParentSourceFile();
+  SourceFile *SF = ctxt->getOutermostParentSourceFile();
   if (!SF) {
     return getPrimaryIGM();
   }
+
   IRGenModule *IGM = GenModules[SF];
   assert(IGM);
   return IGM;
@@ -1939,12 +2024,13 @@ const llvm::StringRef IRGenerator::getClangDataLayoutString() {
 }
 
 TypeExpansionContext IRGenModule::getMaximalTypeExpansionContext() const {
-  return TypeExpansionContext::maximal(getSwiftModule(),
+  return TypeExpansionContext::maximal(getSILModule().getAssociatedContext(),
                                        getSILModule().isWholeModule());
 }
 
-const TypeLayoutEntry &IRGenModule::getTypeLayoutEntry(SILType T) {
-  return Types.getTypeLayoutEntry(T);
+const TypeLayoutEntry
+&IRGenModule::getTypeLayoutEntry(SILType T, bool useStructLayouts) {
+  return Types.getTypeLayoutEntry(T, useStructLayouts);
 }
 
 
@@ -1994,7 +2080,6 @@ bool swift::writeEmptyOutputFilesFor(
   const ASTContext &Context,
   std::vector<std::string>& ParallelOutputFilenames,
   const IRGenOptions &IRGenOpts) {
-
   for (auto fileName : ParallelOutputFilenames) {
     // The first output file, was use for genuine output.
     if (fileName == ParallelOutputFilenames[0])

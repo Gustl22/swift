@@ -21,6 +21,7 @@
 #ifndef SWIFT_SIL_APPLYSITE_H
 #define SWIFT_SIL_APPLYSITE_H
 
+#include "swift/AST/ExtInfo.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBasicBlock.h"
@@ -47,20 +48,20 @@ struct ApplySiteKind {
   explicit ApplySiteKind(SILInstructionKind kind) {
     auto newValue = ApplySiteKind::fromNodeKindHelper(kind);
     assert(newValue && "Non apply site passed into ApplySiteKind");
-    value = newValue.getValue();
+    value = newValue.value();
   }
 
   ApplySiteKind(innerty value) : value(value) {}
   operator innerty() const { return value; }
 
-  static Optional<ApplySiteKind> fromNodeKind(SILInstructionKind kind) {
+  static llvm::Optional<ApplySiteKind> fromNodeKind(SILInstructionKind kind) {
     if (auto innerTyOpt = ApplySiteKind::fromNodeKindHelper(kind))
       return ApplySiteKind(*innerTyOpt);
-    return None;
+    return llvm::None;
   }
 
 private:
-  static Optional<innerty> fromNodeKindHelper(SILInstructionKind kind) {
+  static llvm::Optional<innerty> fromNodeKindHelper(SILInstructionKind kind) {
     switch (kind) {
     case SILInstructionKind::ApplyInst:
       return ApplySiteKind::ApplyInst;
@@ -71,7 +72,7 @@ private:
     case SILInstructionKind::BeginApplyInst:
       return ApplySiteKind::BeginApplyInst;
     default:
-      return None;
+      return llvm::None;
     }
   }
 };
@@ -101,7 +102,7 @@ public:
     if (!kind)
       return ApplySite();
 
-    switch (kind.getValue()) {
+    switch (kind.value()) {
     case ApplySiteKind::ApplyInst:
       return ApplySite(cast<ApplyInst>(inst));
     case ApplySiteKind::BeginApplyInst:
@@ -241,6 +242,12 @@ public:
     FOREACH_IMPL_RETURN(isCalleeKnownProgramTerminationPoint());
   }
 
+  /// Returns true if the callee function is annotated with
+  /// @_semantics("unavailable_code_reached")
+  bool isCalleeUnavailableCodeReached() const {
+    FOREACH_IMPL_RETURN(isCalleeUnavailableCodeReached());
+  }
+
   /// Check if this is a call of a never-returning function.
   bool isCalleeNoReturn() const { FOREACH_IMPL_RETURN(isCalleeNoReturn()); }
 
@@ -253,6 +260,10 @@ public:
     case SILFunctionTypeRepresentation::ObjCMethod:
     case SILFunctionTypeRepresentation::WitnessMethod:
     case SILFunctionTypeRepresentation::Closure:
+    case SILFunctionTypeRepresentation::KeyPathAccessorGetter:
+    case SILFunctionTypeRepresentation::KeyPathAccessorSetter:
+    case SILFunctionTypeRepresentation::KeyPathAccessorEquals:
+    case SILFunctionTypeRepresentation::KeyPathAccessorHash:
       return true;
     case SILFunctionTypeRepresentation::Block:
     case SILFunctionTypeRepresentation::Thick:
@@ -289,8 +300,19 @@ public:
   /// Return the apply operand for the given applied argument index.
   Operand &getArgumentRef(unsigned i) const { return getArgumentOperands()[i]; }
 
+  // The apply operand at the given index into the callee's function's
+  // arguments.
+  Operand &getArgumentRefAtCalleeArgIndex(unsigned i) const {
+    return getArgumentRef(i - getCalleeArgIndexOfFirstAppliedArg());
+  }
+
   /// Return the ith applied argument.
   SILValue getArgument(unsigned i) const { return getArguments()[i]; }
+
+  // The argument at the given index into the callee's function's arguments.
+  SILValue getArgumentAtCalleeArgIndex(unsigned i) const {
+    return getArgument(i - getCalleeArgIndexOfFirstAppliedArg());
+  }
 
   /// Set the ith applied argument.
   void setArgument(unsigned i, SILValue V) const {
@@ -369,9 +391,11 @@ public:
   ///
   /// For full applies, this is equivalent to `getArgumentConvention`. But for
   /// a partial_apply, the argument ownership convention at the partial_apply
-  /// instruction itself is different from the argument convention of the callee.
+  /// instruction itself is different from the argument convention of the
+  /// callee.
+  /// 
   /// For details see the partial_apply documentation in SIL.rst.
-  SILArgumentConvention getArgumentOperandConvention(const Operand &oper) const {
+  SILArgumentConvention getCaptureConvention(const Operand &oper) const {
     SILArgumentConvention conv = getArgumentConvention(oper);
     auto *pai = dyn_cast<PartialApplyInst>(Inst);
     if (!pai)
@@ -379,6 +403,7 @@ public:
     switch (conv) {
     case SILArgumentConvention::Indirect_Inout:
     case SILArgumentConvention::Indirect_InoutAliasable:
+    case SILArgumentConvention::Pack_Inout:
       return conv;
     case SILArgumentConvention::Direct_Owned:
     case SILArgumentConvention::Direct_Unowned:
@@ -386,11 +411,15 @@ public:
       return pai->isOnStack() ? SILArgumentConvention::Direct_Guaranteed
                               : SILArgumentConvention::Direct_Owned;
     case SILArgumentConvention::Indirect_In:
-    case SILArgumentConvention::Indirect_In_Constant:
     case SILArgumentConvention::Indirect_In_Guaranteed:
       return pai->isOnStack() ? SILArgumentConvention::Indirect_In_Guaranteed
                               : SILArgumentConvention::Indirect_In;
+    case SILArgumentConvention::Pack_Guaranteed:
+    case SILArgumentConvention::Pack_Owned:
+      return pai->isOnStack() ? SILArgumentConvention::Pack_Guaranteed
+                              : SILArgumentConvention::Pack_Owned;
     case SILArgumentConvention::Indirect_Out:
+    case SILArgumentConvention::Pack_Out:
       llvm_unreachable("partial_apply cannot have an @out operand");
     }
     llvm_unreachable("covered switch");
@@ -528,9 +557,9 @@ public:
 
   void dump() const LLVM_ATTRIBUTE_USED { getInstruction()->dump(); }
 
-  /// Attempt to cast this apply site to a full apply site, returning None on
-  /// failure.
-  Optional<FullApplySite> asFullApplySite() const;
+  /// Form a FullApplySite.  Note that it will be null if this apply site is not
+  /// in fact a FullApplySite.
+  FullApplySite asFullApplySite() const;
 };
 
 //===----------------------------------------------------------------------===//
@@ -547,20 +576,21 @@ struct FullApplySiteKind {
   explicit FullApplySiteKind(SILInstructionKind kind) {
     auto fullApplySiteKind = FullApplySiteKind::fromNodeKindHelper(kind);
     assert(fullApplySiteKind && "SILNodeKind is not a FullApplySiteKind?!");
-    value = fullApplySiteKind.getValue();
+    value = fullApplySiteKind.value();
   }
 
   FullApplySiteKind(innerty value) : value(value) {}
   operator innerty() const { return value; }
 
-  static Optional<FullApplySiteKind> fromNodeKind(SILInstructionKind kind) {
+  static llvm::Optional<FullApplySiteKind>
+  fromNodeKind(SILInstructionKind kind) {
     if (auto innerOpt = FullApplySiteKind::fromNodeKindHelper(kind))
       return FullApplySiteKind(*innerOpt);
-    return None;
+    return llvm::None;
   }
 
 private:
-  static Optional<innerty> fromNodeKindHelper(SILInstructionKind kind) {
+  static llvm::Optional<innerty> fromNodeKindHelper(SILInstructionKind kind) {
     switch (kind) {
     case SILInstructionKind::ApplyInst:
       return FullApplySiteKind::ApplyInst;
@@ -569,7 +599,7 @@ private:
     case SILInstructionKind::BeginApplyInst:
       return FullApplySiteKind::BeginApplyInst;
     default:
-      return None;
+      return llvm::None;
     }
   }
 };
@@ -591,7 +621,7 @@ public:
     auto kind = FullApplySiteKind::fromNodeKind(inst->getKind());
     if (!kind)
       return FullApplySite();
-    switch (kind.getValue()) {
+    switch (kind.value()) {
     case FullApplySiteKind::ApplyInst:
       return FullApplySite(cast<ApplyInst>(inst));
     case FullApplySiteKind::BeginApplyInst:
@@ -665,6 +695,18 @@ public:
       return cast<TryApplyInst>(getInstruction())->getInoutArguments();
     case FullApplySiteKind::BeginApplyInst:
       return cast<BeginApplyInst>(getInstruction())->getInoutArguments();
+    }
+    llvm_unreachable("invalid apply kind");
+  }
+
+  AutoDiffSemanticResultArgumentRange getAutoDiffSemanticResultArguments() const {
+    switch (getKind()) {
+    case FullApplySiteKind::ApplyInst:
+      return cast<ApplyInst>(getInstruction())->getAutoDiffSemanticResultArguments();
+    case FullApplySiteKind::TryApplyInst:
+      return cast<TryApplyInst>(getInstruction())->getAutoDiffSemanticResultArguments();
+    case FullApplySiteKind::BeginApplyInst:
+      return cast<BeginApplyInst>(getInstruction())->getAutoDiffSemanticResultArguments();
     }
     llvm_unreachable("invalid apply kind");
   }
@@ -792,7 +834,7 @@ template <> struct DenseMapInfo<::swift::FullApplySite> {
 
 namespace swift {
 
-inline Optional<FullApplySite> ApplySite::asFullApplySite() const {
+inline FullApplySite ApplySite::asFullApplySite() const {
   return FullApplySite::isa(getInstruction());
 }
 
@@ -800,7 +842,7 @@ inline bool ApplySite::isIndirectResultOperand(const Operand &op) const {
   auto fas = asFullApplySite();
   if (!fas)
     return false;
-  return fas->isIndirectResultOperand(op);
+  return fas.isIndirectResultOperand(op);
 }
 
 } // namespace swift

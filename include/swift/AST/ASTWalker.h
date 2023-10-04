@@ -20,11 +20,14 @@
 
 namespace swift {
 
+class Argument;
 class ArgumentList;
 class Decl;
 class Expr;
 class ClosureExpr;
+class CustomAttr;
 class ModuleDecl;
+class PackageUnit;
 class Stmt;
 class Pattern;
 class TypeRepr;
@@ -46,9 +49,17 @@ struct ReferenceMetaData {
   SemaReferenceKind Kind;
   llvm::Optional<AccessKind> AccKind;
   bool isImplicit = false;
+  bool isImplicitCtorType = false;
+
+  /// When non-none, this is a custom attribute reference.
+  llvm::Optional<std::pair<const CustomAttr *, Decl *>> CustomAttrRef;
+
   ReferenceMetaData(SemaReferenceKind Kind, llvm::Optional<AccessKind> AccKind,
-                    bool isImplicit = false)
-      : Kind(Kind), AccKind(AccKind), isImplicit(isImplicit) {}
+                    bool isImplicit = false,
+                    llvm::Optional<std::pair<const CustomAttr *, Decl *>>
+                        customAttrRef = llvm::None)
+      : Kind(Kind), AccKind(AccKind), isImplicit(isImplicit),
+        CustomAttrRef(customAttrRef) {}
 };
 
 /// Specifies how the initialization expression of a \c lazy variable should be
@@ -70,11 +81,32 @@ enum class LazyInitializerWalking {
   InAccessor
 };
 
+/// Specifies the behavior for walking a macro expansion, whether we want to
+/// see the macro arguments, the expansion, or both.
+enum class MacroWalking {
+  /// Walk into the expansion of the macro, to see the semantic effect of
+  /// the macro expansion.
+  Expansion,
+
+  /// Walk into the arguments of the macro as written in the source code.
+  ///
+  /// The actual arguments walked may not make it into the program itself,
+  /// because they can be translated by the macro in arbitrary ways.
+  Arguments,
+
+  /// Walk into both the arguments of the macro as written in the source code
+  /// and also the macro expansion.
+  ArgumentsAndExpansion,
+
+  /// Don't walk into macros.
+  None
+};
+
 /// An abstract class used to traverse an AST.
 class ASTWalker {
 public:
   enum class ParentKind {
-    Module, Decl, Stmt, Expr, Pattern, TypeRepr
+    Package, Module, Decl, Stmt, Expr, Pattern, TypeRepr
   };
 
   class ParentTy {
@@ -82,6 +114,7 @@ public:
     void *Ptr = nullptr;
 
   public:
+    ParentTy(PackageUnit *Pkg) : Kind(ParentKind::Package), Ptr(Pkg) {}
     ParentTy(ModuleDecl *Mod) : Kind(ParentKind::Module), Ptr(Mod) {}
     ParentTy(Decl *D) : Kind(ParentKind::Decl), Ptr(D) {}
     ParentTy(Stmt *S) : Kind(ParentKind::Stmt), Ptr(S) {}
@@ -96,6 +129,10 @@ public:
       return Kind;
     }
 
+    PackageUnit *getAsPackage() const {
+      return Kind == ParentKind::Package ? static_cast<PackageUnit*>(Ptr)
+                                        : nullptr;
+    }
     ModuleDecl *getAsModule() const {
       return Kind == ParentKind::Module ? static_cast<ModuleDecl*>(Ptr)
                                         : nullptr;
@@ -282,7 +319,7 @@ public:
   template <typename T>
   struct PreWalkResult {
     PreWalkAction Action;
-    Optional<T> Value;
+    llvm::Optional<T> Value;
 
     template <typename U,
               typename std::enable_if<std::is_convertible<U, T>::value>::type
@@ -316,7 +353,7 @@ public:
           Value(std::move(Result.Value)) {}
 
     PreWalkResult(_Detail::StopWalkAction)
-        : Action(PreWalkAction::Stop), Value(None) {}
+        : Action(PreWalkAction::Stop), Value(llvm::None) {}
   };
 
   /// Do not construct directly, use \c Action::<action> instead.
@@ -327,7 +364,7 @@ public:
   template <typename T>
   struct PostWalkResult {
     PostWalkAction Action;
-    Optional<T> Value;
+    llvm::Optional<T> Value;
 
     template <typename U,
               typename std::enable_if<std::is_convertible<U, T>::value>::type
@@ -355,7 +392,7 @@ public:
           Value(std::move(Result.Value)) {}
 
     PostWalkResult(_Detail::StopWalkAction)
-        : Action(PostWalkAction::Stop), Value(None) {}
+        : Action(PostWalkAction::Stop), Value(llvm::None) {}
   };
 
   /// This method is called when first visiting an expression
@@ -495,6 +532,29 @@ public:
     return LazyInitializerWalking::InPatternBinding;
   }
 
+  /// This method configures how the walker should walk into uses of macros.
+  virtual MacroWalking getMacroWalkingBehavior() const {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
+
+  /// Determine whether we should walk macro arguments (as they appear in
+  /// source) and the expansion (which is semantically part of the program).
+  std::pair<bool, bool> shouldWalkMacroArgumentsAndExpansion() const {
+    switch (getMacroWalkingBehavior()) {
+    case MacroWalking::Expansion:
+      return std::make_pair(false, true);
+
+    case MacroWalking::Arguments:
+      return std::make_pair(true, false);
+
+    case MacroWalking::ArgumentsAndExpansion:
+      return std::make_pair(true, true);
+
+    case MacroWalking::None:
+      return std::make_pair(false, false);
+    }
+  }
+
   /// This method configures whether the walker should visit the body of a
   /// closure that was checked separately from its enclosing expression.
   ///
@@ -531,6 +591,10 @@ public:
   ///
   /// TODO: Consider changing this to false by default.
   virtual bool shouldWalkSerializedTopLevelInternalDecls() { return true; }
+
+  /// Whether to walk into the definition of a \c MacroDecl if it hasn't been
+  /// type-checked yet.
+  virtual bool shouldWalkIntoUncheckedMacroDefinitions() { return false; }
 
   /// walkToParameterListPre - This method is called when first visiting a
   /// ParameterList, before walking into its parameters.
@@ -578,6 +642,27 @@ public:
   virtual PostWalkResult<ArgumentList *>
   walkToArgumentListPost(ArgumentList *ArgList) {
     return Action::Continue(ArgList);
+  }
+
+  /// This method is called when first visiting an argument in an argument list,
+  /// before walking into its expression.
+  ///
+  /// \param Arg The argument to walk.
+  ///
+  /// \returns The walking action to perform.
+  ///
+  /// The default implementation returns \c Action::Continue().
+  virtual PreWalkAction walkToArgumentPre(const Argument &Arg) {
+    return Action::Continue();
+  }
+
+  /// This method is called after visiting an argument in an argument list.
+  ///
+  /// \returns The walking action to perform.
+  ///
+  /// The default implementation returns \c Action::Continue().
+  virtual PostWalkAction walkToArgumentPost(const Argument &Arg) {
+    return Action::Continue();
   }
 
 protected:

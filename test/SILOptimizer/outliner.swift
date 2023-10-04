@@ -3,6 +3,7 @@
 
 // REQUIRES: objc_interop
 // REQUIRES: optimized_stdlib
+// REQUIRES: swift_in_compiler
 
 import Foundation
 
@@ -63,7 +64,6 @@ public func testOutlining() {
 // CHECK:  [[OBJ:%.*]] = open_existential_ref {{.*}} : $AnyObject to $@opened("{{.*}}", AnyObject) Self
 // CHECK:  [[METH:%.*]] = objc_method [[OBJ]] : $@opened("{{.*}}", AnyObject) Self, #Treeish.treeishChildren!foreign : <Self where Self : Treeish> (Self) -> () -> [Any]?
 // CHECK:  [[RES:%.*]] = apply [[METH]]([[OBJ]]) : $@convention(objc_method)
-// CHECK:  switch_enum [[RES]]
 // CHECK: } // end sil function '$s8outliner9dontCrash1ayyp_tF'
 
 // CHECK-LABEL: sil shared [noinline] @$sSo5GizmoC14stringPropertySSSgvgToTeab_ : {{.*}} {

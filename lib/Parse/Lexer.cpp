@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Parse/Lexer.h"
+#include "swift/AST/BridgingUtils.h"
 #include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/Identifier.h"
 #include "swift/Basic/LangOptions.h"
@@ -207,10 +208,15 @@ void Lexer::initialize(unsigned Offset, unsigned EndOffset) {
   ContentStart = BufferStart + BOMLength;
 
   // Initialize code completion.
-  if (BufferID == SourceMgr.getCodeCompletionBufferID()) {
-    const char *Ptr = BufferStart + SourceMgr.getCodeCompletionOffset();
-    if (Ptr >= BufferStart && Ptr <= BufferEnd)
+  if (BufferID == SourceMgr.getIDEInspectionTargetBufferID()) {
+    const char *Ptr = BufferStart + SourceMgr.getIDEInspectionTargetOffset();
+    // If the pointer points to a null byte, it's the null byte that was
+    // inserted to mark the code completion token. If the IDE inspection offset
+    // points to a normal character, no code completion token should be
+    // inserted.
+    if (Ptr >= BufferStart && Ptr < BufferEnd && *Ptr == '\0') {
       CodeCompletionPtr = Ptr;
+    }
   }
 
   ArtificialEOF = BufferStart + EndOffset;
@@ -687,6 +693,11 @@ void Lexer::lexHash() {
   .Case(#id, tok::pound_##id)
 #include "swift/AST/TokenKinds.def"
   .Default(tok::pound);
+
+  // If we found '#assert' but that experimental feature is not enabled,
+  // treat it as '#'.
+  if (Kind == tok::pound_assert && !LangOpts.hasFeature(Feature::StaticAssert))
+    Kind = tok::pound;
 
   // If we didn't find a match, then just return tok::pound.  This is highly
   // dubious in terms of error recovery, but is useful for code completion and
@@ -1996,7 +2007,7 @@ bool Lexer::isPotentialUnskippableBareSlashRegexLiteral(const Token &Tok) const 
   // We either don't have a regex literal, or we failed a heuristic. We now need
   // to make sure we don't have an unbalanced `{` or `}`, as that would have the
   // potential to change the range of a skipped body if we try to more
-  // agressively lex a regex literal during normal parsing. If we have balanced
+  // aggressively lex a regex literal during normal parsing. If we have balanced
   // `{` + `}`, we can proceed with skipping. Worst case scenario is we emit a
   // worse diagnostic.
   // FIXME: We ought to silence lexer diagnostics when skipping, this would
@@ -2079,7 +2090,7 @@ const char *Lexer::tryScanRegexLiteral(const char *TokStart, bool MustBeRegex,
   //   recovered from.
   auto *Ptr = TokStart;
   CompletelyErroneous = regexLiteralLexingFn(
-      &Ptr, BufferEnd, MustBeRegex, Diags);
+      &Ptr, BufferEnd, MustBeRegex, getBridgedOptionalDiagnosticEngine(Diags));
 
   // If we didn't make any lexing progress, this isn't a regex literal and we
   // should fallback to lexing as something else.

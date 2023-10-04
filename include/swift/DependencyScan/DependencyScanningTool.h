@@ -48,7 +48,8 @@ private:
 
 /// Given a set of arguments to a print-target-info frontend tool query, produce the
 /// JSON target info.
-llvm::ErrorOr<swiftscan_string_ref_t> getTargetInfo(ArrayRef<const char *> Command);
+llvm::ErrorOr<swiftscan_string_ref_t> getTargetInfo(ArrayRef<const char *> Command,
+                                                    const char *main_executable_path);
 
 /// The high-level implementation of the dependency scanner that runs on
 /// an individual worker thread.
@@ -85,7 +86,7 @@ public:
 
   /// Writes the current `SharedCache` instance to a specified FileSystem path.
   void serializeCache(llvm::StringRef path);
-  /// Loads an instance of a `GlobalModuleDependenciesCache` to serve as the `SharedCache`
+  /// Loads an instance of a `SwiftDependencyScanningService` to serve as the `SharedCache`
   /// from a specified FileSystem path.
   bool loadCache(llvm::StringRef path);
   /// Discard the tool's current `SharedCache` and start anew.
@@ -95,24 +96,27 @@ public:
   /// Discared the collection of diagnostics encountered so far.
   void resetDiagnostics();
 
+  /// Using the specified invocation command, instantiate a CompilerInstance
+  /// that will be used for this scan.
+  llvm::ErrorOr<std::unique_ptr<CompilerInstance>>
+  initCompilerInstanceForScan(ArrayRef<const char *> Command);
+
 private:
   /// Using the specified invocation command, initialize the scanner instance
   /// for this scan. Returns the `CompilerInstance` that will be used.
   llvm::ErrorOr<std::unique_ptr<CompilerInstance>>
   initScannerForAction(ArrayRef<const char *> Command);
 
-  /// Using the specified invocation command, instantiate a CompilerInstance
-  /// that will be used for this scan.
-  llvm::ErrorOr<std::unique_ptr<CompilerInstance>>
-  initCompilerInstanceForScan(ArrayRef<const char *> Command);
-
   /// Shared cache of module dependencies, re-used by individual full-scan queries
   /// during the lifetime of this Tool.
-  std::unique_ptr<GlobalModuleDependenciesCache> SharedCache;
+  std::unique_ptr<SwiftDependencyScanningService> ScanningService;
 
   /// Shared cache of compiler instances created during batch scanning, corresponding to
   /// command-line options specified in the batch scan input entry.
   std::unique_ptr<CompilerArgInstanceCacheMap> VersionedPCMInstanceCacheCache;
+
+  /// Shared state mutual-exclusivity lock
+  llvm::sys::SmartMutex<true> DependencyScanningToolStateLock;
 
   /// A shared consumer that accumulates encountered diagnostics.
   DependencyScannerDiagnosticCollectingConsumer CDC;

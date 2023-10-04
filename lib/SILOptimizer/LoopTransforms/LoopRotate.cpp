@@ -79,11 +79,6 @@ canDuplicateOrMoveToPreheader(SILLoop *loop, SILBasicBlock *preheader,
     if (isa<DeallocStackInst>(inst)) {
       return false;
     }
-    OwnershipForwardingMixin *ofm = nullptr;
-    if ((ofm = OwnershipForwardingMixin::get(inst)) &&
-        ofm->getForwardingOwnershipKind() == OwnershipKind::Guaranteed) {
-      return false;
-    }
     if (isa<FunctionRefInst>(inst)) {
       moves.push_back(inst);
       invariants.insert(inst);
@@ -116,6 +111,7 @@ canDuplicateOrMoveToPreheader(SILLoop *loop, SILBasicBlock *preheader,
     if (!inst->mayHaveSideEffects() && !inst->mayReadFromMemory() &&
         !isa<TermInst>(inst) &&
         !isa<AllocationInst>(inst) && /* not marked mayhavesideeffects */
+        !isa<CopyValueInst>(inst) &&
         hasLoopInvariantOperands(inst, loop, invariants)) {
       moves.push_back(inst);
       invariants.insert(inst);

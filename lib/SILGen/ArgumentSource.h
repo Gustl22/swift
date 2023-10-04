@@ -222,8 +222,16 @@ public:
     return Storage.get<LValueStorage>(StoredKind).Loc;
   }
 
+  /// The kind of operation under which we are querying a storage reference.
+  enum class StorageReferenceOperationKind {
+    Borrow,
+    Consume
+  };
+
   Expr *findStorageReferenceExprForBorrow() &&;
-  Expr *findStorageReferenceExprForMoveOnlyBorrow() &&;
+  Expr *findStorageReferenceExprForMoveOnly(SILGenFunction &SGF,
+                                      StorageReferenceOperationKind refKind) &&;
+  Expr *findStorageReferenceExprForBorrowExpr(SILGenFunction &SGF) &&;
 
   /// Given that this source is an expression, extract and clear
   /// that expression.
@@ -272,7 +280,7 @@ public:
 
   ArgumentSource copyForDiagnostics() const;
 
-  void dump() const;
+  LLVM_DUMP_METHOD void dump() const;
   void dump(raw_ostream &os, unsigned indent = 0) const;
 
 private:

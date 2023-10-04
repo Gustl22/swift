@@ -15,6 +15,7 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/Basic/ReferenceDependencyKeys.h"
 #include "swift/Basic/SourceManager.h"
+#include "llvm/Support/VirtualOutputBackends.h"
 
 #include <array>
 #include <unordered_map>
@@ -26,7 +27,7 @@ using namespace mocking_fine_grained_dependency_graphs;
 void mocking_fine_grained_dependency_graphs::simulateLoad(
     ModuleDepGraph &g, const driver::Job *cmd,
     const DependencyDescriptions &dependencyDescriptions,
-    Optional<Fingerprint> interfaceHashIfNonEmpty,
+    llvm::Optional<Fingerprint> interfaceHashIfNonEmpty,
     const bool hadCompilationError) {
   const auto changes = getChangesForSimulatedLoad(
       g, cmd, dependencyDescriptions, interfaceHashIfNonEmpty,
@@ -38,22 +39,23 @@ ModuleDepGraph::Changes
 mocking_fine_grained_dependency_graphs::getChangesForSimulatedLoad(
     ModuleDepGraph &g, const driver::Job *cmd,
     const DependencyDescriptions &dependencyDescriptions,
-    Optional<Fingerprint> interfaceHashIfNonEmpty,
+    llvm::Optional<Fingerprint> interfaceHashIfNonEmpty,
     const bool hadCompilationError) {
   auto swiftDeps =
     cmd->getOutput().getAdditionalOutputForType(file_types::TY_SwiftDeps).str();
   auto swiftDepsFingerprint =
-    swift::mockFingerprintFromString(swiftDeps).getValue();
-  auto interfaceHash = interfaceHashIfNonEmpty.getValueOr(swiftDepsFingerprint);
+    swift::mockFingerprintFromString(swiftDeps).value();
+  auto interfaceHash = interfaceHashIfNonEmpty.value_or(swiftDepsFingerprint);
 
   SourceManager sm;
   DiagnosticEngine diags(sm);
+  llvm::vfs::OnDiskOutputBackend backend;
 
   auto sfdg =
       UnitTestSourceFileDepGraphFactory(
           hadCompilationError, swiftDeps, interfaceHash,
           g.emitFineGrainedDependencyDotFileAfterEveryImport,
-          dependencyDescriptions, diags)
+          dependencyDescriptions, diags, backend)
           .construct();
 
   return g.loadFromSourceFileDepGraph(cmd, sfdg, diags);
@@ -63,14 +65,14 @@ std::vector<const driver::Job *>
 mocking_fine_grained_dependency_graphs::simulateReload(
     ModuleDepGraph &g, const driver::Job *cmd,
     const DependencyDescriptions &dependencyDescriptions,
-    Optional<Fingerprint> interfaceHashIfNonEmpty,
+    llvm::Optional<Fingerprint> interfaceHashIfNonEmpty,
     const bool hadCompilationError) {
   const auto changedNodes = getChangesForSimulatedLoad(
       g, cmd, dependencyDescriptions, interfaceHashIfNonEmpty,
       hadCompilationError);
   if (!changedNodes)
     return g.getAllJobs();
-  return g.findJobsToRecompileWhenNodesChange(changedNodes.getValue());
+  return g.findJobsToRecompileWhenNodesChange(changedNodes.value());
 }
 
 LLVM_ATTRIBUTE_UNUSED

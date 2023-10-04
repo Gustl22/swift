@@ -79,8 +79,8 @@ class ConstantEvaluableSubsetChecker : public SILModuleTransform {
         callee = applyInst->getReferencedFunctionOrNull();
       }
 
-      Optional<SILBasicBlock::iterator> nextInstOpt;
-      Optional<SymbolicValue> errorVal;
+      llvm::Optional<SILBasicBlock::iterator> nextInstOpt;
+      llvm::Optional<SymbolicValue> errorVal;
 
       if (!applyInst || !callee || !isConstantEvaluable(callee)) {
 
@@ -100,7 +100,7 @@ class ConstantEvaluableSubsetChecker : public SILModuleTransform {
           errorVal->emitUnknownDiagnosticNotes(inst->getLoc());
           assert(false && "non-constant control flow in the test driver");
         }
-        currI = nextInstOpt.getValue();
+        currI = nextInstOpt.value();
         continue;
       }
 
@@ -120,7 +120,7 @@ class ConstantEvaluableSubsetChecker : public SILModuleTransform {
       }
 
       if (nextInstOpt) {
-        currI = nextInstOpt.getValue();
+        currI = nextInstOpt.value();
         continue;
       }
 

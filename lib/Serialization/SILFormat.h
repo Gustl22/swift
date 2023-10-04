@@ -159,6 +159,9 @@ namespace sil_block {
     SIL_INST_INCREMENT_PROFILER_COUNTER,
     SIL_MOVEONLY_DEINIT,
     SIL_INST_HAS_SYMBOL,
+    SIL_OPEN_PACK_ELEMENT,
+    SIL_PACK_ELEMENT_GET,
+    SIL_PACK_ELEMENT_SET,
   };
 
   using SILInstNoOperandLayout = BCRecordLayout<
@@ -294,6 +297,8 @@ namespace sil_block {
                      BCFixed<1>,  // is dynamically replacable
                      BCFixed<1>,  // exact self class
                      BCFixed<1>,  // is distributed
+                     BCFixed<1>,  // is runtime accessible
+                     BCFixed<1>,  // are lexical lifetimes force-enabled
                      TypeIDField, // SILFunctionType
                      DeclIDField,  // SILFunction name or 0 (replaced function)
                      DeclIDField,  // SILFunction name or 0 (used ad-hoc requirement witness function)
@@ -407,28 +412,20 @@ namespace sil_block {
   >;
 
   // SIL instructions with one type. (alloc_stack)
-  using SILOneTypeLayout = BCRecordLayout<
-    SIL_ONE_TYPE,
-    SILInstOpCodeField,
-    BCFixed<3>,          // Optional attributes
-    TypeIDField,
-    SILTypeCategoryField
-  >;
+  using SILOneTypeLayout = BCRecordLayout<SIL_ONE_TYPE, SILInstOpCodeField,
+                                          BCFixed<4>, // Optional attributes
+                                          TypeIDField, SILTypeCategoryField>;
 
   // SIL instructions with one typed valueref. (dealloc_stack, return)
-  using SILOneOperandLayout = BCRecordLayout<
-    SIL_ONE_OPERAND,
-    SILInstOpCodeField,
-    BCFixed<2>,          // Optional attributes
-    TypeIDField,
-    SILTypeCategoryField,
-    ValueIDField
-  >;
+  using SILOneOperandLayout =
+      BCRecordLayout<SIL_ONE_OPERAND, SILInstOpCodeField,
+                     BCFixed<3>, // Optional attributes
+                     TypeIDField, SILTypeCategoryField, ValueIDField>;
 
   using SILOneOperandExtraAttributeLayout = BCRecordLayout<
     SIL_ONE_OPERAND_EXTRA_ATTR,
     SILInstOpCodeField,
-    BCFixed<6>, // Optional attributes
+    BCFixed<7>, // Optional attributes
     TypeIDField, SILTypeCategoryField, ValueIDField
   >;
 
@@ -455,13 +452,46 @@ namespace sil_block {
   using SILTwoOperandsExtraAttributeLayout = BCRecordLayout<
     SIL_TWO_OPERANDS_EXTRA_ATTR,
     SILInstOpCodeField,
-    BCFixed<6>,          // Optional attributes
+    BCFixed<7>,          // Optional attributes
     TypeIDField,
     SILTypeCategoryField,
     ValueIDField,
     TypeIDField,
     SILTypeCategoryField,
     ValueIDField
+  >;
+
+  // The pack_element_get instruction.
+  using SILOpenPackElementLayout = BCRecordLayout<
+    SIL_OPEN_PACK_ELEMENT,
+    GenericEnvironmentIDField,
+    TypeIDField,
+    SILTypeCategoryField,
+    ValueIDField
+  >;
+
+  // The pack_element_get instruction.
+  using SILPackElementGetLayout = BCRecordLayout<
+    SIL_PACK_ELEMENT_GET,
+    SILInstOpCodeField,
+    TypeIDField,            // element type
+    SILTypeCategoryField,   // element type category
+    TypeIDField,            // pack type
+    SILTypeCategoryField,   // pack type category
+    ValueIDField,           // pack value
+    ValueIDField            // index value
+  >;
+
+  // The pack_element_set instruction.
+  using SILPackElementSetLayout = BCRecordLayout<
+    SIL_PACK_ELEMENT_SET,
+    TypeIDField,            // element type
+    SILTypeCategoryField,   // element type category
+    ValueIDField,           // element value
+    TypeIDField,            // pack type
+    SILTypeCategoryField,   // pack type category
+    ValueIDField,           // pack value
+    ValueIDField            // index value
   >;
 
   // The tail_addr instruction.

@@ -9,13 +9,21 @@
 
 import PackageDescription
 
+let swiftSetttings: [SwiftSetting] = [
+  .unsafeFlags([
+    "-I", "../../include/swift/",
+    "-I", "../../include",
+  ])
+]
+
 let package = Package(
-  name: "ASTGen",
+  name: "swiftSwiftCompiler",
   platforms: [
     .macOS(.v10_15)
   ],
   products: [
-    .library(name: "swiftASTGen", targets: ["swiftASTGen"])
+    .library(name: "swiftASTGen", targets: ["swiftASTGen"]),
+    .library(name: "swiftLLVMJSON", targets: ["swiftLLVMJSON"]),
   ],
   dependencies: [
     .package(path: "../../../swift-syntax")
@@ -24,18 +32,26 @@ let package = Package(
     .target(
       name: "swiftASTGen",
       dependencies: [
+        .product(name: "SwiftBasicFormat", package: "swift-syntax"),
+        .product(name: "SwiftCompilerPluginMessageHandling", package: "swift-syntax"),
         .product(name: "SwiftDiagnostics", package: "swift-syntax"),
-        .product(name: "SwiftSyntax", package: "swift-syntax"),
+        .product(name: "SwiftOperators", package: "swift-syntax"),
         .product(name: "SwiftParser", package: "swift-syntax"),
-        .product(name: "_SwiftSyntaxMacros", package: "swift-syntax"),
+        .product(name: "SwiftParserDiagnostics", package: "swift-syntax"),
+        .product(name: "SwiftSyntax", package: "swift-syntax"),
+        .product(name: "SwiftSyntaxBuilder", package: "swift-syntax"),
+        .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+        .product(name: "SwiftSyntaxMacroExpansion", package: "swift-syntax"),
+        "swiftLLVMJSON"
       ],
-      path: ".",
-      exclude: ["CMakeLists.txt"],
-      swiftSettings: [
-        .unsafeFlags([
-          "-I", "../../include/swift/",
-          "-I", "../../include",
-        ])
-      ])
+      path: "Sources/ASTGen",
+      swiftSettings: swiftSetttings
+    ),
+    .target(
+      name: "swiftLLVMJSON",
+      dependencies: [],
+      path: "Sources/LLVMJSON",
+      swiftSettings: swiftSetttings
+    ),
   ]
 )

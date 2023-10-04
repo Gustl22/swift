@@ -141,27 +141,29 @@ public:
     assert(EntitiesStack.empty());
   }
 
-  bool shouldContinuePre(const Decl *D, Optional<BracketOptions> Bracket) {
-    assert(Bracket.hasValue());
-    if (!Bracket.getValue().shouldOpenExtension(D) &&
+  bool shouldContinuePre(const Decl *D,
+                         llvm::Optional<BracketOptions> Bracket) {
+    assert(Bracket.has_value());
+    if (!Bracket.value().shouldOpenExtension(D) &&
         isa<ExtensionDecl>(D))
       return false;
     return true;
   }
 
-  bool shouldContinuePost(const Decl *D, Optional<BracketOptions> Bracket) {
-    assert(Bracket.hasValue());
-    if (!Bracket.getValue().shouldCloseNominal(D) && isa<NominalTypeDecl>(D))
+  bool shouldContinuePost(const Decl *D,
+                          llvm::Optional<BracketOptions> Bracket) {
+    assert(Bracket.has_value());
+    if (!Bracket.value().shouldCloseNominal(D) && isa<NominalTypeDecl>(D))
       return false;
-    if (!Bracket.getValue().shouldCloseExtension(D) &&
+    if (!Bracket.value().shouldCloseExtension(D) &&
         isa<ExtensionDecl>(D))
       return false;
     return true;
   }
 
-  void printSynthesizedExtensionPre(const ExtensionDecl *ED,
-                                    TypeOrExtensionDecl Target,
-                                    Optional<BracketOptions> Bracket) override {
+  void printSynthesizedExtensionPre(
+      const ExtensionDecl *ED, TypeOrExtensionDecl Target,
+      llvm::Optional<BracketOptions> Bracket) override {
     assert(!SynthesizedExtensionInfo.first);
     SynthesizedExtensionInfo = {ED, Target};
     if (!shouldContinuePre(ED, Bracket))
@@ -170,10 +172,9 @@ public:
     EntitiesStack.emplace_back(ED, Target, nullptr, StartOffset, true);
   }
 
-  void
-  printSynthesizedExtensionPost(const ExtensionDecl *ED,
-                                TypeOrExtensionDecl Target,
-                                Optional<BracketOptions> Bracket) override {
+  void printSynthesizedExtensionPost(
+      const ExtensionDecl *ED, TypeOrExtensionDecl Target,
+      llvm::Optional<BracketOptions> Bracket) override {
     assert(SynthesizedExtensionInfo.first);
     SynthesizedExtensionInfo = {nullptr, {}};
     if (!shouldContinuePost(ED, Bracket))
@@ -185,7 +186,8 @@ public:
     TopEntities.push_back(std::move(Entity));
   }
 
-  void printDeclPre(const Decl *D, Optional<BracketOptions> Bracket) override {
+  void printDeclPre(const Decl *D,
+                    llvm::Optional<BracketOptions> Bracket) override {
     if (isa<ParamDecl>(D))
       return; // Parameters are handled specially in addParameters().
     if (!shouldContinuePre(D, Bracket))
@@ -208,7 +210,8 @@ public:
     }
   }
 
-  void printDeclPost(const Decl *D, Optional<BracketOptions> Bracket) override {
+  void printDeclPost(const Decl *D,
+                     llvm::Optional<BracketOptions> Bracket) override {
     if (isa<ParamDecl>(D))
       return; // Parameters are handled specially in addParameters().
     if (!shouldContinuePost(D, Bracket))
@@ -509,6 +512,7 @@ static bool initDocEntityInfo(const Decl *D,
     case DeclContextKind::ExtensionDecl:
     case DeclContextKind::GenericTypeDecl:
     case DeclContextKind::MacroDecl:
+    case DeclContextKind::Package:
       break;
 
     // We report sub-module information only for top-level decls.
@@ -619,7 +623,7 @@ static void reportRelated(ASTContext &Ctx, const Decl *D,
         passExtends(TD, Consumer);
     }
 
-    passInherits(ED->getInherited(), Consumer);
+    passInherits(ED->getInherited().getEntries(), Consumer);
 
   } else if (auto *TAD = dyn_cast<TypeAliasDecl>(D)) {
 
@@ -627,7 +631,7 @@ static void reportRelated(ASTContext &Ctx, const Decl *D,
       // If underlying type exists, report the inheritance and conformance of the
       // underlying type.
       if (auto NM = Ty->getAnyNominal()) {
-        passInherits(NM->getInherited(), Consumer);
+        passInherits(NM->getInherited().getEntries(), Consumer);
         passConforms(NM->getSatisfiedProtocolRequirements(/*Sorted=*/true),
                      Consumer);
         return;
@@ -770,6 +774,10 @@ public:
     : SM(SM), BufferID(BufferID), References(References), Consumer(Consumer) {}
 
   bool walkToNodePre(SyntaxNode Node) override {
+    // Ignore things that don't come from this buffer.
+    if (!SM.getRangeForBuffer(BufferID).contains(Node.Range.getStart()))
+      return false;
+
     unsigned Offset = SM.getLocOffsetInBuffer(Node.Range.getStart(), BufferID);
     unsigned Length = Node.Range.getByteLength();
 
@@ -830,6 +838,11 @@ public:
       auto passAnnotation = [&](UIdent Kind, SourceLoc Loc, Identifier Name) {
         if (Loc.isInvalid())
           return;
+
+        // Ignore things that don't come from this buffer.
+        if (!SM.getRangeForBuffer(BufferID).contains(Loc))
+          return;
+
         unsigned Offset = SM.getLocOffsetInBuffer(Loc, BufferID);
         unsigned Length = Name.empty() ? 1 : Name.getLength();
         reportRefsUntil(Offset);
@@ -917,9 +930,13 @@ static void addParameters(ArrayRef<Identifier> &ArgNames,
 
     if (auto typeRepr = param->getTypeRepr()) {
       SourceRange TypeRange = typeRepr->getSourceRange();
-      if (auto InOutTyR = dyn_cast_or_null<InOutTypeRepr>(typeRepr))
-        TypeRange = InOutTyR->getBase()->getSourceRange();
+      if (auto OwnTyR = dyn_cast_or_null<OwnershipTypeRepr>(typeRepr))
+        TypeRange = OwnTyR->getBase()->getSourceRange();
       if (TypeRange.isInvalid())
+        continue;
+
+      // Ignore things that don't come from this buffer.
+      if (!SM.getRangeForBuffer(BufferID).contains(TypeRange.Start))
         continue;
 
       unsigned StartOffs = SM.getLocOffsetInBuffer(TypeRange.Start, BufferID);
@@ -969,6 +986,11 @@ public:
              llvm::MutableArrayRef<TextEntity*> FuncEnts)
     : SM(SM), BufferID(BufferID), FuncEnts(FuncEnts) {}
 
+  /// Only walk the arguments of a macro, to represent the source as written.
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
+
   PreWalkAction walkToDeclPre(Decl *D) override {
     if (D->isImplicit())
       return Action::SkipChildren(); // Skip body.
@@ -978,6 +1000,10 @@ public:
 
     if (!isa<AbstractFunctionDecl>(D) && !isa<SubscriptDecl>(D))
       return Action::Continue();
+
+    // Ignore things that don't come from this buffer.
+    if (!SM.getRangeForBuffer(BufferID).contains(D->getLoc()))
+      return Action::SkipChildren();
 
     unsigned Offset = SM.getLocOffsetInBuffer(D->getLoc(), BufferID);
     auto Found = FuncEnts.end();
@@ -1045,7 +1071,7 @@ static bool getModuleInterfaceInfo(ASTContext &Ctx, StringRef ModuleName,
     return true;
 
   PrintOptions Options = PrintOptions::printDocInterface();
-  ModuleTraversalOptions TraversalOptions = None;
+  ModuleTraversalOptions TraversalOptions = llvm::None;
   TraversalOptions |= ModuleTraversal::VisitSubmodules;
   TraversalOptions |= ModuleTraversal::VisitHidden;
 
@@ -1053,7 +1079,7 @@ static bool getModuleInterfaceInfo(ASTContext &Ctx, StringRef ModuleName,
   llvm::raw_svector_ostream OS(Text);
   AnnotatingPrinter Printer(OS);
 
-  printModuleInterface(M, None, TraversalOptions, Printer, Options, true);
+  printModuleInterface(M, llvm::None, TraversalOptions, Printer, Options, true);
 
   Info.Text = std::string(OS.str());
   Info.TopEntities = std::move(Printer.TopEntities);
@@ -1132,6 +1158,11 @@ public:
       return true;
     if (isLocal(D))
       return true;
+
+    // Ignore things that don't come from this buffer.
+    if (!SM.getRangeForBuffer(BufferID).contains(D->getSourceRange().Start))
+      return false;
+
     TextRange TR = getTextRange(D->getSourceRange());
     unsigned LocOffset = getOffset(Range.getStart());
     EntitiesStack.emplace_back(D, TypeOrExtensionDecl(), nullptr, TR, LocOffset,
@@ -1157,6 +1188,10 @@ public:
                           ReferenceMetaData Data) override {
     if (Data.isImplicit || !Range.isValid())
       return true;
+    // Ignore things that don't come from this buffer.
+    if (!SM.getRangeForBuffer(BufferID).contains(Range.getStart()))
+      return false;
+
     unsigned StartOffset = getOffset(Range.getStart());
     References.emplace_back(D, StartOffset, Range.getByteLength(), Ty);
     return true;
@@ -1217,7 +1252,6 @@ static bool reportSourceDocInfo(CompilerInvocation Invocation,
     Consumer.failed(InstanceSetupError);
     return true;
   }
-  DiagConsumer.setInputBufferIDs(CI.getInputBufferIDs());
 
   ASTContext &Ctx = CI.getASTContext();
   CloseClangModuleFiles scopedCloseFiles(*Ctx.getClangModuleLoader());
@@ -1230,10 +1264,9 @@ static bool reportSourceDocInfo(CompilerInvocation Invocation,
 
   reportDocEntities(Ctx, SourceInfo.TopEntities, Consumer);
   reportSourceAnnotations(SourceInfo, CI, Consumer);
-  for (auto &Diag : DiagConsumer.getDiagnosticsForBuffer(
-                                                CI.getInputBufferIDs().back()))
-    Consumer.handleDiagnostic(Diag);
 
+  auto BufferID = CI.getInputBufferIDs().back();
+  Consumer.handleDiagnostics(DiagConsumer.getDiagnosticsForBuffer(BufferID));
   return false;
 }
 
@@ -1283,8 +1316,9 @@ public:
                         R.EndColumn,
                         R.ArgIndex};
               });
-          return {Start.first, Start.second, End.first,
-                  End.second,  R.Text.str(), std::move(SubRanges)};
+          return {R.Path.str(), Start.first,         Start.second,
+                  End.first,    End.second,          R.BufferName.str(),
+                  R.Text.str(), std::move(SubRanges)};
         });
     unsigned End = AllEdits.size();
     StartEnds.emplace_back(Start, End);
@@ -1492,7 +1526,7 @@ SourceFile *SwiftLangSupport::getSyntacticSourceFile(
   unsigned BufferID = ParseCI.getInputBufferIDs().back();
   for (auto Unit : ParseCI.getMainModule()->getFiles()) {
     if (auto Current = dyn_cast<SourceFile>(Unit)) {
-      if (Current->getBufferID().getValue() == BufferID) {
+      if (Current->getBufferID().value() == BufferID) {
         SF = Current;
         break;
       }

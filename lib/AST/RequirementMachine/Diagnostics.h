@@ -42,6 +42,8 @@ struct RequirementError {
     RecursiveRequirement,
     /// A redundant requirement, e.g. T == T.
     RedundantRequirement,
+    /// A not-yet-supported same-element requirement, e.g. each T == Int.
+    UnsupportedSameElement,
   } kind;
 
   /// The invalid requirement.
@@ -49,13 +51,14 @@ struct RequirementError {
 
   /// A requirement that conflicts with \c requirement. Both
   /// requirements will have the same subject type.
-  Optional<Requirement> conflictingRequirement;
+  llvm::Optional<Requirement> conflictingRequirement;
 
   SourceLoc loc;
 
 private:
   RequirementError(Kind kind, Requirement requirement, SourceLoc loc)
-    : kind(kind), requirement(requirement), conflictingRequirement(None), loc(loc) {}
+      : kind(kind), requirement(requirement),
+        conflictingRequirement(llvm::None), loc(loc) {}
 
   RequirementError(Kind kind, Requirement requirement,
                    Requirement conflict,
@@ -99,6 +102,10 @@ public:
   static RequirementError forRecursiveRequirement(Requirement req,
                                                   SourceLoc loc) {
     return {Kind::RecursiveRequirement, req, loc};
+  }
+
+  static RequirementError forSameElement(Requirement req, SourceLoc loc) {
+    return {Kind::UnsupportedSameElement, req, loc};
   }
 };
 

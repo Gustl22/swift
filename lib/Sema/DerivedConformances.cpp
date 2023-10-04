@@ -334,8 +334,13 @@ ValueDecl *DerivedConformance::getDerivableRequirement(NominalTypeDecl *nominal,
       return getRequirement(KnownProtocolKind::AdditiveArithmetic);
 
     // Actor.unownedExecutor
-    if (name.isSimpleName(ctx.Id_unownedExecutor))
-      return getRequirement(KnownProtocolKind::Actor);
+    if (name.isSimpleName(ctx.Id_unownedExecutor)) {
+      if (nominal->isDistributedActor()) {
+        return getRequirement(KnownProtocolKind::DistributedActor);
+      } else {
+        return getRequirement(KnownProtocolKind::Actor);
+      }
+    }
 
     // DistributedActor.id
     if (name.isSimpleName(ctx.Id_id))
@@ -488,6 +493,19 @@ DerivedConformance::createBuiltinCall(ASTContext &ctx,
   return call;
 }
 
+CallExpr *DerivedConformance::createDiagnoseUnavailableCodeReachedCallExpr(
+    ASTContext &ctx) {
+  FuncDecl *diagnoseDecl = ctx.getDiagnoseUnavailableCodeReached();
+  auto diagnoseDeclRefExpr =
+      new (ctx) DeclRefExpr(diagnoseDecl, DeclNameLoc(), true);
+  diagnoseDeclRefExpr->setType(diagnoseDecl->getInterfaceType());
+  auto argList = ArgumentList::createImplicit(ctx, {});
+  auto callExpr = CallExpr::createImplicit(ctx, diagnoseDeclRefExpr, argList);
+  callExpr->setType(ctx.getNeverType());
+  callExpr->setThrows(false);
+  return callExpr;
+}
+
 AccessorDecl *DerivedConformance::
 addGetterToReadOnlyDerivedProperty(VarDecl *property,
                                    Type propertyContextType) {
@@ -513,12 +531,11 @@ DerivedConformance::declareDerivedPropertyGetter(VarDecl *property,
       AccessorKind::Get, property,
       /*StaticLoc=*/SourceLoc(), StaticSpellingKind::None,
       /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
-      /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(), params,
-      property->getInterfaceType(), parentDC);
+      /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(), /*ThrownType=*/TypeLoc(),
+      params, property->getInterfaceType(), parentDC);
   getterDecl->setImplicit();
   getterDecl->setIsTransparent(false);
   getterDecl->copyFormalAccessFrom(property);
-
 
   return getterDecl;
 }
@@ -549,8 +566,8 @@ DerivedConformance::declareDerivedProperty(SynthesizedIntroducer intro,
   propDecl->copyFormalAccessFrom(Nominal, /*sourceIsParentContext*/ true);
   propDecl->setInterfaceType(propertyInterfaceType);
 
-  Pattern *propPat = NamedPattern::createImplicit(Context, propDecl);
-  propPat->setType(propertyContextType);
+  Pattern *propPat =
+      NamedPattern::createImplicit(Context, propDecl, propertyContextType);
 
   propPat = TypedPattern::createImplicit(Context, propPat, propertyContextType);
   propPat->setType(propertyContextType);
@@ -577,8 +594,7 @@ bool DerivedConformance::checkAndDiagnoseDisallowedContext(
       Nominal->getModuleScopeContext() !=
           getConformanceContext()->getModuleScopeContext()) {
     ConformanceDecl->diagnose(diag::cannot_synthesize_in_crossfile_extension,
-                              Nominal->getDescriptiveKind(), Nominal->getName(),
-                              synthesizing->getName(),
+                              Nominal, synthesizing->getName(),
                               getProtocolType());
     Nominal->diagnose(diag::kind_declared_here, DescriptiveDeclKind::Type);
 
@@ -670,6 +686,31 @@ GuardStmt *DerivedConformance::returnFalseIfNotEqualGuard(ASTContext &C,
   auto falseExpr = new (C) BooleanLiteralExpr(false, SourceLoc(), true);
   return returnIfNotEqualGuard(C, lhsExpr, rhsExpr, falseExpr);
 }
+/// Returns a generated guard statement that checks whether the given expr is true.
+/// If it is false, the else block for the guard returns `nil`.
+/// \p C The AST context.
+/// \p testExpr The expression that should be tested.
+/// \p baseType The wrapped type of the to-be-returned Optional<Wrapped>.
+GuardStmt *DerivedConformance::returnNilIfFalseGuardTypeChecked(ASTContext &C,
+                                        Expr *testExpr,
+                                        Type optionalWrappedType) {
+  auto nilExpr = new (C) NilLiteralExpr(SourceLoc(), /*implicit=*/true);
+  nilExpr->setType(optionalWrappedType->wrapInOptionalType());
+
+  SmallVector<StmtConditionElement, 1> conditions;
+  SmallVector<ASTNode, 1> statements;
+
+  auto returnStmt = new (C) ReturnStmt(SourceLoc(), nilExpr);
+  statements.push_back(returnStmt);
+
+  // Next, generate the condition being checked.
+  conditions.emplace_back(testExpr);
+
+  // Build and return the complete guard statement.
+  // guard lhs == rhs else { return lhs < rhs }
+  auto body = BraceStmt::create(C, SourceLoc(), statements, SourceLoc());
+  return new (C) GuardStmt(SourceLoc(), C.AllocateCopy(conditions), body);
+}
 /// Returns a generated guard statement that checks whether the given lhs and
 /// rhs expressions are equal. If not equal, the else block for the guard
 /// returns lhs < rhs.
@@ -692,7 +733,7 @@ GuardStmt *DerivedConformance::returnComparisonIfNotEqualGuard(ASTContext &C,
 static IntegerLiteralExpr *buildIntegerLiteral(ASTContext &C, unsigned index) {
   Type intType = C.getIntType();
 
-  auto literal = IntegerLiteralExpr::createFromUnsigned(C, index);
+  auto literal = IntegerLiteralExpr::createFromUnsigned(C, index, SourceLoc());
   literal->setType(intType);
   literal->setBuiltinInitializer(C.getIntBuiltinInitDecl(C.getIntDecl()));
 
@@ -714,7 +755,7 @@ DeclRefExpr *DerivedConformance::convertEnumToIndex(SmallVectorImpl<ASTNode> &st
                                        AbstractFunctionDecl *funcDecl,
                                        const char *indexName) {
   ASTContext &C = enumDecl->getASTContext();
-  Type enumType = enumVarDecl->getType();
+  Type enumType = enumVarDecl->getTypeInContext();
   Type intType = C.getIntType();
 
   auto indexVar = new (C) VarDecl(/*IsStatic*/false, VarDecl::Introducer::Var,
@@ -724,8 +765,7 @@ DeclRefExpr *DerivedConformance::convertEnumToIndex(SmallVectorImpl<ASTNode> &st
   indexVar->setImplicit();
 
   // generate: var indexVar
-  Pattern *indexPat = NamedPattern::createImplicit(C, indexVar);
-  indexPat->setType(intType);
+  Pattern *indexPat = NamedPattern::createImplicit(C, indexVar, intType);
   indexPat = TypedPattern::createImplicit(C, indexPat, intType);
   indexPat->setType(intType);
   auto *indexBind = PatternBindingDecl::createImplicit(
@@ -734,10 +774,18 @@ DeclRefExpr *DerivedConformance::convertEnumToIndex(SmallVectorImpl<ASTNode> &st
   unsigned index = 0;
   SmallVector<ASTNode, 4> cases;
   for (auto elt : enumDecl->getAllElements()) {
+    if (auto *unavailableElementCase =
+            DerivedConformance::unavailableEnumElementCaseStmt(enumType, elt,
+                                                               funcDecl)) {
+      cases.push_back(unavailableElementCase);
+      continue;
+    }
+
     // generate: case .<Case>:
     auto pat = new (C)
         EnumElementPattern(TypeExpr::createImplicit(enumType, C), SourceLoc(),
-                           DeclNameLoc(), DeclNameRef(), elt, nullptr);
+                           DeclNameLoc(), DeclNameRef(), elt, nullptr,
+                           /*DC*/ funcDecl);
     pat->setImplicit();
     pat->setType(enumType);
 
@@ -757,14 +805,14 @@ DeclRefExpr *DerivedConformance::convertEnumToIndex(SmallVectorImpl<ASTNode> &st
                                   SourceLoc());
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      labelItem, SourceLoc(), SourceLoc(), body,
-                                     /*case body vardecls*/ None));
+                                     /*case body vardecls*/ llvm::None));
   }
 
   // generate: switch enumVar { }
   auto enumRef = new (C) DeclRefExpr(enumVarDecl, DeclNameLoc(),
                                      /*implicit*/true,
                                      AccessSemantics::Ordinary,
-                                     enumVarDecl->getType());
+                                     enumVarDecl->getTypeInContext());
   auto switchStmt =
       SwitchStmt::createImplicit(LabeledStmtInfo(), enumRef, cases, C);
 
@@ -854,8 +902,8 @@ Pattern *DerivedConformance::enumElementPayloadSubpattern(
 
       auto namedPattern = new (C) NamedPattern(payloadVar);
       namedPattern->setImplicit();
-      auto letPattern =
-          BindingPattern::createImplicit(C, /*isLet*/ true, namedPattern);
+      auto letPattern = BindingPattern::createImplicit(
+          C, VarDecl::Introducer::Let, namedPattern);
       elementPatterns.push_back(TuplePatternElt(tupleElement.getName(),
                                                 SourceLoc(), letPattern));
     }
@@ -874,9 +922,56 @@ Pattern *DerivedConformance::enumElementPayloadSubpattern(
 
   auto namedPattern = new (C) NamedPattern(payloadVar);
   namedPattern->setImplicit();
-  auto letPattern =
-      new (C) BindingPattern(SourceLoc(), /*isLet*/ true, namedPattern);
+  auto letPattern = new (C)
+      BindingPattern(SourceLoc(), VarDecl::Introducer::Let, namedPattern);
   return ParenPattern::createImplicit(C, letPattern);
+}
+
+CaseStmt *DerivedConformance::unavailableEnumElementCaseStmt(
+    Type enumType, EnumElementDecl *elt, DeclContext *parentDC,
+    unsigned subPatternCount) {
+  assert(subPatternCount > 0);
+
+  ASTContext &C = parentDC->getASTContext();
+  auto availableAttr = elt->getAttrs().getUnavailable(C);
+  if (!availableAttr)
+    return nullptr;
+
+  if (!availableAttr->isUnconditionallyUnavailable())
+    return nullptr;
+
+  auto createElementPattern = [&]() -> EnumElementPattern * {
+    // .<elt>
+    EnumElementPattern *eltPattern = new (C) EnumElementPattern(
+        TypeExpr::createImplicit(enumType, C), SourceLoc(), DeclNameLoc(),
+        DeclNameRef(elt->getBaseIdentifier()), elt, nullptr, /*DC*/ parentDC);
+    eltPattern->setImplicit();
+    eltPattern->setType(enumType);
+    return eltPattern;
+  };
+
+  Pattern *labelItemPattern;
+  if (subPatternCount > 1) {
+    SmallVector<TuplePatternElt, 2> tuplePatternElts;
+    for (unsigned i = 0; i < subPatternCount; i++) {
+      tuplePatternElts.push_back(TuplePatternElt(createElementPattern()));
+    }
+
+    // (.<elt>, ..., .<elt>)
+    auto caseTuplePattern = TuplePattern::createImplicit(C, tuplePatternElts);
+    caseTuplePattern->setImplicit();
+    labelItemPattern = caseTuplePattern;
+  } else {
+    labelItemPattern = createElementPattern();
+  }
+
+  auto labelItem = CaseLabelItem(labelItemPattern);
+  auto *callExpr =
+      DerivedConformance::createDiagnoseUnavailableCodeReachedCallExpr(C);
+  auto body = BraceStmt::create(C, SourceLoc(), {callExpr}, SourceLoc());
+  return CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(), labelItem,
+                          SourceLoc(), SourceLoc(), body, {},
+                          /*implicit*/ true);
 }
 
 /// Creates a named variable based on a prefix character and a numeric index.

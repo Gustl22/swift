@@ -85,7 +85,7 @@ typealias Foo = some P // expected-error{{'some' types are only permitted}}
 
 func blibble(blobble: some P) {}
 func blib() -> P & some Q { return 1 } // expected-error{{'some' should appear at the beginning}}
-func blab() -> some P? { return 1 } // expected-error{{must specify only}} expected-note{{did you mean to write an optional of an 'opaque' type?}}
+func blab() -> some P? { return 1 } // expected-error{{must specify only}} expected-note{{did you mean to write an optional of an 'some' type?}}
 func blorb<T: some P>(_: T) { } // expected-error{{'some' types are only permitted}}
 func blub<T>() -> T where T == some P { return 1 } // expected-error{{'some' types are only permitted}}
 
@@ -577,4 +577,16 @@ do {
     let x = invalid // expected-error {{cannot find 'invalid' in scope}}
     x
   }
+}
+
+// https://github.com/apple/swift/issues/62787
+func f62787() -> Optional<some Collection<Int>> {
+  return nil // expected-error{{underlying type for opaque result type 'Optional<some Collection<Int>>' could not be inferred from return expression}}
+}
+
+func f62787_1(x: Bool) -> Optional<some Collection<Int>> {
+  if x {
+    return nil // expected-error{{underlying type for opaque result type 'Optional<some Collection<Int>>' could not be inferred from return expression}}
+  } 
+  return nil // expected-error{{underlying type for opaque result type 'Optional<some Collection<Int>>' could not be inferred from return expression}}
 }

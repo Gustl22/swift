@@ -33,10 +33,11 @@
 #include "swift/SIL/SILProperty.h"
 #include "swift/SIL/SILUndef.h"
 
+#include "swift/SIL/OwnershipUtils.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/Support/DJB.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/OnDiskHashTable.h"
 
 #include <type_traits>
@@ -48,21 +49,23 @@ using namespace llvm::support;
 
 const char SILEntityError::ID = '\0';
 void SILEntityError::anchor() {}
+const char SILFunctionTypeMismatch::ID = '\0';
+void SILFunctionTypeMismatch::anchor() {}
 
 STATISTIC(NumDeserializedFunc, "Number of deserialized SIL functions");
 
-static Optional<StringLiteralInst::Encoding>
+static llvm::Optional<StringLiteralInst::Encoding>
 fromStableStringEncoding(unsigned value) {
   switch (value) {
   case SIL_BYTES: return StringLiteralInst::Encoding::Bytes;
   case SIL_UTF8: return StringLiteralInst::Encoding::UTF8;
   case SIL_OBJC_SELECTOR: return StringLiteralInst::Encoding::ObjCSelector;
-  default: return None;
+  default:
+    return llvm::None;
   }
 }
 
-static Optional<SILLinkage>
-fromStableSILLinkage(unsigned value) {
+static llvm::Optional<SILLinkage> fromStableSILLinkage(unsigned value) {
   switch (value) {
   case SIL_LINKAGE_PUBLIC: return SILLinkage::Public;
   case SIL_LINKAGE_PUBLIC_NON_ABI: return SILLinkage::PublicNonABI;
@@ -71,21 +74,23 @@ fromStableSILLinkage(unsigned value) {
   case SIL_LINKAGE_PRIVATE: return SILLinkage::Private;
   case SIL_LINKAGE_PUBLIC_EXTERNAL: return SILLinkage::PublicExternal;
   case SIL_LINKAGE_HIDDEN_EXTERNAL: return SILLinkage::HiddenExternal;
-  default: return None;
+  default:
+    return llvm::None;
   }
 }
 
-static Optional<SILVTable::Entry::Kind>
+static llvm::Optional<SILVTable::Entry::Kind>
 fromStableVTableEntryKind(unsigned value) {
   switch (value) {
   case SIL_VTABLE_ENTRY_NORMAL: return SILVTable::Entry::Kind::Normal;
   case SIL_VTABLE_ENTRY_INHERITED: return SILVTable::Entry::Kind::Inherited;
   case SIL_VTABLE_ENTRY_OVERRIDE: return SILVTable::Entry::Kind::Override;
-  default: return None;
+  default:
+    return llvm::None;
   }
 }
 
-static Optional<swift::DifferentiabilityKind>
+static llvm::Optional<swift::DifferentiabilityKind>
 fromStableDifferentiabilityKind(uint8_t diffKind) {
   switch (diffKind) {
 #define CASE(THE_DK) \
@@ -98,7 +103,7 @@ fromStableDifferentiabilityKind(uint8_t diffKind) {
   CASE(Linear)
 #undef CASE
   default:
-    return None;
+    return llvm::None;
   }
 }
 
@@ -513,16 +518,15 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
   if (!maybeEntry)
     return maybeEntry.takeError();
   llvm::BitstreamEntry entry = maybeEntry.get();
-  if (entry.Kind == llvm::BitstreamEntry::Error) {
-    MF->fatal("Cursor advance error in readSILFunction");
-  }
+  if (entry.Kind == llvm::BitstreamEntry::Error)
+    return MF->diagnoseFatal("Cursor advance error in readSILFunction");
 
   SmallVector<uint64_t, 64> scratch;
   StringRef blobData;
   llvm::Expected<unsigned> maybeKind =
       SILCursor.readRecord(entry.ID, scratch, &blobData);
   if (!maybeKind)
-    MF->fatal(maybeKind.takeError());
+    return MF->diagnoseFatal(maybeKind.takeError());
   unsigned kind = maybeKind.get();
   assert(kind == SIL_FUNCTION && "expect a sil function");
   (void)kind;
@@ -535,24 +539,23 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
   GenericSignatureID genericSigID;
   unsigned rawLinkage, isTransparent, isSerialized, isThunk,
       isWithoutActuallyEscapingThunk, specialPurpose, inlineStrategy,
-      optimizationMode, perfConstr,
-      subclassScope, hasCReferences, effect, numAttrs,
-      hasQualifiedOwnership, isWeakImported, LIST_VER_TUPLE_PIECES(available),
-      isDynamic, isExactSelfClass, isDistributed;
+      optimizationMode, perfConstr, subclassScope, hasCReferences, effect,
+      numAttrs, hasQualifiedOwnership, isWeakImported,
+      LIST_VER_TUPLE_PIECES(available), isDynamic, isExactSelfClass,
+      isDistributed, isRuntimeAccessible, forceEnableLexicalLifetimes;
   ArrayRef<uint64_t> SemanticsIDs;
   SILFunctionLayout::readRecord(
       scratch, rawLinkage, isTransparent, isSerialized, isThunk,
       isWithoutActuallyEscapingThunk, specialPurpose, inlineStrategy,
-      optimizationMode, perfConstr,
-      subclassScope, hasCReferences, effect, numAttrs,
-      hasQualifiedOwnership, isWeakImported, LIST_VER_TUPLE_PIECES(available),
-      isDynamic, isExactSelfClass, isDistributed, funcTyID,
-      replacedFunctionID, usedAdHocWitnessFunctionID,
-      genericSigID, clangNodeOwnerID, parentModuleID, SemanticsIDs);
+      optimizationMode, perfConstr, subclassScope, hasCReferences, effect,
+      numAttrs, hasQualifiedOwnership, isWeakImported,
+      LIST_VER_TUPLE_PIECES(available), isDynamic, isExactSelfClass,
+      isDistributed, isRuntimeAccessible, forceEnableLexicalLifetimes, funcTyID,
+      replacedFunctionID, usedAdHocWitnessFunctionID, genericSigID,
+      clangNodeOwnerID, parentModuleID, SemanticsIDs);
 
-  if (funcTyID == 0) {
-    MF->fatal("SILFunction typeID is 0");
-  }
+  if (funcTyID == 0)
+    return MF->diagnoseFatal("SILFunction typeID is 0");
   auto astType = MF->getTypeChecked(funcTyID);
   if (!astType) {
     if (!existingFn || errorIfEmptyBody) {
@@ -563,9 +566,8 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
     return existingFn;
   }
   auto ty = getSILType(astType.get(), SILValueCategory::Object, nullptr);
-  if (!ty.is<SILFunctionType>()) {
-    MF->fatal("not a function type for SILFunction");
-  }
+  if (!ty.is<SILFunctionType>())
+    return MF->diagnoseFatal("not a function type for SILFunction");
 
   SILFunction *replacedFunction = nullptr;
   Identifier replacedObjectiveCFunc;
@@ -589,16 +591,15 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
   if (!linkageOpt) {
     LLVM_DEBUG(llvm::dbgs() << "invalid linkage code " << rawLinkage
                             << " for SILFunction\n");
-    MF->fatal("invalid linkage code");
+    return MF->diagnoseFatal("invalid linkage code");
   }
-  SILLinkage linkage = linkageOpt.getValue();
+  SILLinkage linkage = linkageOpt.value();
 
   ValueDecl *clangNodeOwner = nullptr;
   if (clangNodeOwnerID != 0) {
     clangNodeOwner = dyn_cast_or_null<ValueDecl>(MF->getDecl(clangNodeOwnerID));
-    if (!clangNodeOwner) {
-      MF->fatal("invalid clang node owner for SILFunction");
-    }
+    if (!clangNodeOwner)
+      return MF->diagnoseFatal("invalid clang node owner for SILFunction");
   }
 
   // If we weren't handed a function, check for an existing
@@ -620,7 +621,11 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
   // If we have an existing function, verify that the types match up.
   if (fn) {
     if (fn->getLoweredType() != ty) {
-      MF->fatal("SILFunction type mismatch");
+      auto error = llvm::make_error<SILFunctionTypeMismatch>(
+                     name,
+                     fn->getLoweredType().getDebugDescription(),
+                     ty.getDebugDescription());
+      return MF->diagnoseFatal(std::move(error));
     }
 
     fn->setSerialized(IsSerialized_t(isSerialized));
@@ -654,9 +659,8 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
       }
     }
 
-    if (fn->isDynamicallyReplaceable() != isDynamic) {
-      MF->fatal("SILFunction type mismatch");
-    }
+    if (fn->isDynamicallyReplaceable() != isDynamic)
+      return MF->diagnoseFatal("SILFunction dynamic replaceable mismatch");
 
   } else {
     // Otherwise, create a new function.
@@ -674,6 +678,7 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
     fn->setIsAlwaysWeakImported(isWeakImported);
     fn->setClassSubclassScope(SubclassScope(subclassScope));
     fn->setHasCReferences(bool(hasCReferences));
+    fn->setIsStaticallyLinked(MF->getAssociatedModule()->isStaticLibrary());
 
     llvm::VersionTuple available;
     DECODE_VER_TUPLE(available);
@@ -685,6 +690,9 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
     fn->setIsDynamic(IsDynamicallyReplaceable_t(isDynamic));
     fn->setIsExactSelfClass(IsExactSelfClass_t(isExactSelfClass));
     fn->setIsDistributed(IsDistributed_t(isDistributed));
+    fn->setIsRuntimeAccessible(IsRuntimeAccessible_t(isRuntimeAccessible));
+    fn->setForceEnableLexicalLifetimes(
+        ForceEnableLexicalLifetimes_t(forceEnableLexicalLifetimes));
     if (replacedFunction)
       fn->setDynamicallyReplacedFunction(replacedFunction);
     if (!replacedObjectiveCFunc.empty())
@@ -888,9 +896,8 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
       Builder.setInsertionPoint(CurrentBB);
 
       // Handle a SILInstruction record.
-      if (readSILInstruction(fn, Builder, kind, scratch)) {
-        MF->fatal("readSILInstruction returns error");
-      }
+      if (readSILInstruction(fn, Builder, kind, scratch))
+        return MF->diagnoseFatal("readSILInstruction returns error");
     }
 
     // Fetch the next record.
@@ -915,11 +922,11 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
   if (fn->empty() && errorIfEmptyBody)
     return nullptr;
 
-  // Check that there are no unresolved forward definitions of opened
+  // Check that there are no unresolved forward definitions of local
   // archetypes.
-  if (SILMod.hasUnresolvedOpenedArchetypeDefinitions())
+  if (SILMod.hasUnresolvedLocalArchetypeDefinitions())
     llvm_unreachable(
-        "All forward definitions of opened archetypes should be resolved");
+        "All forward definitions of local archetypes should be resolved");
 
   if (Callback)
     Callback->didDeserializeFunctionBody(MF->getAssociatedModule(), fn);
@@ -967,16 +974,24 @@ SILBasicBlock *SILDeserializer::readSILBasicBlock(SILFunction *Fn,
     SILArgument *Arg;
     auto ValueCategory = SILValueCategory(Args[I + 1] & 0xF);
     SILType SILArgTy = getSILType(ArgTy, ValueCategory, Fn);
+    auto OwnershipKind = ValueOwnershipKind((Args[I + 1] >> 8) & 0x7);
+    auto reborrow = (Args[I + 1] >> 11) & 0x1;
+    auto pointerEscape = (Args[I + 1] >> 12) & 0x1;
     if (IsEntry) {
       auto *fArg = CurrentBB->createFunctionArgument(SILArgTy);
-      bool isNoImplicitCopy = (Args[I + 1] >> 16) & 0x1;
+      bool isNoImplicitCopy = (Args[I + 1] >> 13) & 0x1;
       fArg->setNoImplicitCopy(isNoImplicitCopy);
-      auto lifetime = (LifetimeAnnotation::Case)((Args[I + 1] >> 17) & 0x3);
+      auto lifetime = (LifetimeAnnotation::Case)((Args[I + 1] >> 14) & 0x3);
       fArg->setLifetimeAnnotation(lifetime);
+      bool isClosureCapture = (Args[I + 1] >> 16) & 0x1;
+      fArg->setClosureCapture(isClosureCapture);
+      bool isFormalParameterPack = (Args[I + 1] >> 17) & 0x1;
+      fArg->setFormalParameterPack(isFormalParameterPack);
       Arg = fArg;
     } else {
-      auto OwnershipKind = ValueOwnershipKind((Args[I + 1] >> 8) & 0xF);
-      Arg = CurrentBB->createPhiArgument(SILArgTy, OwnershipKind);
+      Arg = CurrentBB->createPhiArgument(SILArgTy, OwnershipKind,
+                                         /*decl*/ nullptr, reborrow,
+                                         pointerEscape);
     }
     LastValueID = LastValueID + 1;
     setLocalValue(Arg, LastValueID);
@@ -1012,15 +1027,15 @@ static SILDeclRef getSILDeclRef(ModuleFile *MF,
   return DRef;
 }
 
-Optional<KeyPathPatternComponent>
+llvm::Optional<KeyPathPatternComponent>
 SILDeserializer::readKeyPathComponent(ArrayRef<uint64_t> ListOfValues,
                                       unsigned &nextValue) {
   auto kind =
     (KeyPathComponentKindEncoding)ListOfValues[nextValue++];
   
   if (kind == KeyPathComponentKindEncoding::Trivial)
-    return None;
-  
+    return llvm::None;
+
   auto type = MF->getType(ListOfValues[nextValue++])
     ->getCanonicalType();
 
@@ -1284,6 +1299,24 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     SILInstHasSymbolLayout::readRecord(scratch, ValID, ListOfValues);
     RawOpCode = (unsigned)SILInstructionKind::HasSymbolInst;
     break;
+  case SIL_OPEN_PACK_ELEMENT:
+    SILOpenPackElementLayout::readRecord(scratch, Attr,
+                                         TyID, TyCategory, ValID);
+    RawOpCode = (unsigned)SILInstructionKind::OpenPackElementInst;
+    break;
+  case SIL_PACK_ELEMENT_GET:
+    SILPackElementGetLayout::readRecord(scratch, RawOpCode,
+                                        TyID, TyCategory,
+                                        TyID2, TyCategory2, ValID2,
+                                        ValID3);
+    break;
+  case SIL_PACK_ELEMENT_SET:
+    SILPackElementSetLayout::readRecord(scratch,
+                                        TyID, TyCategory, ValID,
+                                        TyID2, TyCategory2, ValID2,
+                                        ValID3);
+    RawOpCode = (unsigned)SILInstructionKind::PackElementSetInst;
+    break;
   }
 
   // FIXME: validate
@@ -1292,16 +1325,24 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   SILInstruction *ResultInst;
   switch (OpCode) {
   case SILInstructionKind::DebugValueInst:
+  case SILInstructionKind::DebugStepInst:
   case SILInstructionKind::TestSpecificationInst:
+  case SILInstructionKind::AllocPackMetadataInst:
+  case SILInstructionKind::DeallocPackMetadataInst:
     llvm_unreachable("not supported");
 
-  case SILInstructionKind::AllocBoxInst:
+  case SILInstructionKind::AllocBoxInst: {
     assert(RecordKind == SIL_ONE_TYPE && "Layout should be OneType.");
+    bool hasDynamicLifetime = Attr & 0x1;
+    bool reflection = (Attr >> 1) & 0x1;
+    bool usesMoveableValueDebugInfo = (Attr >> 2) & 0x1;
+    bool pointerEscape = (Attr >> 3) & 0x1;
     ResultInst = Builder.createAllocBox(
-        Loc, cast<SILBoxType>(MF->getType(TyID)->getCanonicalType()), None,
-        /*bool hasDynamicLifetime*/ Attr & 1,
-        /*bool reflection*/ Attr & 2);
+        Loc, cast<SILBoxType>(MF->getType(TyID)->getCanonicalType()),
+        llvm::None, hasDynamicLifetime, reflection, usesMoveableValueDebugInfo,
+        /*skipVarDeclAssert*/ false, pointerEscape);
     break;
+  }
   case SILInstructionKind::AllocStackInst: {
     assert(RecordKind == SIL_ONE_TYPE && "Layout should be OneType.");
     bool hasDynamicLifetime = Attr & 0x1;
@@ -1309,7 +1350,19 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     bool wasMoved = (Attr >> 2) & 0x1;
     ResultInst = Builder.createAllocStack(
         Loc, getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn),
-        None, hasDynamicLifetime, isLexical, wasMoved);
+        llvm::None, hasDynamicLifetime, isLexical, wasMoved);
+    break;
+  }
+  case SILInstructionKind::AllocPackInst: {
+    assert(RecordKind == SIL_ONE_TYPE && "Layout should be OneType.");
+    ResultInst = Builder.createAllocPack(
+        Loc, getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn));
+    break;
+  }
+  case SILInstructionKind::PackLengthInst: {
+    assert(RecordKind == SIL_ONE_TYPE && "Layout should be OneType.");
+    ResultInst = Builder.createPackLength(
+        Loc, cast<PackType>(MF->getType(TyID)->getCanonicalType()));
     break;
   }
   case SILInstructionKind::MetatypeInst:
@@ -1367,6 +1420,92 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
         Attr == 0 ? OpenedExistentialAccess::Immutable
                   : OpenedExistentialAccess::Mutable);
     break;
+  case SILInstructionKind::DynamicPackIndexInst: {
+    assert(RecordKind == SIL_ONE_TYPE_ONE_OPERAND &&
+           "Layout should be OneTypeOneOperand.");
+    auto indexOperand =
+      getLocalValue(ValID,
+        getSILType(MF->getType(TyID2), (SILValueCategory)TyCategory2, Fn));
+    auto packType = cast<PackType>(MF->getType(TyID)->getCanonicalType());
+    ResultInst = Builder.createDynamicPackIndex(Loc, indexOperand, packType);
+    break;
+  }
+  case SILInstructionKind::PackPackIndexInst: {
+    assert(RecordKind == SIL_ONE_TYPE_ONE_OPERAND &&
+           "Layout should be OneTypeOneOperand.");
+    auto indexOperand =
+      getLocalValue(ValID,
+        getSILType(MF->getType(TyID2), (SILValueCategory)TyCategory2, Fn));
+    auto packType = cast<PackType>(MF->getType(TyID)->getCanonicalType());
+    ResultInst =
+      Builder.createPackPackIndex(Loc, Attr, indexOperand, packType);
+    break;
+  }
+  case SILInstructionKind::ScalarPackIndexInst: {
+    assert(RecordKind == SIL_ONE_TYPE && "Layout should be OneType.");
+    auto packType = cast<PackType>(MF->getType(TyID)->getCanonicalType());
+    ResultInst = Builder.createScalarPackIndex(Loc, Attr, packType);
+    break;
+  }
+  case SILInstructionKind::OpenPackElementInst: {
+    assert(RecordKind == SIL_OPEN_PACK_ELEMENT && "Layout should be OpenPackElement");
+    auto index = getLocalValue(ValID,
+        getSILType(MF->getType(TyID), (SILValueCategory) TyCategory, Fn));
+    auto env = MF->getGenericEnvironmentChecked(Attr);
+    if (!env) MF->fatal(env.takeError());
+    ResultInst = Builder.createOpenPackElement(Loc, index, *env);
+    break;
+  }
+  case SILInstructionKind::PackElementGetInst: {
+    assert(RecordKind == SIL_PACK_ELEMENT_GET);
+    auto elementType = getSILType(MF->getType(TyID),
+                                  (SILValueCategory) TyCategory, Fn);
+    auto packType = getSILType(MF->getType(TyID2),
+                               (SILValueCategory) TyCategory2, Fn);
+    auto pack = getLocalValue(ValID2, packType);
+    auto indexType = SILType::getPackIndexType(MF->getContext());
+    auto index = getLocalValue(ValID3, indexType);
+    ResultInst = Builder.createPackElementGet(Loc, index, pack, elementType);
+    break;
+  }
+  case SILInstructionKind::PackElementSetInst: {
+    assert(RecordKind == SIL_PACK_ELEMENT_SET);
+    auto elementType = getSILType(MF->getType(TyID),
+                                  (SILValueCategory) TyCategory, Fn);
+    auto value = getLocalValue(ValID, elementType);
+    auto packType = getSILType(MF->getType(TyID2),
+                               (SILValueCategory) TyCategory2, Fn);
+    auto pack = getLocalValue(ValID2, packType);
+    auto indexType = SILType::getPackIndexType(MF->getContext());
+    auto index = getLocalValue(ValID3, indexType);
+    ResultInst = Builder.createPackElementSet(Loc, value, index, pack);
+    break;
+  }
+  case SILInstructionKind::TuplePackElementAddrInst: {
+    assert(RecordKind == SIL_PACK_ELEMENT_GET);
+    auto elementType = getSILType(MF->getType(TyID),
+                                  (SILValueCategory) TyCategory, Fn);
+    auto tupleType = getSILType(MF->getType(TyID2),
+                               (SILValueCategory) TyCategory2, Fn);
+    auto tuple = getLocalValue(ValID2, tupleType);
+    auto indexType = SILType::getPackIndexType(MF->getContext());
+    auto index = getLocalValue(ValID3, indexType);
+    ResultInst = Builder.createTuplePackElementAddr(Loc, index, tuple,
+                                                    elementType);
+    break;
+  }
+  case SILInstructionKind::TuplePackExtractInst: {
+    assert(RecordKind == SIL_PACK_ELEMENT_GET);
+    auto elementType =
+        getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn);
+    auto tupleType =
+        getSILType(MF->getType(TyID2), (SILValueCategory)TyCategory2, Fn);
+    auto tuple = getLocalValue(ValID2, tupleType);
+    auto indexType = SILType::getPackIndexType(MF->getContext());
+    auto index = getLocalValue(ValID3, indexType);
+    ResultInst = Builder.createTuplePackExtract(Loc, index, tuple, elementType);
+    break;
+  }
 
 #define ONEOPERAND_ONETYPE_INST(ID)                                            \
   case SILInstructionKind::ID##Inst:                                           \
@@ -1576,7 +1715,8 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
                                                  TailTypes, Counts);
     } else {
       assert(i == NumVals);
-      ResultInst = Builder.createAllocRef(Loc, ClassTy, isObjC, canAllocOnStack,
+      bool isBare = (bool)((Flags >> 2) & 1);
+      ResultInst = Builder.createAllocRef(Loc, ClassTy, isObjC, canAllocOnStack, isBare,
                                           TailTypes, Counts);
     }
     break;
@@ -1727,7 +1867,7 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     if (OpCode == SILInstructionKind::GlobalAddrInst) {
       ResultInst = Builder.createGlobalAddr(Loc, g);
     } else {
-      ResultInst = Builder.createGlobalValue(Loc, g);
+      ResultInst = Builder.createGlobalValue(Loc, g, /*isBare=*/ (Attr & 1) != 0);
     }
     break;
   }
@@ -1746,6 +1886,13 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   case SILInstructionKind::DeallocStackRefInst: {
     auto Ty = MF->getType(TyID);
     ResultInst = Builder.createDeallocStackRef(
+        Loc,
+        getLocalValue(ValID, getSILType(Ty, (SILValueCategory)TyCategory, Fn)));
+    break;
+  }
+  case SILInstructionKind::DeallocPackInst: {
+    auto Ty = MF->getType(TyID);
+    ResultInst = Builder.createDeallocPack(
         Loc,
         getLocalValue(ValID, getSILType(Ty, (SILValueCategory)TyCategory, Fn)));
     break;
@@ -1802,6 +1949,15 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
         getLocalValue(ValID, getSILType(Ty, (SILValueCategory)TyCategory, Fn)),
         getLocalValue(ValID2,
                       getSILType(Ty2, (SILValueCategory)TyCategory2, Fn)));
+    break;
+  }
+  case SILInstructionKind::BeginDeallocRefInst: {
+    auto Ty = MF->getType(TyID);
+    auto Ty2 = MF->getType(TyID2);
+    ResultInst = Builder.createBeginDeallocRef(
+        Loc,
+        getLocalValue(ValID, getSILType(Ty, (SILValueCategory)TyCategory, Fn)),
+        getLocalValue(ValID2, getSILType(Ty2, (SILValueCategory)TyCategory2, Fn)));
     break;
   }
   case SILInstructionKind::CopyBlockWithoutEscapingInst: {
@@ -1890,7 +2046,7 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     auto encoding = fromStableStringEncoding(Attr);
     if (!encoding) return true;
     ResultInst =
-        Builder.createStringLiteral(Loc, StringVal, encoding.getValue());
+        Builder.createStringLiteral(Loc, StringVal, encoding.value());
     break;
   }
   case SILInstructionKind::CondFailInst: {
@@ -1947,12 +2103,16 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
         (Atomicity)Attr);                                                      \
     break;
 
+    UNARY_INSTRUCTION(UnownedCopyValue)
+    UNARY_INSTRUCTION(WeakCopyValue)
 #define UNCHECKED_REF_STORAGE(Name, ...)                                       \
   UNARY_INSTRUCTION(StrongCopy##Name##Value)
 #define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)            \
   REFCOUNTING_INSTRUCTION(Name##Retain)                                        \
   REFCOUNTING_INSTRUCTION(Name##Release)                                       \
   REFCOUNTING_INSTRUCTION(StrongRetain##Name)                                  \
+  UNARY_INSTRUCTION(StrongCopy##Name##Value)
+#define NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, ...)                          \
   UNARY_INSTRUCTION(StrongCopy##Name##Value)
 #include "swift/AST/ReferenceStorage.def"
   REFCOUNTING_INSTRUCTION(RetainValue)
@@ -1965,7 +2125,6 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   REFCOUNTING_INSTRUCTION(UnmanagedReleaseValue)
   REFCOUNTING_INSTRUCTION(AutoreleaseValue)
   REFCOUNTING_INSTRUCTION(UnmanagedAutoreleaseValue)
-  REFCOUNTING_INSTRUCTION(SetDeallocating)
   UNARY_INSTRUCTION(DeinitExistentialAddr)
   UNARY_INSTRUCTION(DeinitExistentialValue)
   UNARY_INSTRUCTION(EndBorrow)
@@ -1978,6 +2137,7 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   UNARY_INSTRUCTION(EndLifetime)
   UNARY_INSTRUCTION(CopyBlock)
   UNARY_INSTRUCTION(LoadBorrow)
+  UNARY_INSTRUCTION(EndInitLetRef)
   REFCOUNTING_INSTRUCTION(StrongRetain)
   REFCOUNTING_INSTRUCTION(StrongRelease)
   UNARY_INSTRUCTION(IsUnique)
@@ -1990,11 +2150,12 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   case SILInstructionKind::BeginBorrowInst: {
     assert(RecordKind == SIL_ONE_OPERAND && "Layout should be OneOperand.");
     bool isLexical = Attr & 0x1;
+    bool hasPointerEscape = (Attr >> 1) & 0x1;
     ResultInst = Builder.createBeginBorrow(
         Loc,
         getLocalValue(ValID, getSILType(MF->getType(TyID),
                                         (SILValueCategory)TyCategory, Fn)),
-        isLexical);
+        isLexical, hasPointerEscape);
     break;
   }
 
@@ -2080,23 +2241,32 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     auto Ty = MF->getType(TyID);
     bool AllowsDiagnostics = Attr & 0x1;
     bool IsLexical = (Attr >> 1) & 0x1;
+    bool IsEscaping = (Attr >> 2) & 0x1;
     auto *MVI = Builder.createMoveValue(
         Loc,
         getLocalValue(ValID, getSILType(Ty, (SILValueCategory)TyCategory, Fn)),
-        IsLexical);
+        IsLexical, IsEscaping);
     MVI->setAllowsDiagnostics(AllowsDiagnostics);
     ResultInst = MVI;
     break;
   }
 
-  case SILInstructionKind::MarkMustCheckInst: {
-    using CheckKind = MarkMustCheckInst::CheckKind;
+  case SILInstructionKind::DropDeinitInst: {
     auto Ty = MF->getType(TyID);
-    auto CKind = CheckKind(Attr);
-    ResultInst = Builder.createMarkMustCheckInst(
+    ResultInst = Builder.createDropDeinit(
         Loc,
-        getLocalValue(ValID, getSILType(Ty, (SILValueCategory)TyCategory, Fn)),
-        CKind);
+        getLocalValue(ValID, getSILType(Ty, (SILValueCategory)TyCategory, Fn)));
+    break;
+  }
+
+  case SILInstructionKind::MarkUnresolvedReferenceBindingInst: {
+    using Kind = MarkUnresolvedReferenceBindingInst::Kind;
+    auto ty = MF->getType(TyID);
+    auto kind = Kind(Attr);
+    ResultInst = Builder.createMarkUnresolvedReferenceBindingInst(
+        Loc,
+        getLocalValue(ValID, getSILType(ty, (SILValueCategory)TyCategory, Fn)),
+        kind);
     break;
   }
 
@@ -2166,6 +2336,16 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     ResultInst = Builder.createMarkUninitialized(Loc, Val, Kind);
     break;
   }
+  case SILInstructionKind::MarkUnresolvedNonCopyableValueInst: {
+    using CheckKind = MarkUnresolvedNonCopyableValueInst::CheckKind;
+    auto Ty = MF->getType(TyID);
+    auto CKind = CheckKind(Attr);
+    ResultInst = Builder.createMarkUnresolvedNonCopyableValueInst(
+        Loc,
+        getLocalValue(ValID, getSILType(Ty, (SILValueCategory)TyCategory, Fn)),
+        CKind);
+    break;
+  }
   case SILInstructionKind::StoreInst: {
     auto Ty = MF->getType(TyID);
     SILType addrType = getSILType(Ty, (SILValueCategory)TyCategory, Fn);
@@ -2188,11 +2368,32 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     SILValue op = getLocalValue(
         ValID, getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn));
     auto accessKind = SILAccessKind(Attr & 0x3);
-    auto enforcement = SILAccessEnforcement((Attr >> 2) & 0x3);
-    bool noNestedConflict = (Attr >> 4) & 0x01;
-    bool fromBuiltin = (Attr >> 5) & 0x01;
+    auto enforcement = SILAccessEnforcement((Attr >> 2) & 0x07);
+    bool noNestedConflict = (Attr >> 5) & 0x01;
+    bool fromBuiltin = (Attr >> 6) & 0x01;
     ResultInst = Builder.createBeginAccess(Loc, op, accessKind, enforcement,
                                            noNestedConflict, fromBuiltin);
+    break;
+  }
+  case SILInstructionKind::MoveOnlyWrapperToCopyableAddrInst: {
+    assert(RecordKind == SIL_ONE_OPERAND);
+    SILValue op = getLocalValue(
+        ValID, getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn));
+    ResultInst = Builder.createMoveOnlyWrapperToCopyableAddr(Loc, op);
+    break;
+  }
+  case SILInstructionKind::MoveOnlyWrapperToCopyableBoxInst: {
+    assert(RecordKind == SIL_ONE_OPERAND);
+    SILValue op = getLocalValue(
+        ValID, getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn));
+    ResultInst = Builder.createMoveOnlyWrapperToCopyableBox(Loc, op);
+    break;
+  }
+  case SILInstructionKind::CopyableToMoveOnlyWrapperAddrInst: {
+    assert(RecordKind == SIL_ONE_OPERAND);
+    SILValue op = getLocalValue(
+        ValID, getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn));
+    ResultInst = Builder.createCopyableToMoveOnlyWrapperAddr(Loc, op);
     break;
   }
   case SILInstructionKind::EndAccessInst: {
@@ -2209,9 +2410,9 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
         getLocalValue(ValID2, getSILType(MF->getType(TyID2),
                                          (SILValueCategory)TyCategory2, Fn));
     auto accessKind = SILAccessKind(Attr & 0x3);
-    auto enforcement = SILAccessEnforcement((Attr >> 2) & 0x03);
-    bool noNestedConflict = (Attr >> 4) & 0x01;
-    bool fromBuiltin = (Attr >> 5) & 0x01;
+    auto enforcement = SILAccessEnforcement((Attr >> 2) & 0x07);
+    bool noNestedConflict = (Attr >> 5) & 0x01;
+    bool fromBuiltin = (Attr >> 6) & 0x01;
     ResultInst = Builder.createBeginUnpairedAccess(
         Loc, source, buffer, accessKind, enforcement, noNestedConflict,
         fromBuiltin);
@@ -2221,8 +2422,8 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     SILValue op = getLocalValue(
         ValID, getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn));
     bool aborted = Attr & 0x1;
-    auto enforcement = SILAccessEnforcement((Attr >> 1) & 0x03);
-    bool fromBuiltin = (Attr >> 3) & 0x01;
+    auto enforcement = SILAccessEnforcement((Attr >> 1) & 0x07);
+    bool fromBuiltin = (Attr >> 4) & 0x01;
     ResultInst = Builder.createEndUnpairedAccess(Loc, op, enforcement, aborted,
                                                  fromBuiltin);
     break;
@@ -2267,6 +2468,7 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     break;
   }
   case SILInstructionKind::AssignByWrapperInst:
+  case SILInstructionKind::AssignOrInitInst:
     llvm_unreachable("not supported");
   case SILInstructionKind::BindMemoryInst: {
     assert(RecordKind == SIL_ONE_TYPE_VALUES &&
@@ -2462,9 +2664,9 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
                             getBBForReference(Fn, ListOfValues[I+1])} );
     }
     if (OpCode == SILInstructionKind::SwitchEnumInst) {
-      ResultInst = Builder.createSwitchEnum(Loc, Cond, DefaultBB, CaseBBs,
-                                            None, ProfileCounter(),
-                                            forwardingOwnership);
+      ResultInst =
+          Builder.createSwitchEnum(Loc, Cond, DefaultBB, CaseBBs, llvm::None,
+                                   ProfileCounter(), forwardingOwnership);
     } else {
       ResultInst = Builder.createSwitchEnumAddr(Loc, Cond, DefaultBB, CaseBBs);
     }
@@ -2526,35 +2728,6 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     ResultInst = Builder.createSwitchValue(Loc, Cond, DefaultBB, CaseBBs);
     break;
   }
-  case SILInstructionKind::SelectValueInst: {
-    // Format: condition, a list of cases (ValueID + Value ID),
-    // default value ID. Use SILOneTypeValuesLayout: the type is
-    // for condition, the list has value for condition, result type,
-    // hasDefault, default,
-    // basic block ID, a list of (Value ID, Value ID).
-    SILValue Cond = getLocalValue(
-        ListOfValues[0],
-        getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn));
-
-    Type ResultLoweredTy = MF->getType(ListOfValues[1]);
-    SILValueCategory ResultCategory = (SILValueCategory)ListOfValues[2];
-    SILType ResultTy = getSILType(ResultLoweredTy, ResultCategory, Fn);
-
-    SILValue DefaultVal = nullptr;
-    if (ListOfValues[3])
-      DefaultVal = getLocalValue(ListOfValues[4], ResultTy);
-
-    SmallVector<std::pair<SILValue, SILValue>, 4> CaseValuesAndResults;
-    for (unsigned I = 5, E = ListOfValues.size(); I < E; I += 2) {
-      auto CaseValue = getLocalValue(ListOfValues[I], Cond->getType());
-      auto Result = getLocalValue(ListOfValues[I+1], ResultTy);
-      CaseValuesAndResults.push_back({CaseValue, Result});
-    }
-
-    ResultInst = Builder.createSelectValue(Loc, Cond, ResultTy, DefaultVal,
-                                           CaseValuesAndResults);
-    break;
-  }  
   case SILInstructionKind::EnumInst: {
     // Format: a type, an operand and a decl ID. Use SILTwoOperandsLayout: type,
     // (DeclID + hasOperand), and an operand.
@@ -2720,19 +2893,20 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     // Format: the cast kind, a typed value, a BasicBlock ID for success,
     // a BasicBlock ID for failure. Uses SILOneTypeValuesLayout.
     bool isExact = ListOfValues[0] != 0;
-    SILType opTy = getSILType(MF->getType(ListOfValues[2]),
-                              (SILValueCategory)ListOfValues[3], Fn);
-    SILValue op = getLocalValue(ListOfValues[1], opTy);
+    CanType sourceFormalType = MF->getType(ListOfValues[1])->getCanonicalType();
+    SILType opTy = getSILType(MF->getType(ListOfValues[3]),
+                              (SILValueCategory)ListOfValues[4], Fn);
+    SILValue op = getLocalValue(ListOfValues[2], opTy);
     SILType targetLoweredType =
         getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn);
-    CanType targetFormalType =
-        MF->getType(ListOfValues[4])->getCanonicalType();
-    auto *successBB = getBBForReference(Fn, ListOfValues[5]);
-    auto *failureBB = getBBForReference(Fn, ListOfValues[6]);
+    CanType targetFormalType = MF->getType(ListOfValues[5])->getCanonicalType();
+    auto *successBB = getBBForReference(Fn, ListOfValues[6]);
+    auto *failureBB = getBBForReference(Fn, ListOfValues[7]);
 
     ResultInst =
-        Builder.createCheckedCastBranch(Loc, isExact, op, targetLoweredType,
-                                        targetFormalType, successBB, failureBB,
+        Builder.createCheckedCastBranch(Loc, isExact, op, sourceFormalType, 
+                                        targetLoweredType, targetFormalType, 
+                                        successBB, failureBB,
                                         forwardingOwnership);
     break;
   }
@@ -2927,7 +3101,8 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
       auto silTy = getSILType(astTy, (SILValueCategory)ListOfValues[i + 1], Fn);
       operands.push_back(getLocalValue(ListOfValues[i + 2], silTy));
     }
-    Optional<std::pair<SILValue, SILValue>> derivativeFunctions = None;
+    llvm::Optional<std::pair<SILValue, SILValue>> derivativeFunctions =
+        llvm::None;
     if (hasDerivativeFunctions)
       derivativeFunctions = std::make_pair(operands[1], operands[2]);
     ResultInst = Builder.createDifferentiableFunction(
@@ -2952,7 +3127,7 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
       auto silTy = getSILType(astTy, (SILValueCategory)ListOfValues[i+1], Fn);
       operands.push_back(getLocalValue(ListOfValues[i+2], silTy));
     }
-    Optional<SILValue> transposeFunction = None;
+    llvm::Optional<SILValue> transposeFunction = llvm::None;
     if (hasLinearFunction)
       transposeFunction = operands[1];
     ResultInst = Builder.createLinearFunction(Loc, paramIndices, operands[0],
@@ -2964,7 +3139,7 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     auto silTy = getSILType(astTy, SILValueCategory::Object, Fn);
     auto val = getLocalValue(ValID, silTy);
     NormalDifferentiableFunctionTypeComponent extractee(Attr);
-    Optional<SILType> explicitExtracteeType = None;
+    llvm::Optional<SILType> explicitExtracteeType = llvm::None;
     if (Attr2) {
       auto extracteeASTType = MF->getType(TyID2);
       explicitExtracteeType =
@@ -2987,7 +3162,7 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     auto *witness = getSILDifferentiabilityWitnessForReference(mangledKey);
     assert(witness && "SILDifferentiabilityWitness not found");
     DifferentiabilityWitnessFunctionKind witnessKind(Attr);
-    Optional<SILType> explicitFnTy = None;
+    llvm::Optional<SILType> explicitFnTy = llvm::None;
     auto astTy = MF->getType(TyID);
     if (TyID)
       explicitFnTy = getSILType(astTy, SILValueCategory::Object, Fn);
@@ -3046,7 +3221,7 @@ SILFunction *SILDeserializer::lookupSILFunction(SILFunction *InFunc,
 /// This function is modeled after readSILFunction. But it does not
 /// create a SILFunction object.
 bool SILDeserializer::hasSILFunction(StringRef Name,
-                                     Optional<SILLinkage> Linkage) {
+                                     llvm::Optional<SILLinkage> Linkage) {
   if (!FuncTable)
     return false;
   auto iter = FuncTable->find(Name);
@@ -3062,16 +3237,21 @@ bool SILDeserializer::hasSILFunction(StringRef Name,
     return !Linkage || cacheEntry.get()->getLinkage() == *Linkage;
 
   BCOffsetRAII restoreOffset(SILCursor);
-  if (llvm::Error Err = SILCursor.JumpToBit(cacheEntry.getOffset()))
-    MF->fatal(std::move(Err));
+  if (llvm::Error Err = SILCursor.JumpToBit(cacheEntry.getOffset())) {
+    MF->diagnoseAndConsumeFatal(std::move(Err));
+    return false;
+  }
 
   llvm::Expected<llvm::BitstreamEntry> maybeEntry =
       SILCursor.advance(AF_DontPopBlockAtEnd);
-  if (!maybeEntry)
-    MF->fatal(maybeEntry.takeError());
+  if (!maybeEntry) {
+    MF->diagnoseAndConsumeFatal(maybeEntry.takeError());
+    return false;
+  }
   llvm::BitstreamEntry entry = maybeEntry.get();
   if (entry.Kind == llvm::BitstreamEntry::Error) {
-    MF->fatal("Cursor advance error in hasSILFunction");
+    MF->diagnoseAndConsumeFatal("Cursor advance error in hasSILFunction");
+    return false;
   }
 
   SmallVector<uint64_t, 64> scratch;
@@ -3095,20 +3275,20 @@ bool SILDeserializer::hasSILFunction(StringRef Name,
   GenericSignatureID genericSigID;
   unsigned rawLinkage, isTransparent, isSerialized, isThunk,
       isWithoutActuallyEscapingThunk, isGlobal, inlineStrategy,
-      optimizationMode, perfConstr,
-      subclassScope, hasCReferences, effect, numSpecAttrs,
-      hasQualifiedOwnership, isWeakImported, LIST_VER_TUPLE_PIECES(available),
-      isDynamic, isExactSelfClass, isDistributed;
+      optimizationMode, perfConstr, subclassScope, hasCReferences, effect,
+      numSpecAttrs, hasQualifiedOwnership, isWeakImported,
+      LIST_VER_TUPLE_PIECES(available), isDynamic, isExactSelfClass,
+      isDistributed, isRuntimeAccessible, forceEnableLexicalLifetimes;
   ArrayRef<uint64_t> SemanticsIDs;
   SILFunctionLayout::readRecord(
       scratch, rawLinkage, isTransparent, isSerialized, isThunk,
       isWithoutActuallyEscapingThunk, isGlobal, inlineStrategy,
-      optimizationMode, perfConstr,
-      subclassScope, hasCReferences, effect, numSpecAttrs,
-      hasQualifiedOwnership, isWeakImported, LIST_VER_TUPLE_PIECES(available),
-      isDynamic, isExactSelfClass, isDistributed, funcTyID,
-      replacedFunctionID, usedAdHocWitnessFunctionID,
-      genericSigID, clangOwnerID, parentModuleID, SemanticsIDs);
+      optimizationMode, perfConstr, subclassScope, hasCReferences, effect,
+      numSpecAttrs, hasQualifiedOwnership, isWeakImported,
+      LIST_VER_TUPLE_PIECES(available), isDynamic, isExactSelfClass,
+      isDistributed, isRuntimeAccessible, forceEnableLexicalLifetimes, funcTyID,
+      replacedFunctionID, usedAdHocWitnessFunctionID, genericSigID,
+      clangOwnerID, parentModuleID, SemanticsIDs);
   auto linkage = fromStableSILLinkage(rawLinkage);
   if (!linkage) {
     LLVM_DEBUG(llvm::dbgs() << "invalid linkage code " << rawLinkage
@@ -3117,13 +3297,12 @@ bool SILDeserializer::hasSILFunction(StringRef Name,
   }
 
   // Bail if it is not a required linkage.
-  if (Linkage && linkage.getValue() != *Linkage)
+  if (Linkage && linkage.value() != *Linkage)
     return false;
 
   LLVM_DEBUG(llvm::dbgs() << "Found SIL Function: " << Name << "\n");
   return true;
 }
-
 
 SILFunction *SILDeserializer::lookupSILFunction(StringRef name,
                                                 bool declarationOnly) {
@@ -3214,11 +3393,9 @@ SILGlobalVariable *SILDeserializer::readGlobalVar(StringRef Name) {
 
   auto Ty = MF->getType(TyID);
   SILGlobalVariable *v = SILGlobalVariable::create(
-      SILMod, linkage.getValue(),
-      isSerialized ? IsSerialized : IsNotSerialized,
-      Name.str(), getSILType(Ty, SILValueCategory::Object, nullptr),
-      None,
-      dID ? cast<VarDecl>(MF->getDecl(dID)): nullptr);
+      SILMod, linkage.value(), isSerialized ? IsSerialized : IsNotSerialized,
+      Name.str(), getSILType(Ty, SILValueCategory::Object, nullptr), llvm::None,
+      dID ? cast<VarDecl>(MF->getDecl(dID)) : nullptr);
   v->setLet(IsLet);
   globalVarOrOffset.set(v, true /*isFullyDeserialized*/);
   v->setDeclaration(IsDeclaration);
@@ -3250,9 +3427,8 @@ SILGlobalVariable *SILDeserializer::readGlobalVar(StringRef Name) {
   while (kind != SIL_FUNCTION && kind != SIL_VTABLE && kind != SIL_GLOBALVAR &&
          kind != SIL_MOVEONLY_DEINIT && kind != SIL_WITNESS_TABLE &&
          kind != SIL_DIFFERENTIABILITY_WITNESS) {
-    if (readSILInstruction(nullptr, Builder, kind, scratch)) {
+    if (readSILInstruction(nullptr, Builder, kind, scratch))
       MF->fatal("readSILInstruction returns error");
-    }
 
     // Fetch the next record.
     scratch.clear();
@@ -3388,7 +3564,7 @@ SILVTable *SILDeserializer::readVTable(DeclID VId) {
     if (Func) {
       unsigned NextValueIndex = 0;
       vtableEntries.emplace_back(getSILDeclRef(MF, ListOfValues, NextValueIndex),
-                                 Func, EntryKind.getValue(), (bool)IsNonOverridden);
+                                 Func, EntryKind.value(), (bool)IsNonOverridden);
     }
 
     // Fetch the next record.
@@ -3813,7 +3989,7 @@ void SILDeserializer::getAllWitnessTables() {
         // import, it is safe to ignore for this function's purpose.
         consumeError(maybeTable.takeError());
       } else {
-        MF->fatal(maybeTable.takeError());
+        MF->diagnoseAndConsumeFatal(maybeTable.takeError());
       }
     }
   }

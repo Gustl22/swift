@@ -9,6 +9,7 @@ Mangling
 ::
 
   mangled-name ::= '$s' global  // Swift stable mangling
+  mangled-name ::= '@__swiftmacro_' global // Swift mangling for filenames
   mangled-name ::= '_T0' global // Swift 4.0
   mangled-name ::= '$S' global  // Swift 4.2
 
@@ -299,6 +300,8 @@ are always non-polymorphic ``<impl-function-type>`` types.
   VALUE-WITNESS-KIND ::= 'ug'           // getEnumTag
   VALUE-WITNESS-KIND ::= 'up'           // destructiveProjectEnumData
   VALUE-WITNESS-KIND ::= 'ui'           // destructiveInjectEnumTag
+  VALUE-WITNESS-KIND ::= 'et'           // getEnumTagSinglePayload
+  VALUE-WITNESS-KIND ::= 'st'           // storeEnumTagSinglePayload
 
 ``<VALUE-WITNESS-KIND>`` differentiates the kinds of value
 witness functions for a type.
@@ -346,6 +349,7 @@ Entities
   entity-spec ::= type 'fU' INDEX            // explicit anonymous closure expression
   entity-spec ::= type 'fu' INDEX            // implicit anonymous closure
   entity-spec ::= 'fA' INDEX                 // default argument N+1 generator
+  entity-spec ::= entity 'fa'                // runtime discoverable attribute generator
   entity-spec ::= 'fi'                       // non-local variable initializer
   entity-spec ::= 'fP'                       // property wrapper backing initializer
   entity-spec ::= 'fW'                       // property wrapper init from projected value
@@ -362,6 +366,8 @@ Entities
   entity-spec ::= decl-name label-list? type 'v' ACCESSOR                           // variable
   entity-spec ::= decl-name type 'fp'                                               // generic type parameter
   entity-spec ::= decl-name type 'fo'                                               // enum element (currently not used)
+  entity-spec ::= decl-name label-list? type generic-signature? 'fm'   // macro
+  entity-spec ::= context macro-discriminator-list  // macro expansion
   entity-spec ::= identifier 'Qa'                                                   // associated type declaration
 
   ACCESSOR ::= 'm'                           // materializeForSet
@@ -388,6 +394,16 @@ Entities
 
   RELATED-DISCRIMINATOR ::= [a-j]
   RELATED-DISCRIMINATOR ::= [A-J]
+
+  macro-discriminator-list ::= macro-discriminator-list? file-discriminator? macro-expansion-operator INDEX
+
+  macro-expansion-operator ::= decl-name identifier 'fMa' // attached accessor macro
+  macro-expansion-operator ::= decl-name identifier 'fMr' // attached member-attribute macro
+  macro-expansion-operator ::= identifier 'fMf' // freestanding macro
+  macro-expansion-operator ::= decl-name identifier 'fMm' // attached member macro
+  macro-expansion-operator ::= decl-name identifier 'fMp' // attached peer macro
+  macro-expansion-operator ::= decl-name identifier 'fMc' // attached conformance macro
+  macro-expansion-operator ::= decl-name identifier 'fMu' // uniquely-named entity
 
   file-discriminator ::= identifier 'Ll'     // anonymous file-discriminated declaration
 
@@ -561,12 +577,16 @@ Types
     type ::= 'BD'                              // Builtin.DefaultActorStorage
     type ::= 'Be'                              // Builtin.Executor
   #endif
+  #if SWIFT_RUNTIME_VERSION >= 5.9
+    type ::= 'Bd'                              // Builtin.NonDefaultDistributedActorStorage
+  #endif
   type ::= 'Bf' NATURAL '_'                  // Builtin.Float<n>
   type ::= 'Bi' NATURAL '_'                  // Builtin.Int<n>
   type ::= 'BI'                              // Builtin.IntLiteral
   #if SWIFT_RUNTIME_VERSION >= 5.5
     type ::= 'Bj'                              // Builtin.Job
   #endif
+  type ::= 'BP'                              // Builtin.PackIndex
   type ::= 'BO'                              // Builtin.UnknownObject (no longer a distinct type, but still used for AnyObject)
   type ::= 'Bo'                              // Builtin.NativeObject
   type ::= 'Bp'                              // Builtin.RawPointer
@@ -652,9 +672,13 @@ Types
   type ::= assoc-type-name 'Qz'                      // shortcut for 'Qyz'
   type ::= assoc-type-list 'QY' GENERIC-PARAM-INDEX  // associated type at depth
   type ::= assoc-type-list 'QZ'                      // shortcut for 'QYz'
+  type ::= opaque-type-decl-name bound-generic-args 'Qo' INDEX // opaque type
+  
+  type ::= pack-type 'Qe' INDEX              // pack element type
   
   type ::= pattern-type count-type 'Qp'      // pack expansion type
   type ::= pack-element-list 'QP'            // pack type
+  type ::= pack-element-list 'QS' DIRECTNESS // SIL pack type
 
   pack-element-list ::= type '_' type*
   pack-element-list ::= empty-list
@@ -736,6 +760,9 @@ mangled in to disambiguate.
   PARAM-CONVENTION ::= 'y'                   // direct unowned
   PARAM-CONVENTION ::= 'g'                   // direct guaranteed
   PARAM-CONVENTION ::= 'e'                   // direct deallocating
+  PARAM-CONVENTION ::= 'v'                   // pack owned
+  PARAM-CONVENTION ::= 'p'                   // pack guaranteed
+  PARAM-CONVENTION ::= 'm'                   // pack inout
 
   PARAM-DIFFERENTIABILITY ::= 'w'            // @noDerivative
 
@@ -744,8 +771,12 @@ mangled in to disambiguate.
   RESULT-CONVENTION ::= 'd'                  // unowned
   RESULT-CONVENTION ::= 'u'                  // unowned inner pointer
   RESULT-CONVENTION ::= 'a'                  // auto-released
+  RESULT-CONVENTION ::= 'k'                  // pack
 
   RESULT-DIFFERENTIABILITY ::= 'w'            // @noDerivative
+
+  DIRECTNESS ::= 'i'                         // indirect
+  DIRECTNESS ::= 'd'                         // direct
 
 For the most part, manglings follow the structure of formal language
 types.  However, in some cases it is more useful to encode the exact
@@ -864,8 +895,10 @@ now codified into the ABI; the index 0 is therefore reserved.
 
 ::
 
-  generic-signature ::= requirement* 'l'     // one generic parameter
-  generic-signature ::= requirement* 'r' GENERIC-PARAM-COUNT* 'l'
+  generic-signature ::= requirement* generic-param-pack-marker* 'l'     // one generic parameter
+  generic-signature ::= requirement* generic-param-pack-marker* 'r' GENERIC-PARAM-COUNT* 'l'
+
+  generic-param-pack-marker ::= 'Rv' GENERIC_PARAM-INDEX   // generic parameter pack marker
 
   GENERIC-PARAM-COUNT ::= 'z'                // zero parameters
   GENERIC-PARAM-COUNT ::= INDEX              // N+1 parameters
@@ -908,9 +941,11 @@ now codified into the ABI; the index 0 is therefore reserved.
   LAYOUT-SIZE ::= INDEX // Size only
   LAYOUT-SIZE-AND-ALIGNMENT ::= INDEX INDEX // Size followed by alignment
 
-
-
 A generic signature begins with an optional list of requirements.
+
+This is followed by an optional list of generic-param-pack-markers to record
+which generic parameters are packs (variadic).
+
 The ``<GENERIC-PARAM-COUNT>`` describes the number of generic parameters at
 each depth of the signature. As a special case, no ``<GENERIC-PARAM-COUNT>``
 values indicates a single generic parameter at the outermost depth::
@@ -1115,6 +1150,7 @@ Function Specializations
   specialization ::= type '_' type* 'Ts' SPEC-INFO     // Generic re-abstracted prespecialization
   specialization ::= type '_' type* 'TG' SPEC-INFO     // Generic not re-abstracted specialization
   specialization ::= type '_' type* 'Ti' SPEC-INFO     // Inlined function with generic substitutions.
+  specialization ::= type '_' type* 'Ta' SPEC-INFO     // Non-async specialization
 
 The types are the replacement types of the substitution list.
 
@@ -1137,7 +1173,7 @@ Some kinds need arguments, which precede ``Tf``.
   spec-arg ::= identifier
   spec-arg ::= type
 
-  SPEC-INFO ::= MT-REMOVED? FRAGILE? PASSID
+  SPEC-INFO ::= MT-REMOVED? FRAGILE? ASYNC-REMOVED? PASSID
 
   PASSID ::= '0'                             // AllocBoxToStack,
   PASSID ::= '1'                             // ClosureSpecializer,
@@ -1145,10 +1181,14 @@ Some kinds need arguments, which precede ``Tf``.
   PASSID ::= '3'                             // CapturePropagation,
   PASSID ::= '4'                             // FunctionSignatureOpts,
   PASSID ::= '5'                             // GenericSpecializer,
+  PASSID ::= '6'                             // MoveDiagnosticInOutToOut,
+  PASSID ::= '7'                             // AsyncDemotion,
 
   MT-REMOVED ::= 'm'                         // non-generic metatype arguments are removed in the specialized function
 
   FRAGILE ::= 'q'
+
+  ASYNC-REMOVED ::= 'a'                      // async effect removed
 
   ARG-SPEC-KIND ::= 'n'                      // Unmodified argument
   ARG-SPEC-KIND ::= 'c'                      // Consumes n 'type' arguments which are closed over types in argument order

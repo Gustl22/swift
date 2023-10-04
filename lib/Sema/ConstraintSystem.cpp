@@ -31,6 +31,7 @@
 #include "swift/Basic/Statistic.h"
 #include "swift/Sema/CSFix.h"
 #include "swift/Sema/ConstraintGraph.h"
+#include "swift/Sema/IDETypeChecking.h"
 #include "swift/Sema/SolutionResult.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallSet.h"
@@ -224,7 +225,7 @@ void ConstraintSystem::assignFixedType(TypeVariableType *typeVar, Type type,
         // Check whether the nominal types match. This makes sure that we
         // properly handle Array vs. Array<T>.
         if (defaultType->getAnyNominal() != type->getAnyNominal()) {
-          increaseScore(SK_NonDefaultLiteral);
+          increaseScore(SK_NonDefaultLiteral, locator);
         }
       }
 
@@ -278,13 +279,15 @@ getDynamicResultSignature(ValueDecl *decl) {
   llvm_unreachable("Not a valid @objc member");
 }
 
-LookupResult &ConstraintSystem::lookupMember(Type base, DeclNameRef name) {
+LookupResult &ConstraintSystem::lookupMember(Type base, DeclNameRef name,
+                                             SourceLoc loc) {
   // Check whether we've already performed this lookup.
   auto &result = MemberLookups[{base, name}];
   if (result) return *result;
 
   // Lookup the member.
-  result = TypeChecker::lookupMember(DC, base, name, defaultMemberLookupOptions);
+  result = TypeChecker::lookupMember(DC, base, name, loc,
+                                     defaultMemberLookupOptions);
 
   // If we aren't performing dynamic lookup, we're done.
   if (!*result || !base->isAnyObject())
@@ -352,19 +355,15 @@ ConstraintSystem::getAlternativeLiteralTypes(KnownProtocolKind kind,
   return scratch;
 }
 
-bool ConstraintSystem::containsCodeCompletionLoc(ASTNode node) const {
-  SourceRange range = node.getSourceRange();
-  if (range.isInvalid())
-    return false;
-  return Context.SourceMgr.rangeContainsCodeCompletionLoc(range);
+bool ConstraintSystem::containsIDEInspectionTarget(ASTNode node) const {
+  return swift::containsIDEInspectionTarget(node.getSourceRange(),
+                                            Context.SourceMgr);
 }
 
-bool ConstraintSystem::containsCodeCompletionLoc(
+bool ConstraintSystem::containsIDEInspectionTarget(
     const ArgumentList *args) const {
-  SourceRange range = args->getSourceRange();
-  if (range.isInvalid())
-    return false;
-  return Context.SourceMgr.rangeContainsCodeCompletionLoc(range);
+  return swift::containsIDEInspectionTarget(args->getSourceRange(),
+                                            Context.SourceMgr);
 }
 
 ConstraintLocator *ConstraintSystem::getConstraintLocator(
@@ -466,7 +465,7 @@ ConstraintLocator *ConstraintSystem::getCalleeLocator(
     ConstraintLocator *locator, bool lookThroughApply,
     llvm::function_ref<Type(Expr *)> getType,
     llvm::function_ref<Type(Type)> simplifyType,
-    llvm::function_ref<Optional<SelectedOverload>(ConstraintLocator *)>
+    llvm::function_ref<llvm::Optional<SelectedOverload>(ConstraintLocator *)>
         getOverloadFor) {
   if (locator->findLast<LocatorPathElt::ImplicitConversion>())
     return locator;
@@ -496,6 +495,15 @@ ConstraintLocator *ConstraintSystem::getCalleeLocator(
     }
   }
 
+  {
+    // Pattern match is always a callee regardless of what comes after it.
+    auto iter = path.rbegin();
+    if (locator->findLast<LocatorPathElt::PatternMatch>(iter)) {
+      auto newPath = path.drop_back(iter - path.rbegin());
+      return getConstraintLocator(anchor, newPath);
+    }
+  }
+
   if (locator->findLast<LocatorPathElt::DynamicCallable>()) {
     return getConstraintLocator(anchor, LocatorPathElt::ApplyFunction());
   }
@@ -507,7 +515,7 @@ ConstraintLocator *ConstraintSystem::getCalleeLocator(
   // If we have a locator that starts with a key path component element, we
   // may have a callee given by a property or subscript component.
   if (auto componentElt =
-          locator->getFirstElementAs<LocatorPathElt::KeyPathComponent>()) {
+      locator->getFirstElementAs<LocatorPathElt::KeyPathComponent>()) {
     auto *kpExpr = castToExpr<KeyPathExpr>(anchor);
     auto component = kpExpr->getComponents()[componentElt->getIndex()];
 
@@ -517,7 +525,7 @@ ConstraintLocator *ConstraintSystem::getCalleeLocator(
     case ComponentKind::Subscript:
       // For a subscript the callee is given by 'component -> subscript member'.
       return getConstraintLocator(
-          anchor, {*componentElt, ConstraintLocator::SubscriptMember});
+                                  anchor, {*componentElt, ConstraintLocator::SubscriptMember});
     case ComponentKind::UnresolvedProperty:
     case ComponentKind::Property:
       // For a property, the choice is just given by the component.
@@ -555,14 +563,14 @@ ConstraintLocator *ConstraintSystem::getCalleeLocator(
     if (fnTy->is<AnyMetatypeType>()) {
       return getConstraintLocator(anchor,
                                   {LocatorPathElt::ApplyFunction(),
-                                   LocatorPathElt::ConstructorMember()});
+        LocatorPathElt::ConstructorMember()});
     }
 
     // Handle an apply of a nominal type which supports callAsFunction.
     if (fnTy->isCallAsFunctionType(DC)) {
       return getConstraintLocator(anchor,
                                   {LocatorPathElt::ApplyFunction(),
-                                   LocatorPathElt::ImplicitCallAsFunction()});
+        LocatorPathElt::ImplicitCallAsFunction()});
     }
 
     // Handling an apply for a nominal type that supports @dynamicCallable.
@@ -597,13 +605,13 @@ ConstraintLocator *ConstraintSystem::getCalleeLocator(
         UDE->getName().getBaseName() == Context.Id_callAsFunction) {
       return getConstraintLocator(anchor,
                                   {LocatorPathElt::ApplyFunction(),
-                                   LocatorPathElt::ImplicitCallAsFunction()});
+        LocatorPathElt::ImplicitCallAsFunction()});
     }
 
     return getConstraintLocator(
-        anchor, TypeChecker::getSelfForInitDelegationInConstructor(DC, UDE)
-                    ? ConstraintLocator::ConstructorMember
-                    : ConstraintLocator::Member);
+                                anchor, TypeChecker::getSelfForInitDelegationInConstructor(DC, UDE)
+                                ? ConstraintLocator::ConstructorMember
+                                : ConstraintLocator::Member);
   }
 
   if (auto *UME = getAsExpr<UnresolvedMemberExpr>(anchor)) {
@@ -615,6 +623,17 @@ ConstraintLocator *ConstraintSystem::getCalleeLocator(
 
   if (isExpr<ObjectLiteralExpr>(anchor))
     return getConstraintLocator(anchor, ConstraintLocator::ConstructorMember);
+
+  if (locator->isFirstElement<LocatorPathElt::CoercionOperand>()) {
+    auto *CE = castToExpr<CoerceExpr>(anchor);
+    locator = getConstraintLocator(CE->getSubExpr()->getValueProvidingExpr(),
+                                   path.drop_front());
+    return getCalleeLocator(locator, lookThroughApply, getType, simplifyType,
+                            getOverloadFor);
+  }
+
+  if (auto FVE = getAsExpr<ForceValueExpr>(anchor))
+    return getConstraintLocator(FVE->getSubExpr(), ConstraintLocator::Member);
 
   return getConstraintLocator(anchor);
 }
@@ -637,6 +656,51 @@ std::pair<Type, OpenedArchetypeType *> ConstraintSystem::openExistentialType(
   return {result, opened};
 }
 
+GenericEnvironment *
+ConstraintSystem::getPackElementEnvironment(ConstraintLocator *locator,
+                                            CanType shapeClass) {
+  assert(locator->directlyAt<PackExpansionExpr>());
+
+  std::pair<UUID, Type> uuidAndShape;
+  auto result = PackExpansionEnvironments.find(locator);
+  if (result == PackExpansionEnvironments.end()) {
+    uuidAndShape = std::make_pair(UUID::fromTime(), shapeClass);
+    PackExpansionEnvironments[locator] = uuidAndShape;
+  } else {
+    uuidAndShape = result->second;
+  }
+
+  if (!shapeClass->is<PackArchetypeType>() ||
+      !shapeClass->isEqual(uuidAndShape.second))
+    return nullptr;
+
+  auto shapeParam = cast<GenericTypeParamType>(
+      shapeClass->mapTypeOutOfContext()->getCanonicalType());
+
+  auto &ctx = getASTContext();
+  auto elementSig = ctx.getOpenedElementSignature(
+      DC->getGenericSignatureOfContext().getCanonicalSignature(), shapeParam);
+  auto *contextEnv = DC->getGenericEnvironmentOfContext();
+  auto contextSubs = contextEnv->getForwardingSubstitutionMap();
+  return GenericEnvironment::forOpenedElement(elementSig, uuidAndShape.first,
+                                              shapeParam, contextSubs);
+}
+
+PackExpansionExpr *
+ConstraintSystem::getPackEnvironment(PackElementExpr *packElement) const {
+  const auto match = PackEnvironments.find(packElement);
+  return (match == PackEnvironments.end()) ? nullptr : match->second;
+}
+
+void ConstraintSystem::addPackEnvironment(PackElementExpr *packElement,
+                                          PackExpansionExpr *packExpansion) {
+  assert(packElement);
+  assert(packExpansion);
+  [[maybe_unused]] const auto inserted =
+      PackEnvironments.insert({packElement, packExpansion}).second;
+  assert(inserted && "Mapping already defined?");
+}
+
 /// Extend the given depth map by adding depths for all of the subexpressions
 /// of the given expression.
 static void extendDepthMap(
@@ -652,6 +716,10 @@ static void extendDepthMap(
     explicit RecordingTraversal(
         llvm::DenseMap<Expr *, std::pair<unsigned, Expr *>> &depthMap)
         : DepthMap(depthMap) {}
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::ArgumentsAndExpansion;
+    }
 
     // For argument lists, bump the depth of the arguments, as they are
     // effectively nested within the argument list. It's debatable whether we
@@ -709,8 +777,8 @@ static void extendDepthMap(
   expr->walk(traversal);
 }
 
-Optional<std::pair<unsigned, Expr *>> ConstraintSystem::getExprDepthAndParent(
-    Expr *expr) {
+llvm::Optional<std::pair<unsigned, Expr *>>
+ConstraintSystem::getExprDepthAndParent(Expr *expr) {
   // Bring the set of expression weights up to date.
   while (NumInputExprsInWeights < InputExprs.size()) {
     extendDepthMap(InputExprs[NumInputExprsInWeights], ExprWeights);
@@ -721,7 +789,7 @@ Optional<std::pair<unsigned, Expr *>> ConstraintSystem::getExprDepthAndParent(
   if (e != ExprWeights.end())
     return e->second;
 
-  return None;
+  return llvm::None;
 }
 
 Type ConstraintSystem::openUnboundGenericType(GenericTypeDecl *decl,
@@ -778,15 +846,34 @@ Type ConstraintSystem::openUnboundGenericType(GenericTypeDecl *decl,
   // call to BoundGenericType::get().
   auto result =
       TypeResolution::forInterface(
-          DC, None,
+          DC, llvm::None,
           [](auto) -> Type { llvm_unreachable("should not be used"); },
-          [](auto &, auto) -> Type { llvm_unreachable("should not be used"); })
+          [](auto &, auto) -> Type { llvm_unreachable("should not be used"); },
+          [](auto, auto) -> Type { llvm_unreachable("should not be used"); })
           .applyUnboundGenericArguments(decl, parentTy, SourceLoc(), arguments);
   if (!parentTy && !isTypeResolution) {
     result = DC->mapTypeIntoContext(result);
   }
 
-  return result;
+  return result.transform([&](Type type) -> Type {
+    // Although generic parameters are declared with just `each`
+    // their interface types introduce a pack expansion which
+    // means that the solver has to extact generic argument type
+    // variable from Pack{repeat ...} and drop that structure to
+    // make sure that generic argument gets inferred to a pack type.
+    if (auto *packTy = type->getAs<PackType>()) {
+      assert(packTy->getNumElements() == 1);
+      auto *expansion = packTy->getElementType(0)->castTo<PackExpansionType>();
+      auto *typeVar = expansion->getPatternType()->castTo<TypeVariableType>();
+      assert(typeVar->getImpl().getGenericParameter() &&
+             typeVar->getImpl().canBindToPack());
+      return typeVar;
+    }
+
+    if (auto *expansion = dyn_cast<PackExpansionType>(type.getPointer()))
+      return openPackExpansionType(expansion, replacements, locator);
+    return type;
+  });
 }
 
 static void checkNestedTypeConstraints(ConstraintSystem &cs, Type type,
@@ -910,7 +997,8 @@ Type ConstraintSystem::replaceInferableTypesWithTypeVars(
   return type;
 }
 
-Type ConstraintSystem::openType(Type type, OpenedTypeMap &replacements) {
+Type ConstraintSystem::openType(Type type, OpenedTypeMap &replacements,
+                                ConstraintLocatorBuilder locator) {
   assert(!type->hasUnboundGenericType());
 
   if (!type->hasTypeParameter())
@@ -918,6 +1006,37 @@ Type ConstraintSystem::openType(Type type, OpenedTypeMap &replacements) {
 
   return type.transform([&](Type type) -> Type {
       assert(!type->is<GenericFunctionType>());
+
+      // Preserve single element tuples if their element is
+      // pack expansion, otherwise it wouldn't be expanded.
+      if (auto *tuple = type->getAs<TupleType>()) {
+        if (tuple->getNumElements() == 1) {
+          const auto &elt = tuple->getElement(0);
+          if (!elt.hasName() && elt.getType()->is<PackExpansionType>()) {
+            return TupleType::get(
+                {openPackExpansionType(
+                    elt.getType()->castTo<PackExpansionType>(), replacements,
+                    locator)},
+                tuple->getASTContext());
+          }
+        }
+      }
+
+      // While opening variadic generic types that appear in other types
+      // we need to extract generic parameter from Pack{repeat ...} structure
+      // that gets introduced by the interface type, see
+      // \c openUnboundGenericType for more details.
+      if (auto *packTy = type->getAs<PackType>()) {
+        if (auto expansionTy = packTy->unwrapSingletonPackExpansion()) {
+          auto patternTy = expansionTy->getPatternType();
+          if (patternTy->isTypeParameter())
+            return openType(patternTy, replacements, locator);
+        }
+      }
+
+      if (auto *expansion = type->getAs<PackExpansionType>()) {
+        return openPackExpansionType(expansion, replacements, locator);
+      }
 
       // Replace a generic type parameter with its corresponding type variable.
       if (auto genericParam = type->getAs<GenericTypeParamType>()) {
@@ -933,6 +1052,35 @@ Type ConstraintSystem::openType(Type type, OpenedTypeMap &replacements) {
 
       return type;
     });
+}
+
+Type ConstraintSystem::openPackExpansionType(PackExpansionType *expansion,
+                                             OpenedTypeMap &replacements,
+                                             ConstraintLocatorBuilder locator) {
+  auto patternType =
+      openType(expansion->getPatternType(), replacements, locator);
+  auto shapeType = openType(expansion->getCountType(), replacements, locator);
+
+  auto openedPackExpansion = PackExpansionType::get(patternType, shapeType);
+
+  auto known = OpenedPackExpansionTypes.find(openedPackExpansion);
+  if (known != OpenedPackExpansionTypes.end())
+    return known->second;
+
+  auto *expansionLoc = getConstraintLocator(locator.withPathElement(
+      LocatorPathElt::PackExpansionType(openedPackExpansion)));
+
+  auto *expansionVar = createTypeVariable(expansionLoc, TVO_PackExpansion);
+
+  // This constraint is important to make sure that pack expansion always
+  // has a binding and connect pack expansion var to any type variables
+  // that appear in pattern and shape types.
+  addUnsolvedConstraint(Constraint::create(*this, ConstraintKind::FallbackType,
+                                           expansionVar, openedPackExpansion,
+                                           expansionLoc));
+
+  OpenedPackExpansionTypes[openedPackExpansion] = expansionVar;
+  return expansionVar;
 }
 
 Type ConstraintSystem::openOpaqueType(OpaqueTypeArchetypeType *opaque,
@@ -960,25 +1108,14 @@ Type ConstraintSystem::openOpaqueType(OpaqueTypeArchetypeType *opaque,
   // underlying return type.
   auto opaqueLocator = locator.withPathElement(
       LocatorPathElt::OpenedOpaqueArchetype(opaqueDecl));
+
   OpenedTypeMap replacements;
   openGeneric(DC, opaqueDecl->getOpaqueInterfaceGenericSignature(),
               opaqueLocator, replacements);
 
-  // If there is an outer generic signature, bind the outer parameters based
-  // on the substitutions in the opaque type.
-  auto subs = opaque->getSubstitutions();
-  if (auto genericSig = subs.getGenericSignature()) {
-    for (auto *genericParamPtr : genericSig.getGenericParams()) {
-      Type genericParam(genericParamPtr);
-      addConstraint(
-          ConstraintKind::Bind, openType(genericParam, replacements),
-          genericParam.subst(subs), opaqueLocator);
-    }
-  }
-
   recordOpenedTypes(opaqueLocatorKey, replacements);
 
-  return openType(opaque->getInterfaceType(), replacements);
+  return openType(opaque->getInterfaceType(), replacements, locator);
 }
 
 Type ConstraintSystem::openOpaqueType(Type type, ContextualTypePurpose context,
@@ -1025,27 +1162,21 @@ FunctionType *ConstraintSystem::openFunctionType(
 
     openGenericParameters(outerDC, signature, replacements, locator);
 
-    openGenericRequirements(
-        outerDC, signature, /*skipProtocolSelfConstraint=*/false, locator,
-        [&](Type type) -> Type { return openType(type, replacements); });
+    openGenericRequirements(outerDC, signature,
+                            /*skipProtocolSelfConstraint=*/false, locator,
+                            [&](Type type) -> Type {
+                              return openType(type, replacements, locator);
+                            });
 
     funcType = genericFn->substGenericArgs(
-        [&](Type type) { return openType(type, replacements); });
+        [&](Type type) { return openType(type, replacements, locator); });
   }
 
   return funcType->castTo<FunctionType>();
 }
 
-Optional<Type> ConstraintSystem::isArrayType(Type type) {
-  if (auto boundStruct = type->getAs<BoundGenericStructType>()) {
-    if (boundStruct->getDecl() == type->getASTContext().getArrayDecl())
-      return boundStruct->getGenericArgs()[0];
-  }
-
-  return None;
-}
-
-Optional<std::pair<Type, Type>> ConstraintSystem::isDictionaryType(Type type) {
+llvm::Optional<std::pair<Type, Type>>
+ConstraintSystem::isDictionaryType(Type type) {
   if (auto boundStruct = type->getAs<BoundGenericStructType>()) {
     if (boundStruct->getDecl() == type->getASTContext().getDictionaryDecl()) {
       auto genericArgs = boundStruct->getGenericArgs();
@@ -1053,27 +1184,28 @@ Optional<std::pair<Type, Type>> ConstraintSystem::isDictionaryType(Type type) {
     }
   }
 
-  return None;
+  return llvm::None;
 }
 
-Optional<Type> ConstraintSystem::isSetType(Type type) {
+llvm::Optional<Type> ConstraintSystem::isSetType(Type type) {
   if (auto boundStruct = type->getAs<BoundGenericStructType>()) {
     if (boundStruct->getDecl() == type->getASTContext().getSetDecl())
       return boundStruct->getGenericArgs()[0];
   }
 
-  return None;
+  return llvm::None;
 }
 
-Type ConstraintSystem::getFixedTypeRecursive(Type type,
-                                             TypeMatchOptions &flags,
-                                             bool wantRValue) const {
+Type ConstraintSystem::getFixedTypeRecursive(Type type, TypeMatchOptions &flags,
+                                             bool wantRValue) {
 
   if (wantRValue)
     type = type->getRValueType();
 
   if (auto depMemType = type->getAs<DependentMemberType>()) {
-    if (!depMemType->getBase()->isTypeVariableOrMember()) return type;
+    auto baseTy = depMemType->getBase();
+    if (!baseTy->hasTypeVariable() && !baseTy->hasDependentMember())
+      return type;
 
     // FIXME: Perform a more limited simplification?
     Type newType = simplifyType(type);
@@ -1084,6 +1216,16 @@ Type ConstraintSystem::getFixedTypeRecursive(Type type,
     flags |= TMF_GenerateConstraints;
 
     return getFixedTypeRecursive(newType, flags, wantRValue);
+  }
+
+  // Tuple types can lose their tuple structure under substitution
+  // when a parameter pack is substituted with one element.
+  if (auto tuple = type->getAs<TupleType>()) {
+    auto simplified = simplifyType(type);
+    if (simplified.getPointer() == type.getPointer())
+      return type;
+
+    return getFixedTypeRecursive(simplified, flags, wantRValue);
   }
 
   if (auto typeVar = type->getAs<TypeVariableType>()) {
@@ -1121,10 +1263,10 @@ TypeVariableType *ConstraintSystem::isRepresentativeFor(
   return *member;
 }
 
-static Optional<std::pair<VarDecl *, Type>>
+static llvm::Optional<std::pair<VarDecl *, Type>>
 getPropertyWrapperInformationFromOverload(
     SelectedOverload resolvedOverload, DeclContext *DC,
-    llvm::function_ref<Optional<std::pair<VarDecl *, Type>>(VarDecl *)>
+    llvm::function_ref<llvm::Optional<std::pair<VarDecl *, Type>>(VarDecl *)>
         getInformation) {
   if (auto *decl =
           dyn_cast_or_null<VarDecl>(resolvedOverload.choice.getDeclOrNull())) {
@@ -1139,54 +1281,54 @@ getPropertyWrapperInformationFromOverload(
       return std::make_pair(decl, type);
     }
   }
-  return None;
+  return llvm::None;
 }
 
-Optional<std::pair<VarDecl *, Type>>
+llvm::Optional<std::pair<VarDecl *, Type>>
 ConstraintSystem::getPropertyWrapperProjectionInfo(
     SelectedOverload resolvedOverload) {
   return getPropertyWrapperInformationFromOverload(
       resolvedOverload, DC,
-      [](VarDecl *decl) -> Optional<std::pair<VarDecl *, Type>> {
+      [](VarDecl *decl) -> llvm::Optional<std::pair<VarDecl *, Type>> {
         if (!decl->hasAttachedPropertyWrapper())
-          return None;
+          return llvm::None;
 
         auto projectionVar = decl->getPropertyWrapperProjectionVar();
         if (!projectionVar)
-          return None;
+          return llvm::None;
 
         return std::make_pair(projectionVar,
                               projectionVar->getInterfaceType());
       });
 }
 
-Optional<std::pair<VarDecl *, Type>>
+llvm::Optional<std::pair<VarDecl *, Type>>
 ConstraintSystem::getPropertyWrapperInformation(
     SelectedOverload resolvedOverload) {
   return getPropertyWrapperInformationFromOverload(
       resolvedOverload, DC,
-      [](VarDecl *decl) -> Optional<std::pair<VarDecl *, Type>> {
+      [](VarDecl *decl) -> llvm::Optional<std::pair<VarDecl *, Type>> {
         if (!decl->hasAttachedPropertyWrapper())
-          return None;
+          return llvm::None;
 
         auto backingTy = decl->getPropertyWrapperBackingPropertyType();
         if (!backingTy)
-          return None;
+          return llvm::None;
 
         return std::make_pair(decl, backingTy);
       });
 }
 
-Optional<std::pair<VarDecl *, Type>>
+llvm::Optional<std::pair<VarDecl *, Type>>
 ConstraintSystem::getWrappedPropertyInformation(
     SelectedOverload resolvedOverload) {
   return getPropertyWrapperInformationFromOverload(
       resolvedOverload, DC,
-      [](VarDecl *decl) -> Optional<std::pair<VarDecl *, Type>> {
+      [](VarDecl *decl) -> llvm::Optional<std::pair<VarDecl *, Type>> {
         if (auto wrapped = decl->getOriginalWrappedProperty())
           return std::make_pair(decl, wrapped->getInterfaceType());
 
-        return None;
+        return llvm::None;
       });
 }
 
@@ -1264,7 +1406,7 @@ Type ConstraintSystem::getUnopenedTypeOfReference(
           return ErrorType::get(getASTContext());
         }
 
-        return wantInterfaceType ? var->getInterfaceType() : var->getType();
+        return wantInterfaceType ? var->getInterfaceType() : var->getTypeInContext();
       },
       memberLocator, wantInterfaceType, adjustForPreconcurrency,
       GetClosureType{*this},
@@ -1280,6 +1422,10 @@ Type ConstraintSystem::getUnopenedTypeOfReference(
     llvm::function_ref<bool(const ClosureExpr *)> isolatedByPreconcurrency) {
   Type requestedType =
       getType(value)->getWithoutSpecifierType()->getReferenceStorageReferent();
+
+  // Strip pack expansion types off of pack references.
+  if (auto *expansion = requestedType->getAs<PackExpansionType>())
+    requestedType = expansion->getPatternType();
 
   // Adjust the type for concurrency if requested.
   if (adjustForPreconcurrency)
@@ -1403,6 +1549,13 @@ unwrapPropertyWrapperParameterTypes(ConstraintSystem &cs, AbstractFunctionDecl *
     return functionType;
   }
 
+  // This transform is not applicable to pattern matching context.
+  //
+  // Note: If the transform is ever enabled for patterns - new branch
+  // would have to be added to `nameLoc` selection.
+  if (locator.endsWith<LocatorPathElt::PatternMatch>())
+    return functionType;
+
   auto *paramList = funcDecl->getParameters();
   auto paramTypes = functionType->getParams();
   SmallVector<AnyFunctionType::Param, 4> adjustedParamTypes;
@@ -1450,18 +1603,14 @@ unwrapPropertyWrapperParameterTypes(ConstraintSystem &cs, AbstractFunctionDecl *
 
 /// Determine whether the given locator is for a witness or requirement.
 static bool isRequirementOrWitness(const ConstraintLocatorBuilder &locator) {
-  if (auto last = locator.last()) {
-    return last->getKind() == ConstraintLocator::ProtocolRequirement ||
-           last->getKind() == ConstraintLocator::Witness;
-  }
-
-  return false;
+  return locator.endsWith<LocatorPathElt::ProtocolRequirement>() ||
+         locator.endsWith<LocatorPathElt::Witness>();
 }
 
 AnyFunctionType *ConstraintSystem::adjustFunctionTypeForConcurrency(
     AnyFunctionType *fnType, ValueDecl *decl, DeclContext *dc,
-    unsigned numApplies, bool isMainDispatchQueue,
-    OpenedTypeMap &replacements) {
+    unsigned numApplies, bool isMainDispatchQueue, OpenedTypeMap &replacements,
+    ConstraintLocatorBuilder locator) {
   return swift::adjustFunctionTypeForConcurrency(
       fnType, decl, dc, numApplies, isMainDispatchQueue,
       GetClosureType{*this}, ClosureIsolatedByPreconcurrency{*this},
@@ -1469,7 +1618,7 @@ AnyFunctionType *ConstraintSystem::adjustFunctionTypeForConcurrency(
         if (replacements.empty())
           return type;
 
-        return openType(type, replacements);
+        return openType(type, replacements, locator);
       });
 }
 
@@ -1478,22 +1627,27 @@ AnyFunctionType *ConstraintSystem::adjustFunctionTypeForConcurrency(
 /// that declared \p type. This is useful for code completion so we can match
 /// the types we do know instead of bailing out completely because \p type
 /// contains an error type.
-static Type replaceParamErrorTypeByPlaceholder(Type type, ValueDecl *value) {
+static Type replaceParamErrorTypeByPlaceholder(Type type, ValueDecl *value, bool hasAppliedSelf) {
   if (!type->is<AnyFunctionType>() || !isa<AbstractFunctionDecl>(value)) {
     return type;
   }
   auto funcType = type->castTo<AnyFunctionType>();
   auto funcDecl = cast<AbstractFunctionDecl>(value);
 
-  auto declParams = funcDecl->getParameters();
+  SmallVector<ParamDecl *> declParams;
+  if (hasAppliedSelf) {
+    declParams.append(funcDecl->getParameters()->begin(), funcDecl->getParameters()->end());
+  } else {
+    declParams.push_back(funcDecl->getImplicitSelfDecl());
+  }
   auto typeParams = funcType->getParams();
-  assert(declParams->size() == typeParams.size());
+  assert(declParams.size() == typeParams.size());
   SmallVector<AnyFunctionType::Param, 4> newParams;
-  newParams.reserve(declParams->size());
+  newParams.reserve(declParams.size());
   for (auto i : indices(typeParams)) {
     AnyFunctionType::Param param = typeParams[i];
     if (param.getPlainType()->is<ErrorType>()) {
-      auto paramDecl = declParams->get(i);
+      auto paramDecl = declParams[i];
       auto placeholder =
           PlaceholderType::get(paramDecl->getASTContext(), paramDecl);
       newParams.push_back(param.withType(placeholder));
@@ -1501,7 +1655,7 @@ static Type replaceParamErrorTypeByPlaceholder(Type type, ValueDecl *value) {
       newParams.push_back(param);
     }
   }
-  assert(newParams.size() == declParams->size());
+  assert(newParams.size() == declParams.size());
   return FunctionType::get(newParams, funcType->getResult());
 }
 
@@ -1539,7 +1693,8 @@ ConstraintSystem::getTypeOfReference(ValueDecl *value,
     if (!isRequirementOrWitness(locator)) {
       unsigned numApplies = getNumApplications(value, false, functionRefKind);
       openedType = cast<FunctionType>(adjustFunctionTypeForConcurrency(
-          origOpenedType, func, useDC, numApplies, false, replacements));
+          origOpenedType, func, useDC, numApplies, false, replacements,
+          locator));
     }
 
     // The reference implicitly binds 'self'.
@@ -1565,14 +1720,14 @@ ConstraintSystem::getTypeOfReference(ValueDecl *value,
       unsigned numApplies = getNumApplications(
           funcDecl, false, functionRefKind);
       openedType = cast<FunctionType>(adjustFunctionTypeForConcurrency(
-          origOpenedType->castTo<FunctionType>(), funcDecl, useDC,
-          numApplies, false, replacements));
+          origOpenedType->castTo<FunctionType>(), funcDecl, useDC, numApplies,
+          false, replacements, locator));
     }
 
     if (isForCodeCompletion() && openedType->hasError()) {
       // In code completion, replace error types by placeholder types so we can
       // match the types we know instead of bailing out completely.
-      openedType = replaceParamErrorTypeByPlaceholder(openedType, value);
+      openedType = replaceParamErrorTypeByPlaceholder(openedType, value, /*hasAppliedSelf=*/true);
     }
 
     // If we opened up any type variables, record the replacements.
@@ -1587,7 +1742,8 @@ ConstraintSystem::getTypeOfReference(ValueDecl *value,
     auto type =
         TypeResolution::forInterface(useDC, TypeResolverContext::InExpression,
                                      /*unboundTyOpener*/ nullptr,
-                                     /*placeholderHandler*/ nullptr)
+                                     /*placeholderHandler*/ nullptr,
+                                     /*packElementOpener*/ nullptr)
             .resolveTypeInContext(typeDecl, /*foundDC*/ nullptr,
                                   /*isSpecialized=*/false);
     type = useDC->mapTypeIntoContext(type);
@@ -1612,13 +1768,12 @@ ConstraintSystem::getTypeOfReference(ValueDecl *value,
 
     // Open any the generic types.
     OpenedTypeMap replacements;
-    openGeneric(macro->getParentModule(), macro->getGenericSignature(),
-                locator, replacements);
+    Type openedType = openFunctionType(
+        macroType->castTo<AnyFunctionType>(), locator, replacements,
+        macro->getDeclContext());
 
     // If we opened up any type variables, record the replacements.
     recordOpenedTypes(locator, replacements);
-
-    Type openedType = openType(macroType, replacements);
 
     // FIXME: Should we use replaceParamErrorTypeByPlaceholder() here?
 
@@ -1709,6 +1864,8 @@ static void bindArchetypesFromContext(
     auto genericSig = parentDC->getGenericSignatureOfContext();
     for (auto *paramTy : genericSig.getGenericParams()) {
       Type contextTy = cs.DC->mapTypeIntoContext(paramTy);
+      if (paramTy->isParameterPack())
+        contextTy = PackType::getSingletonPackExpansion(contextTy);
       bindPrimaryArchetype(paramTy, contextTy);
     }
 
@@ -1729,7 +1886,7 @@ void ConstraintSystem::openGeneric(
   // Add the requirements as constraints.
   openGenericRequirements(
       outerDC, sig, /*skipProtocolSelfConstraint=*/false, locator,
-      [&](Type type) { return openType(type, replacements); });
+      [&](Type type) { return openType(type, replacements, locator); });
 }
 
 void ConstraintSystem::openGenericParameters(DeclContext *outerDC,
@@ -1755,10 +1912,13 @@ TypeVariableType *ConstraintSystem::openGenericParameter(
   auto *paramLocator = getConstraintLocator(
       locator.withPathElement(LocatorPathElt::GenericParameter(parameter)));
 
-  unsigned options = (TVO_PrefersSubtypeBinding |
-                      TVO_CanBindToHole);
+  unsigned options = TVO_PrefersSubtypeBinding;
+
   if (parameter->isParameterPack())
     options |= TVO_CanBindToPack;
+
+  if (shouldAttemptFixes())
+    options |= TVO_CanBindToHole;
 
   auto typeVar = createTypeVariable(paramLocator, options);
   auto result = replacements.insert(std::make_pair(
@@ -1767,6 +1927,24 @@ TypeVariableType *ConstraintSystem::openGenericParameter(
   assert(result.second);
   (void)result;
 
+  if (Context.LangOpts.hasFeature(Feature::NoncopyableGenerics)) {
+    return typeVar;
+  }
+
+  // Add a constraint that generic parameters conform to Copyable.
+  // This lookup only can fail if the stdlib (i.e. the Swift module) has not
+  // been loaded because you've passed `-parse-stdlib` and are not building the
+  // stdlib itself (which would have `-module-name Swift` too).
+  if (!outerDC->getParentModule()->isBuiltinModule()) {
+    if (auto *copyable = TypeChecker::getProtocol(getASTContext(), SourceLoc(),
+                                                  KnownProtocolKind::Copyable)) {
+      addConstraint(
+          ConstraintKind::ConformsTo, typeVar,
+          copyable->getDeclaredInterfaceType(),
+          locator.withPathElement(LocatorPathElt::GenericParameter(parameter)));
+    }
+  }
+  
   return typeVar;
 }
 
@@ -1788,7 +1966,7 @@ void ConstraintSystem::openGenericRequirement(
     DeclContext *outerDC, unsigned index, const Requirement &req,
     bool skipProtocolSelfConstraint, ConstraintLocatorBuilder locator,
     llvm::function_ref<Type(Type)> substFn) {
-  Optional<Requirement> openedReq;
+  llvm::Optional<Requirement> openedReq;
   auto openedFirst = substFn(req.getFirstType());
 
   auto kind = req.getKind();
@@ -1914,16 +2092,11 @@ static bool isMainDispatchQueueMember(ConstraintLocator *locator) {
   if (!typeRepr)
     return false;
 
-  auto identTypeRepr = dyn_cast<IdentTypeRepr>(typeRepr);
-  if (!identTypeRepr)
+  auto declRefTR = dyn_cast<DeclRefTypeRepr>(typeRepr);
+  if (!declRefTR)
     return false;
 
-  auto components = identTypeRepr->getComponentRange();
-  if (components.empty())
-    return false;
-
-  if (components.back()->getNameRef().getBaseName().userFacingName() !=
-        "DispatchQueue")
+  if (declRefTR->getNameRef().getBaseName().userFacingName() != "DispatchQueue")
     return false;
 
   return true;
@@ -1935,10 +2108,8 @@ static bool isMainDispatchQueueMember(ConstraintLocator *locator) {
 ///
 /// \note If a 'Self'-rooted type parameter is bound to a concrete type, this
 /// routine will recurse into the concrete type.
-static Type
-typeEraseExistentialSelfReferences(
-    Type refTy, Type baseTy,
-    TypePosition outermostPosition) {
+static Type typeEraseExistentialSelfReferences(Type refTy, Type baseTy,
+                                               TypePosition outermostPosition) {
   assert(baseTy->isExistentialType());
   if (!refTy->hasTypeParameter()) {
     return refTy;
@@ -1966,93 +2137,94 @@ typeEraseExistentialSelfReferences(
   std::function<Type(Type, TypePosition)> transformFn;
   transformFn = [&](Type type, TypePosition initialPos) -> Type {
     return type.transformWithPosition(
-        initialPos, [&](TypeBase *t, TypePosition currPos) -> Optional<Type> {
-      if (!t->hasTypeParameter()) {
-        return Type(t);
-      }
-
-      if (t->is<MetatypeType>()) {
-        const auto instanceTy = t->getMetatypeInstanceType();
-        ++metatypeDepth;
-        const auto erasedTy = transformFn(instanceTy, currPos);
-        --metatypeDepth;
-
-        if (instanceTy.getPointer() == erasedTy.getPointer()) {
-          return Type(t);
-        }
-
-        return Type(ExistentialMetatypeType::get(erasedTy));
-      }
-
-      // Opaque types whose substitutions involve this type parameter are
-      // erased to their upper bound.
-      if (auto opaque = dyn_cast<OpaqueTypeArchetypeType>(t)) {
-        for (auto replacementType :
-                 opaque->getSubstitutions().getReplacementTypes()) {
-          if (hasErasedGenericParameter(replacementType)) {
-            Type interfaceType = opaque->getInterfaceType();
-            auto genericSig =
-                opaque->getDecl()->getOpaqueInterfaceGenericSignature();
-            return genericSig->getNonDependentUpperBounds(interfaceType);
+        initialPos,
+        [&](TypeBase *t, TypePosition currPos) -> llvm::Optional<Type> {
+          if (!t->hasTypeParameter()) {
+            return Type(t);
           }
-        }
-      }
 
-      if (!t->isTypeParameter()) {
-        // Recurse.
-        return None;
-      }
+          if (t->is<MetatypeType>()) {
+            const auto instanceTy = t->getMetatypeInstanceType();
+            ++metatypeDepth;
+            const auto erasedTy = transformFn(instanceTy, currPos);
+            --metatypeDepth;
 
-      if (t->getRootGenericParam()->getDepth() > 0) {
-        return Type(t);
-      }
+            if (instanceTy.getPointer() == erasedTy.getPointer()) {
+              return Type(t);
+            }
 
-      // If the type parameter is beyond the domain of the existential generic
-      // signature, ignore it.
-      if (!existentialSig->isValidTypeParameter(t)) {
-        return Type(t);
-      }
+            return Type(ExistentialMetatypeType::get(erasedTy));
+          }
 
-      // If the type parameter is bound to a concrete type, recurse into it.
-      if (const auto concreteTy = existentialSig->getConcreteType(t)) {
-        const auto erasedTy = transformFn(concreteTy, currPos);
-        if (erasedTy.getPointer() == concreteTy.getPointer()) {
-          // Don't return the concrete type if we haven't type-erased anything
-          // inside it, or else we might inadvertently transform a normal
-          // metatype into an existential one.
-          return Type(t);
-        }
+          // Opaque types whose substitutions involve this type parameter are
+          // erased to their upper bound.
+          if (auto opaque = dyn_cast<OpaqueTypeArchetypeType>(t)) {
+            for (auto replacementType :
+                 opaque->getSubstitutions().getReplacementTypes()) {
+              if (hasErasedGenericParameter(replacementType)) {
+                Type interfaceType = opaque->getInterfaceType();
+                auto genericSig =
+                    opaque->getDecl()->getOpaqueInterfaceGenericSignature();
+                return genericSig->getNonDependentUpperBounds(interfaceType);
+              }
+            }
+          }
 
-        return erasedTy;
-      }
+          if (!t->isTypeParameter()) {
+            // Recurse.
+            return llvm::None;
+          }
 
-      switch (currPos) {
-      case TypePosition::Covariant:
-        break;
+          if (t->getRootGenericParam()->getDepth() > 0) {
+            return Type(t);
+          }
 
-      case TypePosition::Contravariant:
-      case TypePosition::Invariant:
-        return Type(t);
-      }
+          // If the type parameter is beyond the domain of the existential
+          // generic signature, ignore it.
+          if (!existentialSig->isValidTypeParameter(t)) {
+            return Type(t);
+          }
 
-      Type erasedTy;
+          // If the type parameter is bound to a concrete type, recurse into it.
+          if (const auto concreteTy = existentialSig->getConcreteType(t)) {
+            const auto erasedTy = transformFn(concreteTy, currPos);
+            if (erasedTy.getPointer() == concreteTy.getPointer()) {
+              // Don't return the concrete type if we haven't type-erased
+              // anything inside it, or else we might inadvertently transform a
+              // normal metatype into an existential one.
+              return Type(t);
+            }
 
-      // The upper bounds of 'Self' is the existential base type.
-      if (t->is<GenericTypeParamType>()) {
-        erasedTy = baseTy;
-      } else {
-        erasedTy = existentialSig->getNonDependentUpperBounds(t);
-      }
+            return erasedTy;
+          }
 
-      if (metatypeDepth) {
-        if (const auto existential = erasedTy->getAs<ExistentialType>())
-          return existential->getConstraintType();
-      }
+          switch (currPos) {
+          case TypePosition::Covariant:
+            break;
 
-      return erasedTy;
-    });
+          case TypePosition::Contravariant:
+          case TypePosition::Invariant:
+          case TypePosition::Shape:
+            return Type(t);
+          }
+
+          Type erasedTy;
+
+          // The upper bounds of 'Self' is the existential base type.
+          if (t->is<GenericTypeParamType>()) {
+            erasedTy = baseTy;
+          } else {
+            erasedTy = existentialSig->getNonDependentUpperBounds(t);
+          }
+
+          if (metatypeDepth) {
+            if (const auto existential = erasedTy->getAs<ExistentialType>())
+              return existential->getConstraintType();
+          }
+
+          return erasedTy;
+        });
   };
-
   return transformFn(refTy, outermostPosition);
 }
 
@@ -2062,7 +2234,7 @@ Type constraints::typeEraseOpenedExistentialReference(
   Type selfGP = GenericTypeParamType::get(false, 0, 0, type->getASTContext());
 
   // First, temporarily reconstitute the 'Self' generic parameter.
-  type = type.transformRec([&](TypeBase *t) -> Optional<Type> {
+  type = type.transformRec([&](TypeBase *t) -> llvm::Optional<Type> {
     // Don't recurse into children unless we have to.
     if (!type->hasTypeVariable())
       return Type(t);
@@ -2071,7 +2243,7 @@ Type constraints::typeEraseOpenedExistentialReference(
       return selfGP;
 
     // Recurse.
-    return None;
+    return llvm::None;
   });
 
   // Then, type-erase occurrences of covariant 'Self'-rooted type parameters.
@@ -2079,7 +2251,7 @@ Type constraints::typeEraseOpenedExistentialReference(
                                             outermostPosition);
 
   // Finally, swap the 'Self'-corresponding type variable back in.
-  return type.transformRec([&](TypeBase *t) -> Optional<Type> {
+  return type.transformRec([&](TypeBase *t) -> llvm::Optional<Type> {
     // Don't recurse into children unless we have to.
     if (!type->hasTypeParameter())
       return Type(t);
@@ -2088,7 +2260,7 @@ Type constraints::typeEraseOpenedExistentialReference(
       return Type(openedTypeVar);
 
     // Recurse.
-    return None;
+    return llvm::None;
   });
 }
 
@@ -2181,16 +2353,26 @@ Type ConstraintSystem::getMemberReferenceTypeFromOpenedType(
     const auto selfGP = cast<GenericTypeParamType>(
         outerDC->getSelfInterfaceType()->getCanonicalType());
     auto openedTypeVar = replacements.lookup(selfGP);
+
     type = typeEraseOpenedExistentialReference(type, baseObjTy, openedTypeVar,
                                                TypePosition::Covariant);
+
+    Type contextualTy;
+
+    if (auto *anchor = getAsExpr(simplifyLocatorToAnchor(locator))) {
+      contextualTy =
+          getContextualType(getParentExpr(anchor), /*forConstraint=*/false);
+    }
 
     if (!hasFixFor(locator) &&
         AddExplicitExistentialCoercion::isRequired(
             *this, nonErasedResultTy,
             [&](TypeVariableType *typeVar) {
-              return openedTypeVar == typeVar ? baseObjTy : Optional<Type>();
+              return openedTypeVar == typeVar ? baseObjTy
+                                              : llvm::Optional<Type>();
             },
-            locator)) {
+            locator) &&
+        !contextualTy) {
       recordFix(AddExplicitExistentialCoercion::create(
           *this, getResultType(type), locator));
     }
@@ -2227,7 +2409,7 @@ Type ConstraintSystem::getMemberReferenceTypeFromOpenedType(
   if (isForCodeCompletion() && type->hasError()) {
     // In code completion, replace error types by placeholder types so we can
     // match the types we know instead of bailing out completely.
-    type = replaceParamErrorTypeByPlaceholder(type, value);
+    type = replaceParamErrorTypeByPlaceholder(type, value, hasAppliedSelf);
   }
 
   return type;
@@ -2292,6 +2474,13 @@ ConstraintSystem::getTypeOfMemberReference(
     return { openedType, openedType, memberTy, memberTy };
   }
 
+  if (isa<AbstractFunctionDecl>(value) || isa<EnumElementDecl>(value)) {
+    if (value->getInterfaceType()->is<ErrorType>()) {
+      auto genericErrorTy = ErrorType::get(getASTContext());
+      return { genericErrorTy, genericErrorTy, genericErrorTy, genericErrorTy };
+    }
+  }
+
   // Figure out the declaration context to use when opening this type.
   DeclContext *innerDC = value->getInnermostDeclContext();
   DeclContext *outerDC = value->getDeclContext();
@@ -2300,18 +2489,21 @@ ConstraintSystem::getTypeOfMemberReference(
   Type openedType;
   OpenedTypeMap localReplacements;
   auto &replacements = replacementsPtr ? *replacementsPtr : localReplacements;
-  unsigned numRemovedArgumentLabels = getNumRemovedArgumentLabels(
-      value, /*isCurriedInstanceReference*/ !hasAppliedSelf, functionRefKind);
 
-  AnyFunctionType *funcType;
+  // If we have a generic signature, open the parameters. We delay opening
+  // requirements to allow contextual types to affect the situation.
+  auto genericSig = innerDC->getGenericSignatureOfContext();
+  if (genericSig)
+    openGenericParameters(outerDC, genericSig, replacements, locator);
 
   if (isa<AbstractFunctionDecl>(value) || isa<EnumElementDecl>(value)) {
-    if (auto ErrorTy = value->getInterfaceType()->getAs<ErrorType>()) {
-      auto genericErrorTy = ErrorType::get(ErrorTy->getASTContext());
-      return { genericErrorTy, genericErrorTy, genericErrorTy, genericErrorTy };
-    }
     // This is the easy case.
-    funcType = value->getInterfaceType()->castTo<AnyFunctionType>();
+    openedType = value->getInterfaceType()->castTo<AnyFunctionType>();
+
+    if (auto *genericFn = openedType->getAs<GenericFunctionType>()) {
+      openedType = genericFn->substGenericArgs(
+          [&](Type type) { return openType(type, replacements, locator); });
+    }
   } else {
     // For a property, build a type (Self) -> PropType.
     // For a subscript, build a type (Self) -> (Indices...) -> ElementType.
@@ -2352,29 +2544,21 @@ ConstraintSystem::getTypeOfMemberReference(
         !selfTy->hasError())
       selfFlags = selfFlags.withInOut(true);
 
-    // If the storage is generic, add a generic signature.
-    FunctionType::Param selfParam(selfTy, Identifier(), selfFlags);
-    // FIXME: Verify ExtInfo state is correct, not working by accident.
-    if (auto sig = innerDC->getGenericSignatureOfContext()) {
-      GenericFunctionType::ExtInfo info;
-      funcType = GenericFunctionType::get(sig, {selfParam}, refType, info);
-    } else {
-      FunctionType::ExtInfo info;
-      funcType = FunctionType::get({selfParam}, refType, info);
+    // If the storage is generic, open the self and ref types.
+    if (genericSig) {
+      selfTy = openType(selfTy, replacements, locator);
+      refType = openType(refType, replacements, locator);
     }
-  }
+    FunctionType::Param selfParam(selfTy, Identifier(), selfFlags);
 
-  // While opening member function type, let's delay opening requirements
-  // to allow contextual types to affect the situation.
-  if (auto *genericFn = funcType->getAs<GenericFunctionType>()) {
-    openGenericParameters(outerDC, genericFn->getGenericSignature(),
-                          replacements, locator);
-
-    openedType = genericFn->substGenericArgs(
-        [&](Type type) { return openType(type, replacements); });
-  } else {
-    openedType = funcType;
+    // FIXME: Verify ExtInfo state is correct, not working by accident.
+    FunctionType::ExtInfo info;
+    openedType = FunctionType::get({selfParam}, refType, info);
   }
+  assert(!openedType->hasTypeParameter());
+
+  unsigned numRemovedArgumentLabels = getNumRemovedArgumentLabels(
+      value, /*isCurriedInstanceReference*/ !hasAppliedSelf, functionRefKind);
 
   openedType = openedType->removeArgumentLabels(numRemovedArgumentLabels);
 
@@ -2391,7 +2575,7 @@ ConstraintSystem::getTypeOfMemberReference(
               getConcreteReplacementForProtocolSelfType(value)) {
         // Concrete type replacing `Self` could be generic, so we need
         // to make sure that it's opened before use.
-        baseOpenedTy = openType(concreteSelf, replacements);
+        baseOpenedTy = openType(concreteSelf, replacements, locator);
         baseObjTy = baseOpenedTy;
       }
     }
@@ -2425,11 +2609,11 @@ ConstraintSystem::getTypeOfMemberReference(
   // failing we'll get a generic requirement constraint failure
   // if mismatch is related to generic parameters which is much
   // easier to diagnose.
-  if (auto *genericFn = funcType->getAs<GenericFunctionType>()) {
+  if (genericSig) {
     openGenericRequirements(
-        outerDC, genericFn->getGenericSignature(),
+        outerDC, genericSig,
         /*skipProtocolSelfConstraint=*/true, locator,
-        [&](Type type) { return openType(type, replacements); });
+        [&](Type type) { return openType(type, replacements, locator); });
   }
 
   if (auto *funcDecl = dyn_cast<AbstractFunctionDecl>(value)) {
@@ -2454,11 +2638,11 @@ ConstraintSystem::getTypeOfMemberReference(
         value, hasAppliedSelf, functionRefKind);
     openedType = adjustFunctionTypeForConcurrency(
         origOpenedType->castTo<AnyFunctionType>(), value, useDC, numApplies,
-        isMainDispatchQueueMember(locator), replacements);
+        isMainDispatchQueueMember(locator), replacements, locator);
   } else if (auto subscript = dyn_cast<SubscriptDecl>(value)) {
     openedType = adjustFunctionTypeForConcurrency(
         origOpenedType->castTo<AnyFunctionType>(), subscript, useDC,
-        /*numApplies=*/2, /*isMainDispatchQueue=*/false, replacements);
+        /*numApplies=*/2, /*isMainDispatchQueue=*/false, replacements, locator);
   } else if (auto var = dyn_cast<VarDecl>(value)) {
     // Adjust the function's result type, since that's the Var's actual type.
     auto origFnType = origOpenedType->castTo<AnyFunctionType>();
@@ -2506,6 +2690,7 @@ Type ConstraintSystem::getEffectiveOverloadType(ConstraintLocator *locator,
   case OverloadChoiceKind::KeyPathDynamicMemberLookup:
   case OverloadChoiceKind::KeyPathApplication:
   case OverloadChoiceKind::TupleIndex:
+  case OverloadChoiceKind::MaterializePack:
     return Type();
   }
 
@@ -2584,9 +2769,9 @@ Type ConstraintSystem::getEffectiveOverloadType(ConstraintLocator *locator,
       // FIXME: Verify ExtInfo state is correct, not working by accident.
       FunctionType::ExtInfo info;
       type = adjustFunctionTypeForConcurrency(
-          FunctionType::get(indices, elementTy, info),
-          subscript, useDC, /*numApplies=*/1, /*isMainDispatchQueue=*/false,
-          emptyReplacements);
+          FunctionType::get(indices, elementTy, info), subscript, useDC,
+          /*numApplies=*/1, /*isMainDispatchQueue=*/false, emptyReplacements,
+          locator);
     } else if (auto var = dyn_cast<VarDecl>(decl)) {
       type = var->getValueInterfaceType();
       if (doesStorageProduceLValue(var, overload.getBaseType(), useDC)) {
@@ -2632,10 +2817,9 @@ Type ConstraintSystem::getEffectiveOverloadType(ConstraintLocator *locator,
           decl, hasAppliedSelf, overload.getFunctionRefKind());
 
       type = adjustFunctionTypeForConcurrency(
-          type->castTo<FunctionType>(),
-          decl, useDC, numApplies, /*isMainDispatchQueue=*/false,
-          emptyReplacements)
-        ->getResult();
+                 type->castTo<FunctionType>(), decl, useDC, numApplies,
+                 /*isMainDispatchQueue=*/false, emptyReplacements, locator)
+                 ->getResult();
     }
   }
 
@@ -2651,7 +2835,7 @@ void ConstraintSystem::addOverloadSet(Type boundType,
                                       ArrayRef<OverloadChoice> choices,
                                       DeclContext *useDC,
                                       ConstraintLocator *locator,
-                                      Optional<unsigned> favoredIndex) {
+                                      llvm::Optional<unsigned> favoredIndex) {
   // If there is a single choice, add the bind overload directly.
   if (choices.size() == 1) {
     addBindOverloadConstraint(boundType, choices.front(), locator, useDC);
@@ -2736,7 +2920,7 @@ static DeclReferenceType getTypeOfReferenceWithSpecialTypeCheckingSemantics(
                                          FunctionType::ExtInfoBuilder()
                                              .withNoEscape(true)
                                              .withAsync(true)
-                                             .withThrows(true)
+                                             .withThrows(true, /*FIXME:*/Type())
                                              .build());
     FunctionType::Param args[] = {
       FunctionType::Param(noescapeClosure),
@@ -2747,7 +2931,7 @@ static DeclReferenceType getTypeOfReferenceWithSpecialTypeCheckingSemantics(
                                      FunctionType::ExtInfoBuilder()
                                          .withNoEscape(false)
                                          .withAsync(true)
-                                         .withThrows(true)
+                                         .withThrows(true, /*FIXME:*/Type())
                                          .build());
     return {refType, refType, refType, refType};
   }
@@ -2769,7 +2953,7 @@ static DeclReferenceType getTypeOfReferenceWithSpecialTypeCheckingSemantics(
     auto bodyClosure = FunctionType::get(bodyArgs, result,
                                          FunctionType::ExtInfoBuilder()
                                              .withNoEscape(true)
-                                             .withThrows(true)
+                                             .withThrows(true, /*FIXME:*/Type())
                                              .withAsync(true)
                                              .build());
     FunctionType::Param args[] = {
@@ -2779,7 +2963,7 @@ static DeclReferenceType getTypeOfReferenceWithSpecialTypeCheckingSemantics(
     auto refType = FunctionType::get(args, result,
                                      FunctionType::ExtInfoBuilder()
                                          .withNoEscape(false)
-                                         .withThrows(true)
+                                         .withThrows(true, /*FIXME:*/Type())
                                          .withAsync(true)
                                          .build());
     return {refType, refType, refType, refType};
@@ -2881,6 +3065,10 @@ FunctionType::ExtInfo ClosureEffectsRequest::evaluate(
     DeclContext *DC;
     bool FoundThrow = false;
 
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
+
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
       // If we've found a 'try', record it and terminate the traversal.
       if (isa<TryExpr>(expr)) {
@@ -2948,7 +3136,8 @@ FunctionType::ExtInfo ClosureEffectsRequest::evaluate(
           castType = TypeResolution::resolveContextualType(
               castTypeRepr, DC, TypeResolverContext::InExpression,
               /*unboundTyOpener*/ nullptr,
-              /*placeholderHandler*/ nullptr);
+              /*placeholderHandler*/ nullptr,
+              /*packElementOpener*/ nullptr);
         } else {
           castType = isp->getCastType();
         }
@@ -3038,7 +3227,7 @@ FunctionType::ExtInfo ClosureEffectsRequest::evaluate(
   bool concurrent = expr->getAttrs().hasAttribute<SendableAttr>();
   if (throws || async) {
     return ASTExtInfoBuilder()
-      .withThrows(throws)
+      .withThrows(throws, /*FIXME:*/Type())
       .withAsync(async)
       .withConcurrent(concurrent)
       .build();
@@ -3052,7 +3241,7 @@ FunctionType::ExtInfo ClosureEffectsRequest::evaluate(
   auto throwFinder = FindInnerThrows(expr);
   body->walk(throwFinder);
   return ASTExtInfoBuilder()
-      .withThrows(throwFinder.foundThrow())
+      .withThrows(throwFinder.foundThrow(), /*FIXME:*/Type())
       .withAsync(bool(findAsyncNode(expr)))
       .withConcurrent(concurrent)
       .build();
@@ -3164,7 +3353,7 @@ void ConstraintSystem::bindOverloadType(
     if (!argList) {
       argList = ArgumentList::createImplicit(
           ctx, {Argument(SourceLoc(), ctx.Id_dynamicMember, /*expr*/ nullptr)},
-          /*firstTrailingClosureIndex=*/None,
+          /*firstTrailingClosureIndex=*/llvm::None,
           AllocationArena::ConstraintSolver);
     }
 
@@ -3185,6 +3374,7 @@ void ConstraintSystem::bindOverloadType(
   case OverloadChoiceKind::DeclViaBridge:
   case OverloadChoiceKind::DeclViaUnwrappedOptional:
   case OverloadChoiceKind::TupleIndex:
+  case OverloadChoiceKind::MaterializePack:
   case OverloadChoiceKind::KeyPathApplication:
     bindTypeOrIUO(openedType);
     return;
@@ -3272,7 +3462,7 @@ void ConstraintSystem::bindOverloadType(
     if (isSubscriptRef) {
       // Make sure that regular subscript declarations (if any) are
       // preferred over key path dynamic member lookup.
-      increaseScore(SK_KeyPathSubscript);
+      increaseScore(SK_KeyPathSubscript, locator);
 
       auto boundTypeVar = boundType->castTo<TypeVariableType>();
       auto constraints = getConstraintGraph().gatherConstraints(
@@ -3426,6 +3616,19 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
     refType = adjustedRefType;
     break;
 
+  case OverloadChoiceKind::MaterializePack: {
+    // Since pack expansion is only applicable to single element tuples at the
+    // moment we can just look through l-value base to load it.
+    //
+    // In the future, _if_ the syntax allows for multiple expansions
+    // this code would have to be adjusted to project l-value from the
+    // base type just like TupleIndex does.
+    adjustedRefType =
+        getPatternTypeOfSingleUnlabeledPackExpansionTuple(choice.getBaseType());
+    refType = adjustedRefType;
+    break;
+  }
+
   case OverloadChoiceKind::KeyPathApplication: {
     // Key path application looks like a subscript(keyPath: KeyPath<Base, T>).
     // The element type is T or @lvalue T based on the key path subtype and
@@ -3467,8 +3670,8 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
     // contains the completion location
     auto SE = getAsExpr<SubscriptExpr>(locator->getAnchor());
     if (!isForCodeCompletion() ||
-        (SE && !containsCodeCompletionLoc(SE->getArgs()))) {
-      increaseScore(SK_KeyPathSubscript);
+        (SE && !containsIDEInspectionTarget(SE->getArgs()))) {
+      increaseScore(SK_KeyPathSubscript, locator);
     }
     break;
   }
@@ -3484,8 +3687,9 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
       if (!Options.contains(ConstraintSystemFlags::IgnoreAsyncSyncMismatch) &&
           !func->hasPolymorphicEffect(EffectKind::Async) &&
           func->isAsyncContext() != isAsynchronousContext(useDC)) {
-        increaseScore(
-            func->isAsyncContext() ? SK_AsyncInSyncMismatch : SK_SyncInAsync);
+        increaseScore(func->isAsyncContext() ? SK_AsyncInSyncMismatch
+                                             : SK_SyncInAsync,
+                      locator);
       }
     }
 
@@ -3512,7 +3716,7 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
       // choices based on the selector kind on the valid code path.
       if (choice.getFunctionRefKind() == FunctionRefKind::Unapplied &&
           !UnevaluatedRootExprs.contains(getAsExpr(anchor))) {
-        increaseScore(SK_UnappliedFunction);
+        increaseScore(SK_UnappliedFunction, locator);
       }
     }
 
@@ -3550,6 +3754,16 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
 
         // Otherwise both `Self` and arguments are applied,
         // e.g. `foo.bar()` or `Foo.bar(&foo)()`, and there is nothing to do.
+      }
+    }
+
+    // If we have a macro, check for correct usage.
+    if (auto macro = dyn_cast<MacroDecl>(decl)) {
+      // Macro can only be used in an expansion. If we end up here, it's
+      // because we found a macro but are missing the leading '#'.
+      if (!locator->isForMacroExpansion()) {
+        // Record a fix here
+        (void)recordFix(MacroMissingPound::create(*this, macro, locator));
       }
     }
   }
@@ -3596,32 +3810,159 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
   if (auto *decl = choice.getDeclOrNull()) {
     // If the declaration is unavailable, note that in the score.
     if (isDeclUnavailable(decl, locator))
-      increaseScore(SK_Unavailable);
+      increaseScore(SK_Unavailable, locator);
 
     // If this overload is disfavored, note that.
     if (decl->getAttrs().hasAttribute<DisfavoredOverloadAttr>())
-      increaseScore(SK_DisfavoredOverload);
+      increaseScore(SK_DisfavoredOverload, locator);
   }
 
   if (choice.isFallbackMemberOnUnwrappedBase()) {
-    increaseScore(SK_UnresolvedMemberViaOptional);
+    increaseScore(SK_UnresolvedMemberViaOptional, locator);
   }
 }
 
-Type ConstraintSystem::simplifyTypeImpl(Type type,
-    llvm::function_ref<Type(TypeVariableType *)> getFixedTypeFn) const {
-  return type.transform([&](Type type) -> Type {
-    if (auto tvt = dyn_cast<TypeVariableType>(type.getPointer()))
-      return getFixedTypeFn(tvt);
+namespace {
+
+struct TypeSimplifier {
+  ConstraintSystem &CS;
+  llvm::function_ref<Type(TypeVariableType *)> GetFixedTypeFn;
+
+  struct ActivePackExpansion {
+    bool isPackExpansion = false;
+    unsigned index = 0;
+  };
+  SmallVector<ActivePackExpansion, 4> ActivePackExpansions;
+
+  TypeSimplifier(ConstraintSystem &CS,
+                 llvm::function_ref<Type(TypeVariableType *)> getFixedTypeFn)
+    : CS(CS), GetFixedTypeFn(getFixedTypeFn) {}
+
+  Type operator()(Type type) {
+    if (auto tvt = dyn_cast<TypeVariableType>(type.getPointer())) {
+      auto fixedTy = GetFixedTypeFn(tvt);
+
+      // TODO: the following logic should be applied when rewriting
+      // PackElementType.
+      if (ActivePackExpansions.empty()) {
+        return fixedTy;
+      }
+
+      if (auto fixedPack = fixedTy->getAs<PackType>()) {
+        auto &activeExpansion = ActivePackExpansions.back();
+        if (activeExpansion.index >= fixedPack->getNumElements()) {
+          return tvt;
+        }
+
+        auto fixedElt = fixedPack->getElementType(activeExpansion.index);
+        auto fixedExpansion = fixedElt->getAs<PackExpansionType>();
+        if (activeExpansion.isPackExpansion && fixedExpansion) {
+          return fixedExpansion->getPatternType();
+        } else if (!activeExpansion.isPackExpansion && !fixedExpansion) {
+          return fixedElt;
+        } else {
+          return tvt;
+        }
+      }
+
+      return fixedTy;
+    }
+
+    if (auto tuple = dyn_cast<TupleType>(type.getPointer())) {
+      if (tuple->getNumElements() == 1) {
+        auto element = tuple->getElement(0);
+        auto elementType = element.getType();
+        auto resolvedType = elementType.transform(*this);
+
+        // If this is a single-element tuple with pack expansion
+        // variable inside, let's unwrap it if pack is flattened.
+        if (!element.hasName()) {
+          if (auto *typeVar = elementType->getAs<TypeVariableType>()) {
+            if (typeVar->getImpl().isPackExpansion() &&
+                !resolvedType->isEqual(typeVar) &&
+                !resolvedType->is<PackExpansionType>() &&
+                !resolvedType->is<PackType>() &&
+                !resolvedType->is<PackArchetypeType>()) {
+              return resolvedType;
+            }
+          }
+        }
+
+        // Flatten single-element tuples containing type variables that cannot
+        // bind to packs.
+        auto typeVar = resolvedType->getAs<TypeVariableType>();
+        if (!element.hasName() && typeVar &&
+            !typeVar->getImpl().canBindToPack() &&
+            !typeVar->getImpl().isPackExpansion()) {
+          return typeVar;
+        }
+      }
+    }
+
+    if (auto expansion = dyn_cast<PackExpansionType>(type.getPointer())) {
+      auto patternType = expansion->getPatternType();
+      // First, let's check whether pattern type has all of the type variables
+      // that represent packs resolved, otherwise we don't have enough information
+      // to flatten this pack expansion type.
+      //
+      // Note that we don't actually need to do deep transformation here
+      // because pack variables can only appear in structural positions.
+      if (patternType.findIf([&](Type type) {
+            if (auto *typeVar = type->getAs<TypeVariableType>()) {
+              if (typeVar->getImpl().canBindToPack())
+                return GetFixedTypeFn(typeVar)->is<TypeVariableType>();
+            }
+            return false;
+          })) {
+        return expansion;
+      }
+
+      // Transform the count type, ignoring any active pack expansions.
+      auto countType = expansion->getCountType().transform(
+          TypeSimplifier(CS, GetFixedTypeFn));
+
+      // If both pattern and count are resolves, let's just return
+      // the pattern type for `transformWithPosition` to take care
+      // of the rest.
+      if (patternType->is<PackType>() && countType->is<PackType>())
+        return patternType;
+
+      if (auto countPack = countType->getAs<PackType>()) {
+        SmallVector<Type, 4> elts;
+        ActivePackExpansions.push_back({false, 0});
+        for (auto countElt : countPack->getElementTypes()) {
+          auto countExpansion = countElt->getAs<PackExpansionType>();
+          ActivePackExpansions.back().isPackExpansion =
+            (countExpansion != nullptr);
+
+          auto elt = expansion->getPatternType().transform(*this);
+          if (countExpansion)
+            elt = PackExpansionType::get(elt, countExpansion->getCountType());
+          elts.push_back(elt);
+
+          ActivePackExpansions.back().index++;
+        }
+        ActivePackExpansions.pop_back();
+
+        if (elts.size() == 1)
+          return elts[0];
+        return PackType::get(CS.getASTContext(), elts);
+      } else {
+        ActivePackExpansions.push_back({true, 0});
+        auto patternType = expansion->getPatternType().transform(*this);
+        ActivePackExpansions.pop_back();
+        return PackExpansionType::get(patternType, countType);
+      }
+    }
 
     // If this is a dependent member type for which we end up simplifying
     // the base to a non-type-variable, perform lookup.
     if (auto depMemTy = dyn_cast<DependentMemberType>(type.getPointer())) {
       // Simplify the base.
-      Type newBase = simplifyTypeImpl(depMemTy->getBase(), getFixedTypeFn);
+      Type newBase = depMemTy->getBase().transform(*this);
 
       if (newBase->isPlaceholder()) {
-        return PlaceholderType::get(getASTContext(), depMemTy);
+        return PlaceholderType::get(CS.getASTContext(), depMemTy);
       }
 
       // If nothing changed, we're done.
@@ -3641,23 +3982,16 @@ Type ConstraintSystem::simplifyTypeImpl(Type type,
       if (lookupBaseType->mayHaveMembers() ||
           lookupBaseType->is<PackType>()) {
         auto *proto = assocType->getProtocol();
-        auto conformance = DC->getParentModule()->lookupConformance(
-          lookupBaseType, proto);
+        auto conformance = CS.lookupConformance(lookupBaseType, proto);
         if (!conformance) {
-          // FIXME: This regresses diagnostics if removed, but really the
-          // handling of a missing conformance should be the same for
-          // tuples and non-tuples.
-          if (lookupBaseType->is<TupleType>())
-            return DependentMemberType::get(lookupBaseType, assocType);
-
           // If the base type doesn't conform to the associatedtype's protocol,
           // there will be a missing conformance fix applied in diagnostic mode,
           // so the concrete dependent member type is considered a "hole" in
           // order to continue solving.
           auto memberTy = DependentMemberType::get(lookupBaseType, assocType);
-          if (shouldAttemptFixes() &&
-              getPhase() == ConstraintSystemPhase::Solving) {
-            return PlaceholderType::get(getASTContext(), memberTy);
+          if (CS.shouldAttemptFixes() &&
+              CS.getPhase() == ConstraintSystemPhase::Solving) {
+            return PlaceholderType::get(CS.getASTContext(), memberTy);
           }
 
           return memberTy;
@@ -3673,10 +4007,17 @@ Type ConstraintSystem::simplifyTypeImpl(Type type,
     }
 
     return type;
-  });
+  }
+};
+
+} // end anonymous namespace
+
+Type ConstraintSystem::simplifyTypeImpl(Type type,
+    llvm::function_ref<Type(TypeVariableType *)> getFixedTypeFn) {
+  return type.transform(TypeSimplifier(*this, getFixedTypeFn));
 }
 
-Type ConstraintSystem::simplifyType(Type type) const {
+Type ConstraintSystem::simplifyType(Type type) {
   if (!type->hasTypeVariable())
     return type;
 
@@ -3745,7 +4086,7 @@ Type Solution::simplifyTypeForCodeCompletion(Type Ty) const {
 
   // Replace all type variables (which must come from placeholders) by their
   // generic parameters. Because we call into simplifyTypeImpl
-  Ty = CS.simplifyTypeImpl(Ty, [&CS](TypeVariableType *typeVar) -> Type {
+  Ty = CS.simplifyTypeImpl(Ty, [&CS, this](TypeVariableType *typeVar) -> Type {
     // Code completion depends on generic parameter type being represented in
     // terms of `ArchetypeType` since it's easy to extract protocol requirements
     // from it.
@@ -3760,6 +4101,29 @@ Type Solution::simplifyTypeForCodeCompletion(Type Ty) const {
 
     if (auto archetype = getTypeVarAsArchetype(typeVar)) {
       return archetype;
+    }
+
+    // Sometimes the type variable itself doesn't have have an originator that
+    // can be replaced by an archetype but one of its equivalent type variable
+    // does.
+    // Search thorough all equivalent type variables, looking for one that can
+    // be replaced by a generic parameter.
+    std::vector<std::pair<TypeVariableType *, Type>> bindings(
+        typeBindings.begin(), typeBindings.end());
+    // Make sure we iterate the bindings in a deterministic order.
+    llvm::sort(bindings, [](const std::pair<TypeVariableType *, Type> &lhs,
+                            const std::pair<TypeVariableType *, Type> &rhs) {
+      return lhs.first->getID() < rhs.first->getID();
+    });
+    for (auto binding : bindings) {
+      if (auto placeholder = binding.second->getAs<PlaceholderType>()) {
+        if (placeholder->getOriginator().dyn_cast<TypeVariableType *>() ==
+            typeVar) {
+          if (auto archetype = getTypeVarAsArchetype(binding.first)) {
+            return archetype;
+          }
+        }
+      }
     }
 
     // When applying the logic below to get contextual types inside result
@@ -3824,13 +4188,35 @@ Type Solution::simplifyTypeForCodeCompletion(Type Ty) const {
   return Ty->getRValueType();
 }
 
+template <typename T>
+static inline size_t size_in_bytes(const T &x) {
+  return (x.size() * (sizeof(typename T::key_type) + sizeof(unsigned))) +
+         (x.size() * (sizeof(typename T::value_type)));
+}
+
 size_t Solution::getTotalMemory() const {
   return sizeof(*this) + typeBindings.getMemorySize() +
          overloadChoices.getMemorySize() +
          ConstraintRestrictions.getMemorySize() +
-         llvm::capacity_in_bytes(Fixes) + DisjunctionChoices.getMemorySize() +
+         (Fixes.size() * sizeof(void *)) + DisjunctionChoices.getMemorySize() +
          OpenedTypes.getMemorySize() + OpenedExistentialTypes.getMemorySize() +
+         OpenedPackExpansionTypes.getMemorySize() +
+         PackExpansionEnvironments.getMemorySize() +
+         size_in_bytes(PackEnvironments) +
          (DefaultedConstraints.size() * sizeof(void *)) +
+         ImplicitCallAsFunctionRoots.getMemorySize() +
+         nodeTypes.getMemorySize() +
+         keyPathComponentTypes.getMemorySize() +
+         size_in_bytes(KeyPaths) +
+         (contextualTypes.size() * sizeof(ASTNode))  +
+         size_in_bytes(targets) +
+         size_in_bytes(caseLabelItems) +
+         size_in_bytes(exprPatterns) +
+         (isolatedParams.size() * sizeof(void *)) +
+         (preconcurrencyClosures.size() * sizeof(void *)) +
+         size_in_bytes(resultBuilderTransformed) +
+         size_in_bytes(appliedPropertyWrappers) +
+         size_in_bytes(argumentLists) +
          ImplicitCallAsFunctionRoots.getMemorySize();
 }
 
@@ -3855,6 +4241,7 @@ DeclName OverloadChoice::getName() const {
     case OverloadChoiceKind::KeyPathDynamicMemberLookup:
       return DeclName(DynamicMember.getPointer());
 
+    case OverloadChoiceKind::MaterializePack:
     case OverloadChoiceKind::TupleIndex:
       llvm_unreachable("no name!");
   }
@@ -3862,12 +4249,12 @@ DeclName OverloadChoice::getName() const {
   llvm_unreachable("Unhandled OverloadChoiceKind in switch.");
 }
 
-Optional<IUOReferenceKind>
+llvm::Optional<IUOReferenceKind>
 OverloadChoice::getIUOReferenceKind(ConstraintSystem &cs,
                                     bool forSecondApplication) const {
   auto *decl = getDeclOrNull();
   if (!decl || !decl->isImplicitlyUnwrappedOptional())
-    return None;
+    return llvm::None;
 
   // If this isn't an IUO return () -> T!, it's an IUO value.
   if (!decl->getInterfaceType()->is<AnyFunctionType>())
@@ -3880,7 +4267,7 @@ OverloadChoice::getIUOReferenceKind(ConstraintSystem &cs,
   case FunctionRefKind::Unapplied:
   case FunctionRefKind::Compound:
     // Such references never produce IUOs.
-    return None;
+    return llvm::None;
   case FunctionRefKind::SingleApply:
   case FunctionRefKind::DoubleApply: {
     // Check whether this is a curried function reference e.g
@@ -3888,7 +4275,7 @@ OverloadChoice::getIUOReferenceKind(ConstraintSystem &cs,
     // an IUO on the second application.
     auto isCurried = decl->hasCurriedSelf() && !hasAppliedSelf(cs, *this);
     if (forSecondApplication != isCurried)
-      return None;
+      return llvm::None;
     break;
   }
   }
@@ -3954,7 +4341,7 @@ SolutionResult ConstraintSystem::salvage() {
         int i = 0;
         for (auto &solution : viable) {
           log << "---Ambiguous solution #" << i++ << "---\n";
-          solution.dump(log);
+          solution.dump(log, solverState->getCurrentIndent());
           log << "\n";
         }
       }
@@ -4037,9 +4424,28 @@ static void diagnoseOperatorAmbiguity(ConstraintSystem &cs,
     if (overloadType->hasTypeVariable())
       continue;
 
-    if (auto *fnType = overloadType->getAs<FunctionType>())
-      parameters.insert(
-          FunctionType::getParamListAsString(fnType->getParams()));
+    auto overloadFnTy = overloadType->getAs<FunctionType>();
+    if (!overloadFnTy)
+      continue;
+
+    // If arguments to all parameters have been fixed then there is nothing
+    // to note about in this overload.
+    std::set<unsigned> fixedParams;
+    llvm::for_each(solution.Fixes, [&](const ConstraintFix *fix) {
+      auto *locator = fix->getLocator();
+      if (getAsExpr(locator->getAnchor()) != applyExpr)
+        return;
+
+      if (auto argLoc = locator->findLast<LocatorPathElt::ApplyArgToParam>()) {
+        fixedParams.insert(argLoc->getParamIdx());
+      }
+    });
+
+    if (fixedParams.size() == overloadFnTy->getNumParams())
+      continue;
+
+    parameters.insert(
+        FunctionType::getParamListAsString(overloadFnTy->getParams()));
   }
 
   // All of the overload choices had generic parameters like `Self`.
@@ -4208,6 +4614,12 @@ static bool diagnoseConflictingGenericArguments(ConstraintSystem &cs,
     std::tie(GP, loc) = conflict.first;
     auto conflictingArguments = conflict.second;
 
+    // If there are any substitutions that are not fully resolved
+    // solutions cannot be considered conflicting for the given parameter.
+    if (llvm::any_of(conflictingArguments,
+                     [](const auto &arg) { return arg->hasPlaceholder(); }))
+      continue;
+
     llvm::SmallString<64> arguments;
     llvm::raw_svector_ostream OS(arguments);
 
@@ -4326,7 +4738,15 @@ static bool diagnoseAmbiguityWithContextualType(
   auto name = result->choices.front().getName();
   auto contextualTy = solution.getContextualType(anchor);
 
-  assert(contextualTy);
+  // In some situations `getContextualType` for a contextual type
+  // locator is going to return then empty type. This happens because
+  // e.g. optional-some patterns and patterns with incorrect type don't
+  // have a contextual type for initialization expression but use
+  // a conversion with contextual locator nevertheless to indicate
+  // the purpose. This doesn't affect non-ambiguity diagnostics
+  // because mismatches carry both `from` and `to` types.
+  if (!contextualTy)
+    return false;
 
   DE.diagnose(getLoc(anchor),
               contextualTy->is<ProtocolType>()
@@ -4346,11 +4766,71 @@ static bool diagnoseAmbiguityWithContextualType(
             contextualTy->is<ProtocolType>()
                 ? diag::overload_result_type_does_not_conform
                 : diag::cannot_convert_candidate_result_to_contextual_type,
-            decl->getName(), fnType->getResult(), contextualTy);
+            decl, fnType->getResult(), contextualTy);
       } else {
         DE.diagnose(decl, diag::found_candidate_type, type);
       }
     }
+  }
+
+  return true;
+}
+
+/// Diagnose problems with generic requirement fixes that are anchored on
+/// one callee location. The list could contain different kinds of fixes
+/// i.e. missing protocol conformances at different positions,
+/// same-type requirement mismatches, etc.
+static bool diagnoseAmbiguityWithGenericRequirements(
+    ConstraintSystem &cs,
+    ArrayRef<std::pair<const Solution *, const ConstraintFix *>> aggregate) {
+  // If all of the fixes point to the same overload choice,
+  // we can diagnose this an a single error.
+  bool hasNonDeclOverloads = false;
+
+  llvm::SmallSet<ValueDecl *, 4> overloadChoices;
+  for (const auto &entry : aggregate) {
+    const auto &solution = *entry.first;
+    auto *calleeLocator = solution.getCalleeLocator(entry.second->getLocator());
+
+    if (auto overload = solution.getOverloadChoiceIfAvailable(calleeLocator)) {
+      if (auto *D = overload->choice.getDeclOrNull()) {
+        overloadChoices.insert(D);
+      } else {
+        hasNonDeclOverloads = true;
+      }
+    }
+  }
+
+  auto &primaryFix = aggregate.front();
+  {
+    if (overloadChoices.size() > 0) {
+      // Some of the choices are non-declaration,
+      // let's delegate that to ambiguity diagnostics.
+      if (hasNonDeclOverloads)
+        return false;
+
+      if (overloadChoices.size() == 1)
+        return primaryFix.second->diagnose(*primaryFix.first);
+
+      // fall through to the tailored ambiguity diagnostic.
+    } else {
+      // If there are no overload choices it means that
+      // the issue is with types, delegate that to the primary fix.
+      return primaryFix.second->diagnoseForAmbiguity(aggregate);
+    }
+  }
+
+  // Produce "no exact matches" diagnostic.
+  auto &ctx = cs.getASTContext();
+  auto *choice = *overloadChoices.begin();
+
+  ctx.Diags.diagnose(getLoc(primaryFix.second->getLocator()->getAnchor()),
+                     diag::no_overloads_match_exactly_in_call,
+                     /*isApplication=*/false, choice,
+                     choice->getName().isSpecial());
+
+  for (const auto &entry : aggregate) {
+    entry.second->diagnose(*entry.first, /*asNote=*/true);
   }
 
   return true;
@@ -4440,8 +4920,7 @@ static bool diagnoseAmbiguity(
       }
 
       DE.diagnose(anchor->getLoc(), diag::no_overloads_match_exactly_in_call,
-                  /*isApplication=*/false, decl->getDescriptiveKind(),
-                  name.isSpecial(), name.getBaseName());
+                  /*isApplication=*/false, decl, name.isSpecial());
     } else {
       bool isApplication = llvm::any_of(solutions, [&](const auto &S) {
           return llvm::any_of(S.argumentLists, [&](const auto &pair) {
@@ -4451,8 +4930,7 @@ static bool diagnoseAmbiguity(
 
       DE.diagnose(getLoc(commonAnchor),
                   diag::no_overloads_match_exactly_in_call, isApplication,
-                  decl->getDescriptiveKind(), name.isSpecial(),
-                  name.getBaseName());
+                  decl, name.isSpecial());
     }
 
     // Produce candidate notes
@@ -4469,13 +4947,34 @@ static bool diagnoseAmbiguity(
       auto noteLoc =
           decl->getLoc().isInvalid() ? getLoc(commonAnchor) : decl->getLoc();
 
-      if (solution.Fixes.size() == 1) {
-        diagnosed &=
-            solution.Fixes.front()->diagnose(solution, /*asNote*/ true);
-      } else if (llvm::all_of(solution.Fixes, [&](ConstraintFix *fix) {
+      SmallVector<const ConstraintFix *, 4> fixes;
+      for (const auto &entry : aggregateFix) {
+        if (entry.first == &solution)
+          fixes.push_back(entry.second);
+      }
+
+      auto emitGeneralFoundCandidateNote = [&]() {
+        // Emit a general "found candidate" note
+        if (decl->getLoc().isInvalid()) {
+          if (candidateTypes.insert(type->getCanonicalType()).second)
+            DE.diagnose(getLoc(commonAnchor), diag::found_candidate_type, type);
+        } else {
+          DE.diagnose(noteLoc, diag::found_candidate);
+        }
+      };
+
+      if (fixes.size() == 1) {
+        diagnosed &= fixes.front()->diagnose(solution, /*asNote*/ true);
+      } else if (!fixes.empty() &&
+                 llvm::all_of(fixes, [&](const ConstraintFix *fix) {
+                   // Ignore coercion fixes in this context, to
+                   // focus on the argument mismatches.
+                   if (fix->getLocator()->isForCoercion())
+                     return true;
+
                    return fix->getLocator()
                        ->findLast<LocatorPathElt::ApplyArgument>()
-                       .hasValue();
+                       .has_value();
                  })) {
         // All fixes have to do with arguments, so let's show the parameter
         // lists.
@@ -4486,29 +4985,34 @@ static bool diagnoseAmbiguity(
             type->lookThroughAllOptionalTypes()->getAs<AnyFunctionType>();
         assert(fn);
 
-        auto *argList =
-            solution.getArgumentList(solution.Fixes.front()->getLocator());
-        assert(argList);
+        auto first = llvm::find_if(fixes, [&](const ConstraintFix *fix) {
+          return fix->getLocator()
+              ->findLast<LocatorPathElt::ApplyArgument>()
+              .has_value();
+        });
 
-        if (fn->getNumParams() == 1 && argList->isUnary()) {
-          const auto &param = fn->getParams()[0];
-          auto argTy = solution.getResolvedType(argList->getUnaryExpr());
+        if (first != fixes.end()) {
+          auto *argList = solution.getArgumentList((*first)->getLocator());
+          assert(argList);
 
-          DE.diagnose(noteLoc, diag::candidate_has_invalid_argument_at_position,
-                      solution.simplifyType(param.getPlainType()),
-                      /*position=*/1, param.isInOut(), argTy);
+          if (fn->getNumParams() == 1 && argList->isUnary()) {
+            const auto &param = fn->getParams()[0];
+            auto argTy = solution.getResolvedType(argList->getUnaryExpr());
+
+            DE.diagnose(noteLoc,
+                        diag::candidate_has_invalid_argument_at_position,
+                        solution.simplifyType(param.getPlainType()),
+                        /*position=*/1, param.isInOut(), argTy);
+          } else {
+            DE.diagnose(noteLoc, diag::candidate_partial_match,
+                        fn->getParamListAsString(fn->getParams()));
+          }
         } else {
-          DE.diagnose(noteLoc, diag::candidate_partial_match,
-                      fn->getParamListAsString(fn->getParams()));
+          // Only coercion ambiguity fixes.
+          emitGeneralFoundCandidateNote();
         }
       } else {
-        // Emit a general "found candidate" note
-        if (decl->getLoc().isInvalid()) {
-          if (candidateTypes.insert(type->getCanonicalType()).second)
-            DE.diagnose(getLoc(commonAnchor), diag::found_candidate_type, type);
-        } else {
-          DE.diagnose(noteLoc, diag::found_candidate);
-        }
+        emitGeneralFoundCandidateNote();
       }
     }
 
@@ -4688,13 +5192,15 @@ bool ConstraintSystem::diagnoseAmbiguityWithFixes(
     return true;
 
   if (isDebugMode()) {
-    auto &log = llvm::errs();
+    auto indent = solverState->getCurrentIndent();
+    auto &log = llvm::errs().indent(indent);
     log << "--- Ambiguity: Considering #" << solutions.size()
         << " solutions with fixes ---\n";
     int i = 0;
     for (auto &solution : solutions) {
-      log << "\n--- Solution #" << i++ << "---\n";
-      solution.dump(log);
+      log << "\n";
+      log.indent(indent) << "--- Solution #" << i++ << "---\n";
+      solution.dump(log, indent);
       log << "\n";
     }
   }
@@ -4777,14 +5283,80 @@ bool ConstraintSystem::diagnoseAmbiguityWithFixes(
   // overload choices.
   fixes.set_subtract(consideredFixes);
 
+  // Aggregate all requirement fixes that belong to the same callee
+  // and attempt to diagnose possible ambiguities.
+  {
+    auto isResultBuilderMethodRef = [&](ASTNode node) {
+      auto *UDE = getAsExpr<UnresolvedDotExpr>(node);
+      if (!(UDE && UDE->isImplicit()))
+        return false;
+
+      auto &ctx = getASTContext();
+      SmallVector<Identifier, 4> builderMethods(
+          {ctx.Id_buildBlock, ctx.Id_buildExpression, ctx.Id_buildPartialBlock,
+           ctx.Id_buildFinalResult});
+
+      return llvm::any_of(builderMethods, [&](const Identifier &methodId) {
+        return UDE->getName().compare(DeclNameRef(methodId)) == 0;
+      });
+    };
+
+    // Aggregates fixes fixes attached to `buildExpression` and `buildBlock`
+    // methods at the particular source location.
+    llvm::MapVector<SourceLoc, SmallVector<FixInContext, 4>>
+        builderMethodRequirementFixes;
+
+    llvm::MapVector<ConstraintLocator *, SmallVector<FixInContext, 4>>
+        perCalleeRequirementFixes;
+
+    for (const auto &entry : fixes) {
+      auto *fix = entry.second;
+      if (!fix->getLocator()->isLastElement<LocatorPathElt::AnyRequirement>())
+        continue;
+
+      auto *calleeLoc = entry.first->getCalleeLocator(fix->getLocator());
+
+      if (isResultBuilderMethodRef(calleeLoc->getAnchor())) {
+        auto *anchor = castToExpr<Expr>(calleeLoc->getAnchor());
+        builderMethodRequirementFixes[anchor->getLoc()].push_back(entry);
+      } else {
+        perCalleeRequirementFixes[calleeLoc].push_back(entry);
+      }
+    }
+
+    SmallVector<SmallVector<FixInContext, 4>, 4> viableGroups;
+    {
+      auto takeAggregateIfViable =
+          [&](SmallVector<FixInContext, 4> &aggregate) {
+            // Ambiguity only if all of the solutions have a requirement
+            // fix at the given location.
+            if (aggregate.size() == solutions.size())
+              viableGroups.push_back(std::move(aggregate));
+          };
+
+      for (auto &entry : builderMethodRequirementFixes)
+        takeAggregateIfViable(entry.second);
+
+      for (auto &entry : perCalleeRequirementFixes)
+        takeAggregateIfViable(entry.second);
+    }
+
+    for (auto &aggregate : viableGroups) {
+      if (diagnoseAmbiguityWithGenericRequirements(*this, aggregate)) {
+        // Remove diagnosed fixes.
+        fixes.set_subtract(aggregate);
+        diagnosed = true;
+      }
+    }
+  }
+
   llvm::MapVector<std::pair<FixKind, ConstraintLocator *>,
                   SmallVector<FixInContext, 4>>
       fixesByKind;
 
   for (const auto &entry : fixes) {
     const auto *fix = entry.second;
-    fixesByKind[{fix->getKind(), fix->getLocator()}].push_back(
-        {entry.first, fix});
+    fixesByKind[{fix->getKind(), fix->getLocator()}].push_back(entry);
   }
 
   // If leftover fix is contained in all of the solutions let's
@@ -4813,12 +5385,18 @@ bool ConstraintSystem::diagnoseAmbiguityWithFixes(
 /// provided set.
 static unsigned countDistinctOverloads(ArrayRef<OverloadChoice> choices) {
   llvm::SmallPtrSet<void *, 4> uniqueChoices;
-  unsigned result = 0;
   for (auto choice : choices) {
-    if (uniqueChoices.insert(choice.getOpaqueChoiceSimple()).second)
-      ++result;
+    uniqueChoices.insert(choice.getOpaqueChoiceSimple());
   }
-  return result;
+  return uniqueChoices.size();
+}
+
+static Type getOverloadChoiceType(ConstraintLocator *overloadLoc,
+                                  const Solution &solution) {
+  auto selectedOverload = solution.overloadChoices.find(overloadLoc);
+  if (selectedOverload == solution.overloadChoices.end())
+    return Type();
+  return solution.simplifyType(selectedOverload->second.adjustedOpenedType);
 }
 
 /// Determine the name of the overload in a set of overload choices.
@@ -4857,6 +5435,10 @@ static void extendPreorderIndexMap(
     explicit RecordingTraversal(llvm::DenseMap<Expr *, unsigned> &indexMap)
       : IndexMap(indexMap) { }
 
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::ArgumentsAndExpansion;
+    }
+
     PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
       IndexMap[E] = Index;
       ++Index;
@@ -4873,7 +5455,7 @@ bool ConstraintSystem::diagnoseAmbiguity(ArrayRef<Solution> solutions) {
   SolutionDiff diff(solutions);
 
   // Find the locators which have the largest numbers of distinct overloads.
-  Optional<unsigned> bestOverload;
+  llvm::Optional<unsigned> bestOverload;
   // Overloads are scored by lexicographical comparison of (# of distinct
   // overloads, depth, *reverse* of the index). N.B. - cannot be used for the
   // reversing: the score version of index == 0 should be > than that of 1, but
@@ -4895,6 +5477,25 @@ bool ConstraintSystem::diagnoseAmbiguity(ArrayRef<Solution> solutions) {
   for (unsigned i = 0, n = diff.overloads.size(); i != n; ++i) {
     auto &overload = diff.overloads[i];
     auto *locator = overload.locator;
+
+    // If there is only one overload difference, it's the best.
+    if (n == 1) {
+      bestOverload = i;
+      break;
+    }
+
+    // If there are multiple overload sets involved, let's pick the
+    // one that has choices with different types, because that is
+    // most likely the source of ambiguity.
+    {
+      auto overloadTy = getOverloadChoiceType(locator, solutions.front());
+      if (std::all_of(solutions.begin() + 1, solutions.end(),
+                      [&](const Solution &solution) {
+                        return overloadTy->isEqual(
+                          getOverloadChoiceType(locator, solution));
+                      }))
+        continue;
+    }
 
     ASTNode anchor;
 
@@ -5010,6 +5611,7 @@ bool ConstraintSystem::diagnoseAmbiguity(ArrayRef<Solution> solutions) {
         break;
 
       case OverloadChoiceKind::TupleIndex:
+      case OverloadChoiceKind::MaterializePack:
         // FIXME: Actually diagnose something here.
         break;
       }
@@ -5118,6 +5720,7 @@ void constraints::simplifyLocator(ASTNode &anchor,
       continue;
 
    case ConstraintLocator::TupleType:
+   case ConstraintLocator::GenericType:
       path = path.slice(1);
       continue;
 
@@ -5145,6 +5748,13 @@ void constraints::simplifyLocator(ASTNode &anchor,
     }
 
     case ConstraintLocator::ConstructorMember:
+      // Look through specialization first, because it doesn't play a
+      // functional role here.
+      if (auto *USE = getAsExpr<UnresolvedSpecializeExpr>(anchor)) {
+        anchor = USE->getSubExpr();
+        range = anchor.getSourceRange();
+      }
+
       // - This is really an implicit 'init' MemberRef, so point at the base,
       //   i.e. the TypeExpr.
       // - For re-declarations we'd get an overloaded reference
@@ -5157,6 +5767,15 @@ void constraints::simplifyLocator(ASTNode &anchor,
       LLVM_FALLTHROUGH;
 
     case ConstraintLocator::Member:
+      if (auto UDE = getAsExpr<UnresolvedDotExpr>(anchor)) {
+        path = path.slice(1);
+        continue;
+      }
+      if (anchor.is<Pattern *>()) {
+        path = path.slice(1);
+        continue;
+      }
+      break;
     case ConstraintLocator::MemberRefBase:
       if (auto UDE = getAsExpr<UnresolvedDotExpr>(anchor)) {
         range = UDE->getNameLoc().getSourceRange();
@@ -5190,10 +5809,35 @@ void constraints::simplifyLocator(ASTNode &anchor,
       }
       break;
 
-    case ConstraintLocator::ContextualType:
+    case ConstraintLocator::ClosureThrownError:
+      if (auto CE = getAsExpr<ClosureExpr>(anchor)) {
+        if (auto thrownTypeRepr = CE->getExplicitThrownTypeRepr()) {
+          anchor = thrownTypeRepr;
+          path = path.slice(1);
+          break;
+        }
+      }
+      break;
+
+    case ConstraintLocator::CoercionOperand: {
+      auto *CE = castToExpr<CoerceExpr>(anchor);
+      anchor = CE->getSubExpr()->getValueProvidingExpr();
+      path = path.slice(1);
+      // When in a argument function type on a coercion context
+      // look past the argument, because is just for identify the
+      // argument type that is being matched.
+      if (!path.empty() && path[0].is<LocatorPathElt::FunctionArgument>()) {
+        path = path.slice(1);
+      }
+      continue;
+    }
+
+    case ConstraintLocator::GlobalActorType:
+    case ConstraintLocator::ContextualType: {
       // This was just for identifying purposes, strip it off.
       path = path.slice(1);
       continue;
+    }
 
     case ConstraintLocator::KeyPathComponent: {
       auto elt = path[0].castTo<LocatorPathElt::KeyPathComponent>();
@@ -5249,6 +5893,16 @@ void constraints::simplifyLocator(ASTNode &anchor,
       continue;
     }
 
+    case ConstraintLocator::SingleValueStmtResult: {
+      auto branchElt = path[0].castTo<LocatorPathElt::SingleValueStmtResult>();
+      auto exprIdx = branchElt.getIndex();
+      auto *SVE = castToExpr<SingleValueStmtExpr>(anchor);
+      SmallVector<Expr *, 4> scratch;
+      anchor = SVE->getResultExprs(scratch)[exprIdx];
+      path = path.slice(1);
+      continue;
+    }
+
     case ConstraintLocator::KeyPathDynamicMember:
     case ConstraintLocator::ImplicitDynamicMemberSubscript: {
       // Key path dynamic member lookup should be completely transparent.
@@ -5285,6 +5939,11 @@ void constraints::simplifyLocator(ASTNode &anchor,
     case ConstraintLocator::PatternMatch: {
       auto patternElt = path[0].castTo<LocatorPathElt::PatternMatch>();
       anchor = patternElt.getPattern();
+      path = path.slice(1);
+      continue;
+    }
+
+    case ConstraintLocator::EnumPatternImplicitCastMatch: {
       path = path.slice(1);
       continue;
     }
@@ -5328,6 +5987,7 @@ void constraints::simplifyLocator(ASTNode &anchor,
 
     case ConstraintLocator::PackElement:
     case ConstraintLocator::PackShape:
+    case ConstraintLocator::PackExpansionType:
       break;
 
     case ConstraintLocator::PackExpansionPattern: {
@@ -5450,15 +6110,12 @@ bool constraints::hasAppliedSelf(const OverloadChoice &choice,
 /// Check whether given type conforms to `RawRepresentable` protocol
 /// and return the witness type.
 Type constraints::isRawRepresentable(ConstraintSystem &cs, Type type) {
-  auto *DC = cs.DC;
-
   auto rawReprType = TypeChecker::getProtocol(
       cs.getASTContext(), SourceLoc(), KnownProtocolKind::RawRepresentable);
   if (!rawReprType)
     return Type();
 
-  auto conformance = TypeChecker::conformsToProtocol(type, rawReprType,
-                                                     DC->getParentModule());
+  auto conformance = cs.lookupConformance(type, rawReprType);
   if (conformance.isInvalid())
     return Type();
 
@@ -5468,7 +6125,7 @@ Type constraints::isRawRepresentable(ConstraintSystem &cs, Type type) {
 void ConstraintSystem::generateConstraints(
     SmallVectorImpl<Constraint *> &constraints, Type type,
     ArrayRef<OverloadChoice> choices, DeclContext *useDC,
-    ConstraintLocator *locator, Optional<unsigned> favoredIndex,
+    ConstraintLocator *locator, llvm::Optional<unsigned> favoredIndex,
     bool requiresFix,
     llvm::function_ref<ConstraintFix *(unsigned, const OverloadChoice &)>
         getFix) {
@@ -5642,14 +6299,14 @@ Type Solution::resolveInterfaceType(Type type) const {
   return resolvedType;
 }
 
-Optional<FunctionArgApplyInfo>
+llvm::Optional<FunctionArgApplyInfo>
 Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
   // It's only valid to use `&` in argument positions, but we need
   // to figure out exactly where it was used.
   if (auto *argExpr = getAsExpr<InOutExpr>(locator->getAnchor())) {
     auto *argLoc = getConstraintSystem().getArgumentLocator(argExpr);
     if (!argLoc)
-      return None;
+      return llvm::None;
 
     locator = argLoc;
   }
@@ -5664,7 +6321,7 @@ Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
   auto iter = path.rbegin();
   auto applyArgElt = locator->findLast<LocatorPathElt::ApplyArgToParam>(iter);
   if (!applyArgElt)
-    return None;
+    return llvm::None;
 
 #ifndef NDEBUG
   auto nextIter = iter + 1;
@@ -5682,13 +6339,13 @@ Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
   // If we were unable to simplify down to the argument expression, we don't
   // know what this is.
   if (!argExpr)
-    return None;
+    return llvm::None;
 
   auto *argList = getArgumentList(argLocator);
   if (!argList)
-    return None;
+    return llvm::None;
 
-  Optional<OverloadChoice> choice;
+  llvm::Optional<OverloadChoice> choice;
   Type rawFnType;
   auto *calleeLocator = getCalleeLocator(argLocator);
   if (auto overload = getOverloadChoiceIfAvailable(calleeLocator)) {
@@ -5706,13 +6363,13 @@ Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
     // issues e.g. it's a reference to an invalid member
     // let's just return here.
     if (simplifyType(rawFnType)->is<UnresolvedType>())
-      return None;
+      return llvm::None;
 
     // A tuple construction is spelled in the AST as a function call, but
     // is really more like a tuple conversion.
     if (auto metaTy = simplifyType(rawFnType)->getAs<MetatypeType>()) {
       if (metaTy->getInstanceType()->is<TupleType>())
-        return None;
+        return llvm::None;
     }
 
     assert(!shouldHaveDirectCalleeOverload(call) &&
@@ -5726,7 +6383,7 @@ Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
                      ->lookThroughAllOptionalTypes()
                      ->getAs<FunctionType>();
   if (!fnType)
-    return None;
+    return llvm::None;
 
   // Resolve the interface type for the function. Note that this may not be a
   // function type, for example it could be a generic parameter.
@@ -5748,11 +6405,18 @@ Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
             *choice, [this](Type type) -> Type { return simplifyType(type); }))
       fnInterfaceType = fnInterfaceType->castTo<AnyFunctionType>()->getResult();
 
+#ifndef NDEBUG
+    // If variadic generics are not involved, interface type should
+    // always match applied type.
     if (auto *fn = fnInterfaceType->getAs<AnyFunctionType>()) {
-      assert(fn->getNumParams() == fnType->getNumParams() &&
-             "Parameter mismatch?");
-      (void)fn;
+      if (llvm::none_of(fn->getParams(), [&](const auto &param) {
+            return param.getPlainType()->hasParameterPack();
+          })) {
+        assert(fn->getNumParams() == fnType->getNumParams() &&
+               "Parameter mismatch?");
+      }
     }
+#endif
   } else {
     fnInterfaceType = resolveInterfaceType(rawFnType);
   }
@@ -5790,7 +6454,7 @@ Type constraints::getConcreteReplacementForProtocolSelfType(ValueDecl *member) {
     signature = DC->getGenericSignatureOfContext();
   }
 
-  auto selfTy = DC->getProtocolSelfType();
+  auto selfTy = DC->getSelfInterfaceType();
   return signature->getConcreteType(selfTy);
 }
 
@@ -5799,20 +6463,20 @@ static bool isOperator(Expr *expr, StringRef expectedName) {
   return name ? name->is(expectedName) : false;
 }
 
-Optional<Identifier> constraints::getOperatorName(Expr *expr) {
+llvm::Optional<Identifier> constraints::getOperatorName(Expr *expr) {
   ValueDecl *choice = nullptr;
   if (auto *ODRE = dyn_cast_or_null<OverloadedDeclRefExpr>(expr)) {
     choice = ODRE->getDecls().front();
   } else if (auto *DRE = dyn_cast_or_null<DeclRefExpr>(expr)) {
     choice = DRE->getDecl();
   } else {
-    return None;
+    return llvm::None;
   }
 
   if (auto *FD = dyn_cast_or_null<AbstractFunctionDecl>(choice))
     return FD->getBaseIdentifier();
 
-  return None;
+  return llvm::None;
 }
 
 bool constraints::isPatternMatchingOperator(ASTNode node) {
@@ -5940,6 +6604,7 @@ ConstraintSystem::isConversionEphemeral(ConversionRestrictionKind conversion,
                                         ConstraintLocatorBuilder locator) {
   switch (conversion) {
   case ConversionRestrictionKind::ArrayToPointer:
+  case ConversionRestrictionKind::ArrayToCPointer:
   case ConversionRestrictionKind::StringToPointer:
     // Always ephemeral.
     return ConversionEphemeralness::Ephemeral;
@@ -6105,8 +6770,7 @@ Expr *ConstraintSystem::buildAutoClosureExpr(Expr *expr,
                          ->castTo<FunctionType>();
 
   auto *closure = new (Context)
-      AutoClosureExpr(expr, newClosureType,
-                      AutoClosureExpr::InvalidDiscriminator, ClosureContext);
+      AutoClosureExpr(expr, newClosureType, ClosureContext);
 
   closure->setParameterList(ParameterList::createEmpty(Context));
 
@@ -6176,9 +6840,9 @@ ValueDecl *ConstraintSystem::findResolvedMemberRef(ConstraintLocator *locator) {
   return choice.getDecl();
 }
 
-void SolutionApplicationTargetsKey::dump() const { dump(llvm::errs()); }
+void SyntacticElementTargetKey::dump() const { dump(llvm::errs()); }
 
-void SolutionApplicationTargetsKey::dump(raw_ostream &OS) const {
+void SyntacticElementTargetKey::dump(raw_ostream &OS) const {
   switch (kind) {
   case Kind::empty:
     OS << "<empty>\n";
@@ -6224,265 +6888,12 @@ void SolutionApplicationTargetsKey::dump(raw_ostream &OS) const {
   llvm_unreachable("invalid statement kind");
 }
 
-SolutionApplicationTarget::SolutionApplicationTarget(
-    Expr *expr, DeclContext *dc, ContextualTypePurpose contextualPurpose,
-    TypeLoc convertType, bool isDiscarded) {
-  // Verify that a purpose was specified if a convertType was.  Note that it is
-  // ok to have a purpose without a convertType (which is used for call
-  // return types).
-  assert((!convertType.getType() || contextualPurpose != CTP_Unused) &&
-         "Purpose for conversion type was not specified");
-
-  // Take a look at the conversion type to check to make sure it is sensible.
-  if (auto type = convertType.getType()) {
-    // If we're asked to convert to an UnresolvedType, then ignore the request.
-    // This happens when CSDiags nukes a type.
-    if (type->is<UnresolvedType>() ||
-        (type->is<MetatypeType>() && type->hasUnresolvedType())) {
-      convertType = TypeLoc();
-      contextualPurpose = CTP_Unused;
-    }
-  }
-
-  kind = Kind::expression;
-  expression.expression = expr;
-  expression.dc = dc;
-  expression.contextualPurpose = contextualPurpose;
-  expression.convertType = convertType;
-  expression.pattern = nullptr;
-  expression.propertyWrapper.wrappedVar = nullptr;
-  expression.propertyWrapper.innermostWrappedValueInit = nullptr;
-  expression.propertyWrapper.hasInitialWrappedValue = false;
-  expression.isDiscarded = isDiscarded;
-  expression.bindPatternVarsOneWay = false;
-  expression.initialization.patternBinding = nullptr;
-  expression.initialization.patternBindingIndex = 0;
-}
-
-void SolutionApplicationTarget::maybeApplyPropertyWrapper() {
-  assert(kind == Kind::expression);
-  assert(expression.contextualPurpose == CTP_Initialization);
-
-  VarDecl *singleVar;
-  if (auto *pattern = expression.pattern) {
-    singleVar = pattern->getSingleVar();
-  } else {
-    singleVar = expression.propertyWrapper.wrappedVar;
-  }
-
-  if (!singleVar)
-    return;
-
-  auto wrapperAttrs = singleVar->getAttachedPropertyWrappers();
-  if (wrapperAttrs.empty())
-    return;
-
-  // If the outermost property wrapper is directly initialized, form the
-  // call.
-  auto &ctx = singleVar->getASTContext();
-  auto outermostWrapperAttr = wrapperAttrs.front();
-  Expr *backingInitializer;
-  if (Expr *initializer = expression.expression) {
-    if (!isa<PropertyWrapperValuePlaceholderExpr>(initializer)) {
-      expression.propertyWrapper.hasInitialWrappedValue = true;
-    }
-    // Form init(wrappedValue:) call(s).
-    Expr *wrappedInitializer = buildPropertyWrapperInitCall(
-        singleVar, Type(), initializer, PropertyWrapperInitKind::WrappedValue,
-        [&](ApplyExpr *innermostInit) {
-          expression.propertyWrapper.innermostWrappedValueInit = innermostInit;
-        });
-    if (!wrappedInitializer)
-      return;
-
-    backingInitializer = wrappedInitializer;
-  } else {
-    Type outermostWrapperType =
-        singleVar->getAttachedPropertyWrapperType(0);
-    if (!outermostWrapperType)
-      return;
-
-    bool isImplicit = false;
-
-    // Retrieve the outermost wrapper argument. If there isn't one, we're
-    // performing default initialization.
-    auto outermostArgs = outermostWrapperAttr->getArgs();
-    if (!outermostArgs) {
-      SourceLoc fakeParenLoc = outermostWrapperAttr->getRange().End;
-      outermostArgs = ArgumentList::createImplicit(ctx, fakeParenLoc, {},
-                                                   fakeParenLoc);
-      isImplicit = true;
-    }
-
-    SourceLoc typeLoc;
-    if (auto *repr = outermostWrapperAttr->getTypeRepr()) {
-      typeLoc = repr->getLoc();
-    }
-    auto typeExpr =
-        TypeExpr::createImplicitHack(typeLoc, outermostWrapperType, ctx);
-    backingInitializer = CallExpr::create(ctx, typeExpr, outermostArgs,
-                                          /*implicit*/ isImplicit);
-  }
-  wrapperAttrs[0]->setSemanticInit(backingInitializer);
-
-  // Note that we have applied to property wrapper, so we can adjust
-  // the initializer type later.
-  expression.propertyWrapper.wrappedVar = singleVar;
-  expression.expression = backingInitializer;
-  expression.convertType = {outermostWrapperAttr->getTypeRepr(),
-                            outermostWrapperAttr->getType()};
-}
-
-SolutionApplicationTarget SolutionApplicationTarget::forInitialization(
-    Expr *initializer, DeclContext *dc, Type patternType, Pattern *pattern,
-    bool bindPatternVarsOneWay) {
-  // Determine the contextual type for the initialization.
-  TypeLoc contextualType;
-  if (!(isa<OptionalSomePattern>(pattern) && !pattern->isImplicit()) &&
-      patternType && !patternType->is<UnresolvedType>()) {
-    contextualType = TypeLoc::withoutLoc(patternType);
-
-    // Only provide a TypeLoc if it makes sense to allow diagnostics.
-    if (auto *typedPattern = dyn_cast<TypedPattern>(pattern)) {
-      const Pattern *inner = typedPattern->getSemanticsProvidingPattern();
-      if (isa<NamedPattern>(inner) || isa<AnyPattern>(inner)) {
-        contextualType = TypeLoc(typedPattern->getTypeRepr());
-        if (typedPattern->hasType())
-          contextualType.setType(typedPattern->getType());
-        else
-          contextualType.setType(patternType);
-      }
-    }
-  }
-
-  SolutionApplicationTarget target(
-      initializer, dc, CTP_Initialization, contextualType,
-      /*isDiscarded=*/false);
-  target.expression.pattern = pattern;
-  target.expression.bindPatternVarsOneWay = bindPatternVarsOneWay;
-  target.maybeApplyPropertyWrapper();
-  return target;
-}
-
-SolutionApplicationTarget SolutionApplicationTarget::forInitialization(
-    Expr *initializer, DeclContext *dc, Type patternType,
-    PatternBindingDecl *patternBinding, unsigned patternBindingIndex,
-    bool bindPatternVarsOneWay) {
-    auto result = forInitialization(
-        initializer, dc, patternType,
-        patternBinding->getPattern(patternBindingIndex), bindPatternVarsOneWay);
-    result.expression.initialization.patternBinding = patternBinding;
-    result.expression.initialization.patternBindingIndex = patternBindingIndex;
-    return result;
-}
-
-SolutionApplicationTarget
-SolutionApplicationTarget::forForEachStmt(ForEachStmt *stmt, DeclContext *dc,
-                                          bool bindPatternVarsOneWay) {
-  SolutionApplicationTarget target(
-      stmt, dc, bindPatternVarsOneWay || bool(stmt->getWhere()));
-  return target;
-}
-
-SolutionApplicationTarget
-SolutionApplicationTarget::forPropertyWrapperInitializer(
-    VarDecl *wrappedVar, DeclContext *dc, Expr *initializer) {
-  SolutionApplicationTarget target(
-      initializer, dc, CTP_Initialization, wrappedVar->getType(),
-      /*isDiscarded=*/false);
-  target.expression.propertyWrapper.wrappedVar = wrappedVar;
-  if (auto *patternBinding = wrappedVar->getParentPatternBinding()) {
-    auto index = patternBinding->getPatternEntryIndexForVarDecl(wrappedVar);
-    target.expression.initialization.patternBinding = patternBinding;
-    target.expression.initialization.patternBindingIndex = index;
-    target.expression.pattern = patternBinding->getPattern(index);
-  }
-  target.maybeApplyPropertyWrapper();
-  return target;
-}
-
-ContextualPattern
-SolutionApplicationTarget::getContextualPattern() const {
-  if (kind == Kind::uninitializedVar) {
-    assert(patternBinding);
-    return ContextualPattern::forPatternBindingDecl(patternBinding,
-                                                    uninitializedVar.index);
-  }
-
-  if (isForEachStmt()) {
-    return ContextualPattern::forRawPattern(forEachStmt.pattern,
-                                            forEachStmt.dc);
-  }
-
-  assert(kind == Kind::expression);
-  assert(expression.contextualPurpose == CTP_Initialization);
-  if (expression.contextualPurpose == CTP_Initialization &&
-      expression.initialization.patternBinding) {
-    return ContextualPattern::forPatternBindingDecl(
-        expression.initialization.patternBinding,
-        expression.initialization.patternBindingIndex);
-  }
-
-  return ContextualPattern::forRawPattern(expression.pattern, expression.dc);
-}
-
-bool SolutionApplicationTarget::infersOpaqueReturnType() const {
-  assert(kind == Kind::expression);
-  switch (expression.contextualPurpose) {
-  case CTP_Initialization:
-  case CTP_ReturnStmt:
-  case CTP_ReturnSingleExpr:
-    if (Type convertType = expression.convertType.getType())
-      return convertType->hasOpaqueArchetype();
-    return false;
-  default:
-    return false;
-  }
-}
-
-bool SolutionApplicationTarget::contextualTypeIsOnlyAHint() const {
-  assert(kind == Kind::expression);
-  switch (expression.contextualPurpose) {
-  case CTP_Initialization:
-    return !infersOpaqueReturnType() && !isOptionalSomePatternInit();
-  case CTP_ForEachStmt:
-  case CTP_ForEachSequence:
-    return true;
-  case CTP_Unused:
-  case CTP_ReturnStmt:
-  case CTP_ReturnSingleExpr:
-  case CTP_YieldByValue:
-  case CTP_YieldByReference:
-  case CTP_CaseStmt:
-  case CTP_ThrowStmt:
-  case CTP_EnumCaseRawValue:
-  case CTP_DefaultParameter:
-  case CTP_AutoclosureDefaultParameter:
-  case CTP_CalleeResult:
-  case CTP_CallArgument:
-  case CTP_ClosureResult:
-  case CTP_ArrayElement:
-  case CTP_DictionaryKey:
-  case CTP_DictionaryValue:
-  case CTP_CoerceOperand:
-  case CTP_AssignSource:
-  case CTP_SubscriptAssignSource:
-  case CTP_Condition:
-  case CTP_WrappedProperty:
-  case CTP_ComposedPropertyWrapper:
-  case CTP_CannotFail:
-  case CTP_ExprPattern:
-    return false;
-  }
-  llvm_unreachable("invalid contextual type");
-}
-
 /// Given a specific expression and the remnants of the failed constraint
 /// system, produce a specific diagnostic.
 ///
 /// This is guaranteed to always emit an error message.
 ///
-void ConstraintSystem::diagnoseFailureFor(SolutionApplicationTarget target) {
+void ConstraintSystem::diagnoseFailureFor(SyntacticElementTarget target) {
   setPhase(ConstraintSystemPhase::Diagnostics);
 
   SWIFT_DEFER { setPhase(ConstraintSystemPhase::Finalization); };
@@ -6577,7 +6988,7 @@ bool ConstraintSystem::isConformanceUnavailable(ProtocolConformanceRef conforman
 /// If we aren't certain that we've emitted a diagnostic, emit a fallback
 /// diagnostic.
 void ConstraintSystem::maybeProduceFallbackDiagnostic(
-    SolutionApplicationTarget target) const {
+    SyntacticElementTarget target) const {
   if (Options.contains(ConstraintSystemFlags::SuppressDiagnostics))
     return;
 
@@ -6735,8 +7146,8 @@ SourceRange constraints::getSourceRange(ASTNode anchor) {
   return anchor.getSourceRange();
 }
 
-static Optional<Requirement> getRequirement(ConstraintSystem &cs,
-                                            ConstraintLocator *reqLocator) {
+static llvm::Optional<Requirement>
+getRequirement(ConstraintSystem &cs, ConstraintLocator *reqLocator) {
   ArrayRef<LocatorPathElt> path = reqLocator->getPath();
 
   // If we have something like ... -> type req # -> pack element #, we're
@@ -6745,11 +7156,11 @@ static Optional<Requirement> getRequirement(ConstraintSystem &cs,
     path = path.drop_back();
 
   if (path.empty())
-    return None;
+    return llvm::None;
 
   auto reqLoc = path.back().getAs<LocatorPathElt::AnyRequirement>();
   if (!reqLoc)
-    return None;
+    return llvm::None;
 
   if (reqLoc->isConditionalRequirement()) {
     auto conformanceRef =
@@ -6766,18 +7177,18 @@ static Optional<Requirement> getRequirement(ConstraintSystem &cs,
     return signature.getRequirements()[reqLoc->getIndex()];
   }
 
-  return None;
+  return llvm::None;
 }
 
-static Optional<std::pair<GenericTypeParamType *, RequirementKind>>
+static llvm::Optional<std::pair<GenericTypeParamType *, RequirementKind>>
 getRequirementInfo(ConstraintSystem &cs, ConstraintLocator *reqLocator) {
   auto requirement = getRequirement(cs, reqLocator);
   if (!requirement)
-    return None;
+    return llvm::None;
 
   auto *GP = requirement->getFirstType()->getAs<GenericTypeParamType>();
   if (!GP)
-    return None;
+    return llvm::None;
 
   auto path = reqLocator->getPath();
   auto iter = path.rbegin();
@@ -6798,7 +7209,7 @@ getRequirementInfo(ConstraintSystem &cs, ConstraintLocator *reqLocator) {
       });
 
   if (replacement == substitutions.end())
-    return None;
+    return llvm::None;
 
   auto *repr = cs.getRepresentative(replacement->second);
   return std::make_pair(repr->getImpl().getGenericParameter(),
@@ -6829,7 +7240,7 @@ void ConstraintSystem::recordFixedRequirement(ConstraintLocator *reqLocator,
 
 // Replace any error types encountered with placeholders.
 Type ConstraintSystem::getVarType(const VarDecl *var) {
-  auto type = var->getType();
+  auto type = var->getTypeInContext();
 
   // If this declaration is used as part of a code completion
   // expression, solver needs to glance over the fact that
@@ -6874,7 +7285,7 @@ bool ConstraintSystem::isReadOnlyKeyPathComponent(
     ExportContext where = ExportContext::forFunctionBody(DC, referenceLoc);
     auto maybeUnavail =
         TypeChecker::checkDeclarationAvailability(setter, where);
-    if (maybeUnavail.hasValue()) {
+    if (maybeUnavail.has_value()) {
       return true;
     }
   }
@@ -6928,7 +7339,7 @@ bool ConstraintSystem::isArgumentGenericFunction(Type argType, Expr *argExpr) {
 }
 
 bool ConstraintSystem::participatesInInference(ClosureExpr *closure) const {
-  if (closure->hasSingleExpressionBody())
+  if (getAppliedResultBuilderTransform(closure))
     return true;
 
   if (Options.contains(ConstraintSystemFlags::LeaveClosureBodyUnchecked))
@@ -6937,9 +7348,22 @@ bool ConstraintSystem::participatesInInference(ClosureExpr *closure) const {
   if (closure->hasEmptyBody())
     return false;
 
-  // If body is nested in a parent that has a function builder applied,
-  // let's prevent inference until result builders.
-  return !isInResultBuilderContext(closure);
+  return true;
+}
+
+ProtocolConformanceRef
+ConstraintSystem::lookupConformance(Type type, ProtocolDecl *protocol) {
+  auto cacheKey = std::make_pair(type.getPointer(), protocol);
+
+  auto cachedConformance = Conformances.find(cacheKey);
+  if (cachedConformance != Conformances.end())
+    return cachedConformance->second;
+
+  auto conformance =
+      DC->getParentModule()->lookupConformance(type, protocol,
+                                               /*allowMissing=*/true);
+  Conformances[cacheKey] = conformance;
+  return conformance;
 }
 
 TypeVarBindingProducer::TypeVarBindingProducer(BindingSet &bindings)
@@ -6963,7 +7387,7 @@ TypeVarBindingProducer::TypeVarBindingProducer(BindingSet &bindings)
   }
 
   // A binding to `Any` which should always be considered as a last resort.
-  Optional<Binding> Any;
+  llvm::Optional<Binding> Any;
 
   auto addBinding = [&](const Binding &binding) {
     // Adjust optionality of existing bindings based on presence of
@@ -6977,6 +7401,40 @@ TypeVarBindingProducer::TypeVarBindingProducer(BindingSet &bindings)
       Bindings.push_back(binding);
     }
   };
+
+  if (TypeVar->getImpl().isPackExpansion()) {
+    SmallVector<Binding> viableBindings;
+
+    // Collect possible contextual types (keep in mind that pack
+    // expansion type variable gets bound to its "opened" type
+    // regardless). To be viable the binding has to come from `bind`
+    // or `equal` constraint (i.e. same-type constraint or explicit
+    // generic argument) and be fully resolved.
+    llvm::copy_if(bindings.Bindings, std::back_inserter(viableBindings),
+                  [&](const Binding &binding) {
+                    auto *source = binding.getSource();
+                    if (source->getKind() == ConstraintKind::Bind ||
+                        source->getKind() == ConstraintKind::Equal) {
+                      auto type = binding.BindingType;
+                      return type->is<PackExpansionType>() &&
+                             !type->hasTypeVariable();
+                    }
+                    return false;
+                  });
+
+    // If there is a single fully resolved contextual type, let's
+    // use it as a binding to help with performance and diagnostics.
+    if (viableBindings.size() == 1) {
+      addBinding(viableBindings.front());
+    } else {
+      for (const auto &entry : bindings.Defaults) {
+        auto *constraint = entry.second;
+        Bindings.push_back(getDefaultBinding(constraint));
+      }
+    }
+
+    return;
+  }
 
   for (const auto &binding : bindings.Bindings) {
     addBinding(binding);
@@ -7040,7 +7498,7 @@ bool TypeVarBindingProducer::requiresOptionalAdjustment(
     auto *proto = CS.getASTContext().getProtocol(
          KnownProtocolKind::ExpressibleByNilLiteral);
 
-    return !proto->getParentModule()->lookupConformance(type, proto);
+    return !CS.lookupConformance(type, proto);
   } else if (binding.isDefaultableBinding() && binding.BindingType->isAny()) {
     return true;
   }
@@ -7051,7 +7509,7 @@ bool TypeVarBindingProducer::requiresOptionalAdjustment(
 PotentialBinding
 TypeVarBindingProducer::getDefaultBinding(Constraint *constraint) const {
   assert(constraint->getKind() == ConstraintKind::Defaultable ||
-         constraint->getKind() == ConstraintKind::DefaultClosureType);
+         constraint->getKind() == ConstraintKind::FallbackType);
 
   auto type = constraint->getSecondType();
   Binding binding{type, BindingKind::Exact, constraint};
@@ -7081,4 +7539,22 @@ ASTNode constraints::findAsyncNode(ClosureExpr *closure) {
   if (!body)
     return ASTNode();
   return body->findAsyncNode();
+}
+
+void constraints::dumpAnchor(ASTNode anchor, SourceManager *SM,
+                             raw_ostream &out) {
+  if (auto *expr = anchor.dyn_cast<Expr *>()) {
+    out << Expr::getKindName(expr->getKind());
+    if (SM) {
+      out << '@';
+      expr->getLoc().print(out, *SM);
+    }
+  } else if (auto *pattern = anchor.dyn_cast<Pattern *>()) {
+    out << Pattern::getKindName(pattern->getKind()) << "Pattern";
+    if (SM) {
+      out << '@';
+      pattern->getLoc().print(out, *SM);
+    }
+  }
+  // TODO(diagnostics): Implement the rest of the cases.
 }

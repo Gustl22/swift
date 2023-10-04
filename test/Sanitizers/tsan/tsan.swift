@@ -1,4 +1,4 @@
-// RUN: %target-swiftc_driver %s -target %sanitizers-target-triple -g -sanitize=thread %import-libdispatch -o %t_tsan-binary
+// RUN: %target-swiftc_driver %s -g -sanitize=thread %import-libdispatch -o %t_tsan-binary
 // RUN: %target-codesign %t_tsan-binary
 // RUN: env %env-TSAN_OPTIONS="abort_on_error=0" not %target-run %t_tsan-binary 2>&1 | %FileCheck %s
 // REQUIRES: executable_test
@@ -6,6 +6,9 @@
 // UNSUPPORTED: OS=tvos
 // UNSUPPORTED: CPU=powerpc64le
 // UNSUPPORTED: threading_none
+
+// rdar://101876380
+// UNSUPPORTED: OS=ios
 
 // FIXME: This should be covered by "tsan_runtime"; older versions of Apple OSs
 // don't support TSan.

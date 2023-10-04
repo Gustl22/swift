@@ -1,5 +1,6 @@
 struct __attribute__((swift_attr("import_unsafe"))) NonTrivial {
   NonTrivial() {}
+  NonTrivial(const NonTrivial &) {}
   ~NonTrivial() {}
 
   inline const char *inNonTrivial() const
@@ -50,6 +51,14 @@ struct Base {
   }
 
   void pure() const __attribute__((pure)) {}
+
+  inline int sameMethodNameSameSignature() const {
+    return 42;
+  }
+
+  inline int sameMethodDifferentSignature() const {
+    return 18;
+  }
 };
 
 struct OtherBase {
@@ -65,6 +74,14 @@ struct Derived : Base, OtherBase {
       __attribute__((swift_attr("import_unsafe"))) {
     return "Derived::inDerived";
   }
+
+  inline int sameMethodNameSameSignature() const {
+    return 21;
+  }
+
+  inline int sameMethodDifferentSignature(int x) const {
+    return x + 1;
+  }
 };
 
 struct DerivedFromDerived : Derived {
@@ -76,6 +93,12 @@ struct DerivedFromDerived : Derived {
 
 struct __attribute__((swift_attr("import_unsafe"))) DerivedFromNonTrivial
     : NonTrivial {};
+
+struct PrivatelyInherited : private Base {
+};
+
+struct ProtectedInherited : protected Base {
+};
 
 struct EmptyBaseClass {
   const char *inBase() const __attribute__((swift_attr("import_unsafe"))) {

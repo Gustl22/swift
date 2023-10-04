@@ -53,8 +53,10 @@ public:
       ClangLoader(ClangLoader) {}
 
 private:
-  void printDeclPre(const Decl *D, Optional<BracketOptions> Bracket) override;
-  void printDeclPost(const Decl *D, Optional<BracketOptions> Bracket) override;
+  void printDeclPre(const Decl *D,
+                    llvm::Optional<BracketOptions> Bracket) override;
+  void printDeclPost(const Decl *D,
+                     llvm::Optional<BracketOptions> Bracket) override;
   void avoidPrintDeclPost(const Decl *D) override;
   // Forwarding implementations.
 
@@ -83,16 +85,15 @@ private:
   void printModuleRef(ModuleEntity Mod, Identifier Name) override {
     return OtherPrinter.printModuleRef(Mod, Name);
   }
-  void printSynthesizedExtensionPre(const ExtensionDecl *ED,
-                                    TypeOrExtensionDecl Target,
-                                    Optional<BracketOptions> Bracket) override {
+  void printSynthesizedExtensionPre(
+      const ExtensionDecl *ED, TypeOrExtensionDecl Target,
+      llvm::Optional<BracketOptions> Bracket) override {
     return OtherPrinter.printSynthesizedExtensionPre(ED, Target, Bracket);
   }
 
-  void
-  printSynthesizedExtensionPost(const ExtensionDecl *ED,
-                                TypeOrExtensionDecl Target,
-                                Optional<BracketOptions> Bracket) override {
+  void printSynthesizedExtensionPost(
+      const ExtensionDecl *ED, TypeOrExtensionDecl Target,
+      llvm::Optional<BracketOptions> Bracket) override {
     return OtherPrinter.printSynthesizedExtensionPost(ED, Target, Bracket);
   }
 
@@ -219,14 +220,14 @@ static bool extensionHasClangNode(ExtensionDecl *ext) {
   return static_cast<bool>(swift::ide::extensionGetClangNode(ext));
 }
 
-Optional<StringRef>
-swift::ide::findGroupNameForUSR(ModuleDecl *M, StringRef USR) {
+llvm::Optional<StringRef> swift::ide::findGroupNameForUSR(ModuleDecl *M,
+                                                          StringRef USR) {
   for (auto File : M->getTopLevelModule()->getFiles()) {
     if (auto Name = File->getGroupNameByUSR(USR)) {
       return Name;
     }
   }
-  return None;
+  return llvm::None;
 }
 
 /// Prints a single decl using the \p Printer and \p Options provided. If
@@ -575,10 +576,10 @@ void swift::ide::printModuleInterface(
 
         // If we're supposed to visit submodules, add them now.
         if (TraversalOptions & ModuleTraversal::VisitSubmodules) {
-          for (auto Sub = CM->submodule_begin(), SubEnd = CM->submodule_end();
-               Sub != SubEnd; ++Sub) {
-            if (Visited.insert(*Sub).second)
-              Worklist.push_back(*Sub);
+          for (clang::Module * submodule: CM->submodules()) {
+            if (Visited.insert(submodule).second) {
+                Worklist.push_back(submodule);
+            }
           }
         }
       }
@@ -592,9 +593,8 @@ void swift::ide::printModuleInterface(
   llvm::SmallPtrSet<const clang::Module *, 16> NoImportSubModules;
   if (TargetClangMod) {
     // Assume all submodules are missing.
-    for (auto It = TargetClangMod->submodule_begin();
-         It != TargetClangMod->submodule_end(); ++It) {
-      NoImportSubModules.insert(*It);
+    for (clang::Module *submodule: TargetClangMod->submodules()) {
+      NoImportSubModules.insert(submodule);
     }
   }
   llvm::StringMap<std::vector<Decl*>> FileRangedDecls;
@@ -699,9 +699,9 @@ void swift::ide::printModuleInterface(
       if (!GroupNames.empty()){
         if (auto TargetGroup = D->getGroupName()) {
           if (std::find(GroupNames.begin(), GroupNames.end(),
-                        TargetGroup.getValue()) != GroupNames.end()) {
+                        TargetGroup.value()) != GroupNames.end()) {
             FileRangedDecls.insert({
-              D->getSourceFileName().getValue(),
+              D->getSourceFileName().value(),
               std::vector<Decl*>()
             }).first->getValue().push_back(D);
           }
@@ -718,10 +718,10 @@ void swift::ide::printModuleInterface(
       auto &DeclsInFile = Entry.getValue();
       std::sort(DeclsInFile.begin(), DeclsInFile.end(),
                 [](Decl* LHS, Decl *RHS) {
-                  assert(LHS->getSourceOrder().hasValue());
-                  assert(RHS->getSourceOrder().hasValue());
-                  return LHS->getSourceOrder().getValue() <
-                         RHS->getSourceOrder().getValue();
+                  assert(LHS->getSourceOrder().has_value());
+                  assert(RHS->getSourceOrder().has_value());
+                  return LHS->getSourceOrder().value() <
+                         RHS->getSourceOrder().value();
                 });
 
       for (auto D : DeclsInFile) {
@@ -829,7 +829,7 @@ static SourceLoc getDeclStartPosition(SourceFile &File) {
   for (auto D : File.getTopLevelDecls()) {
     if (tryUpdateStart(D->getStartLoc())) {
       tryUpdateStart(D->getAttrs().getStartLoc());
-      auto RawComment = D->getRawComment(/*SerializedOK=*/false);
+      auto RawComment = D->getRawComment();
       if (!RawComment.isEmpty())
         tryUpdateStart(RawComment.Comments.front().Range.getStart());
     }
@@ -839,7 +839,7 @@ static SourceLoc getDeclStartPosition(SourceFile &File) {
 }
 
 static void printUntilFirstDeclStarts(SourceFile &File, ASTPrinter &Printer) {
-  if (!File.getBufferID().hasValue())
+  if (!File.getBufferID().has_value())
     return;
   auto BufferID = *File.getBufferID();
 
@@ -950,7 +950,7 @@ void ClangCommentPrinter::avoidPrintDeclPost(const Decl *D) {
 }
 
 void ClangCommentPrinter::printDeclPre(const Decl *D,
-                                       Optional<BracketOptions> Bracket) {
+                                       llvm::Optional<BracketOptions> Bracket) {
   // Skip parameters, since we do not gracefully handle nested declarations on a
   // single line.
   // FIXME: we should fix that, since it also affects struct members, etc.
@@ -967,8 +967,8 @@ void ClangCommentPrinter::printDeclPre(const Decl *D,
   return OtherPrinter.printDeclPre(D, Bracket);
 }
 
-void ClangCommentPrinter::printDeclPost(const Decl *D,
-                                        Optional<BracketOptions> Bracket) {
+void ClangCommentPrinter::printDeclPost(
+    const Decl *D, llvm::Optional<BracketOptions> Bracket) {
   OtherPrinter.printDeclPost(D, Bracket);
 
   // Skip parameters; see printDeclPre().
@@ -1133,4 +1133,29 @@ void ClangCommentPrinter::updateLastEntityLine(clang::FileID FID,
   unsigned &LastEntiyLine = LastEntityLines[FID];
   if (LineNo > LastEntiyLine)
     LastEntiyLine = LineNo;
+}
+
+void swift::ide::printSymbolicSwiftClangModuleInterface(
+    ModuleDecl *M, ASTPrinter &Printer, const clang::Module *clangModule) {
+  std::string headerComment;
+  llvm::raw_string_ostream(headerComment)
+      << "// Swift interface for " << (clangModule->IsSystem ? "system " : "")
+      << "module '" << clangModule->Name << "'\n";
+  Printer.printText(headerComment);
+
+  ModuleTraversalOptions opts;
+  opts |= ModuleTraversal::VisitSubmodules;
+  auto popts =
+      PrintOptions::printModuleInterface(/*printFullConvention=*/false);
+  popts.PrintDocumentationComments = false;
+  popts.PrintRegularClangComments = false;
+  popts.SkipInlineCXXNamespace = true;
+
+  auto &SwiftContext = M->getTopLevelModule()->getASTContext();
+  auto &Importer =
+      static_cast<ClangImporter &>(*SwiftContext.getClangModuleLoader());
+  Importer.withSymbolicFeatureEnabled([&]() {
+    printModuleInterface(M, {}, opts, Printer, popts,
+                         /*SynthesizeExtensions=*/false);
+  });
 }

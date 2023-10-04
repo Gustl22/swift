@@ -60,6 +60,12 @@ enum class AccessLevel : uint8_t {
   FilePrivate,
   /// Internal access is limited to the current module.
   Internal,
+  /// Package access is not limited, but some capabilities may be
+  /// restricted outside of the current package containing modules.
+  /// It's similar to Public in that it's accessible from other modules
+  /// and subclassable only within the defining module as long as
+  /// the modules are in the same package.
+  Package,
   /// Public access is not limited, but some capabilities may be
   /// restricted outside of the current module.
   Public,
@@ -96,6 +102,15 @@ enum class EffectsKind : uint8_t {
 enum : unsigned { NumEffectsKindBits =
   countBitsUsed(static_cast<unsigned>(EffectsKind::Last_EffectsKind)) };
 
+/// This enum represents the possible values of the @_expose attribute.
+enum class ExposureKind: uint8_t {
+  Cxx,
+  Wasm,
+  Last_ExposureKind = Wasm
+};
+
+enum : unsigned { NumExposureKindBits =
+  countBitsUsed(static_cast<unsigned>(ExposureKind::Last_ExposureKind)) };
   
 enum DeclAttrKind : unsigned {
 #define DECL_ATTR(_, NAME, ...) DAK_##NAME,

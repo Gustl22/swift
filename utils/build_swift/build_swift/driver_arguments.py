@@ -56,9 +56,20 @@ def _apply_default_arguments(args):
        args.lldb_build_with_xcode is not None:
         args.build_lldb = True
 
+    # Set the default CMake generator.
+    if args.cmake_generator is None:
+        args.cmake_generator = 'Ninja'
+    elif args.cmake_generator == 'Xcode':
+        # Building with Xcode is deprecated.
+        args.skip_build = True
+        args.build_early_swift_driver = False
+        args.build_early_swiftsyntax = False
+
     # Set the default build variant.
     if args.build_variant is None:
-        args.build_variant = 'Debug'
+        args.build_variant = (
+            'MinSizeRel' if args.cmake_generator == 'Xcode' else 'Debug'
+        )
 
     if args.llvm_build_variant is None:
         args.llvm_build_variant = args.build_variant
@@ -118,14 +129,6 @@ def _apply_default_arguments(args):
 
     if args.lldb_assertions is None:
         args.lldb_assertions = args.assertions
-
-    # Set the default CMake generator.
-    if args.cmake_generator is None:
-        args.cmake_generator = 'Ninja'
-    elif args.cmake_generator == 'Xcode':
-        # Building with Xcode is deprecated.
-        args.skip_build = True
-        args.build_early_swift_driver = False
 
     # --ios-all etc are not supported by open-source Swift.
     if args.ios_all:
@@ -449,6 +452,12 @@ def create_argument_parser():
            help='enable sanitizer coverage for swift tools. Necessary for '
                 'fuzzing swiftc')
 
+    option('--swift-enable-backtracing', toggle_true,
+           default=True,
+           help='enable backtracing support')
+    option('--swift-runtime-fixed-backtracer-path', store,
+           help='if set, provide a fixed path for the Swift backtracer')
+
     option('--compiler-vendor', store,
            choices=['none', 'apple'],
            default=defaults.COMPILER_VENDOR,
@@ -650,9 +659,6 @@ def create_argument_parser():
     option(['-b', '--llbuild'], toggle_true('build_llbuild'),
            help='build llbuild')
 
-    option(['--back-deploy-concurrency'], toggle_true('build_backdeployconcurrency'),
-           help='build back-deployment support for concurrency')
-
     option('--install-llvm', toggle_true,
            help='install llvm')
 
@@ -707,8 +713,20 @@ def create_argument_parser():
            help='install SwiftSyntax')
     option('--swiftsyntax-verify-generated-files',
            toggle_true('swiftsyntax_verify_generated_files'),
-           help='set to verify that the generated files in the source tree '
+           help='set to verify that the generated files in the source tree ' +
                 'match the ones that would be generated from current main')
+    option('--swiftsyntax-enable-test-fuzzing',
+           toggle_true('swiftsyntax_enable_test_fuzzing'),
+           help='set to modify test cases in SwiftParserTest to check for ' +
+                'round-trip failures and assertion failures')
+    option('--swiftsyntax-enable-rawsyntax-validation',
+           toggle_true('swiftsyntax_enable_rawsyntax_validation'),
+           help='set to validate that RawSyntax layout nodes contain children of ' +
+                'the expected types and that RawSyntax tokens have the expected ' +
+                'token kinds')
+    option('--swiftsyntax-lint',
+           toggle_true('swiftsyntax_lint'),
+           help='verify that swift-syntax Source code is formatted correctly')
     option(['--install-sourcekit-lsp'], toggle_true('install_sourcekitlsp'),
            help='install SourceKitLSP')
     option(['--install-swiftformat'], toggle_true('install_swiftformat'),
@@ -729,6 +747,9 @@ def create_argument_parser():
            toggle_true('build_swift_inspect'),
            help='build SwiftInspect using swiftpm against the just built '
                 'toolchain')
+    option(['--build-minimal-stdlib'], toggle_true('build_minimalstdlib'),
+           help='build the \'minimal\' freestanding stdlib variant into a '
+                'separate build directory ')
 
     option('--xctest', toggle_true('build_xctest'),
            help='build xctest')
@@ -1067,6 +1088,14 @@ def create_argument_parser():
            help='Include Unicode data in the standard library.'
                 'Note: required for full String functionality')
 
+    option('--build-swift-remote-mirror', toggle_true,
+           default=True,
+           help='Build Remote Mirror')
+
+    option('--build-swift-libexec', toggle_true,
+           default=True,
+           help='build auxiliary executables')
+
     option(['-S', '--skip-build'], store_true,
            help='generate build directory only without building')
 
@@ -1193,6 +1222,7 @@ def create_argument_parser():
     option('--skip-clean-swift-driver', toggle_false('clean_swift_driver'),
            help='skip cleaning up Swift driver')
     option('--skip-test-cmark', toggle_false('test_cmark'),
+           default=False,
            help='skip testing cmark')
     option('--skip-test-swiftpm', toggle_false('test_swiftpm'),
            help='skip testing swiftpm')
@@ -1229,7 +1259,7 @@ def create_argument_parser():
            help='enable building llvm using modules')
 
     option('--llvm-targets-to-build', store,
-           default='X86;ARM;AArch64;PowerPC;SystemZ;Mips',
+           default='X86;ARM;AArch64;PowerPC;SystemZ;Mips;RISCV',
            help='LLVM target generators to build')
 
     option('--llvm-ninja-targets', append,
@@ -1289,9 +1319,16 @@ def create_argument_parser():
            default=True,
            help='Enable experimental Swift differentiable programming.')
 
-    option('--enable-experimental-concurrency', toggle_true,
-           default=True,
+    option('--enable-experimental-concurrency', toggle_true, default=True,
            help='Enable experimental Swift concurrency model.')
+
+    option('--enable-experimental-cxx-interop', toggle_true,
+           default=True,
+           help='Enable experimental C++ interop.')
+
+    option('--enable-cxx-interop-swift-bridging-header', toggle_true,
+           default=True,
+           help='Ship the <swift/bridging> header for C++ interop')
 
     option('--enable-experimental-distributed', toggle_true,
            default=True,
@@ -1300,6 +1337,10 @@ def create_argument_parser():
     option('--enable-experimental-string-processing', toggle_true,
            default=True,
            help='Enable experimental Swift string processing.')
+
+    option('--enable-experimental-observation', toggle_true,
+           default=True,
+           help='Enable experimental Swift observation.')
 
     # -------------------------------------------------------------------------
     in_group('Unsupported options')

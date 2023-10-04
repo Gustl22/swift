@@ -37,6 +37,7 @@ set(SWIFT_BENCH_MODULES
     single-source/ArrayOfGenericRef
     single-source/ArrayOfPOD
     single-source/ArrayOfRef
+    single-source/ArrayRemoveAll
     single-source/ArraySetElement
     single-source/ArraySubscript
     single-source/BinaryFloatingPointConversionFromBinaryInteger
@@ -45,6 +46,7 @@ set(SWIFT_BENCH_MODULES
     single-source/Breadcrumbs
     single-source/BucketSort
     single-source/BufferFill
+    single-source/BufferFind
     single-source/ByteSwap
     single-source/COWTree
     single-source/COWArrayGuaranteedParameterOverhead
@@ -57,6 +59,7 @@ set(SWIFT_BENCH_MODULES
     single-source/CharacterLiteralsLarge
     single-source/CharacterLiteralsSmall
     single-source/CharacterProperties
+    single-source/CharacterRecognizer
     single-source/Chars
     single-source/ClassArrayGetter
     single-source/CodableTest
@@ -119,6 +122,7 @@ set(SWIFT_BENCH_MODULES
     single-source/NSDictionaryCastToSwift
     single-source/NSErrorTest
     single-source/NSStringConversion
+    single-source/NaiveRangeReplaceableCollectionConformance
     single-source/NibbleSort
     single-source/NIOChannelPipeline
     single-source/NopDeinit
@@ -179,11 +183,13 @@ set(SWIFT_BENCH_MODULES
     single-source/StrToInt
     single-source/StringBuilder
     single-source/StringComparison
+    single-source/StringDistance
     single-source/StringEdits
     single-source/StringEnum
     single-source/StringInterpolation
     single-source/StringMatch
     single-source/StringRemoveDupes
+    single-source/StringRepeating
     single-source/StringReplaceSubrange
     single-source/StringSplitting
     single-source/StringSwitch
@@ -195,10 +201,13 @@ set(SWIFT_BENCH_MODULES
     single-source/TwoSum
     single-source/TypeFlood
     single-source/UTF8Decode
+    single-source/UTF16Decode
     single-source/Walsh
     single-source/WordCount
     single-source/XorLoop
     cxx-source/CreateObjects
+    cxx-source/CxxSetToCollection
+    cxx-source/CxxStringConversion
     cxx-source/CxxVectorSum
     cxx-source/ReadAccessor
 )

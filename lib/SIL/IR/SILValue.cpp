@@ -17,6 +17,7 @@
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILVisitor.h"
+#include "swift/SIL/Test.h"
 #include "llvm/ADT/StringSwitch.h"
 
 using namespace swift;
@@ -80,6 +81,16 @@ SILInstruction *ValueBase::getDefiningInstruction() {
   return nullptr;
 }
 
+SILInstruction *ValueBase::getDefiningInstructionOrTerminator() {
+  if (auto *inst = dyn_cast<SingleValueInstruction>(this))
+    return inst;
+  if (auto *result = dyn_cast<MultipleValueInstructionResult>(this))
+    return result->getParent();
+  if (auto *result = SILArgument::isTerminatorResult(this))
+    return result->getSingleTerminator();
+  return nullptr;
+}
+
 SILInstruction *ValueBase::getDefiningInsertionPoint() {
   if (auto *inst = getDefiningInstruction())
     return inst;
@@ -96,26 +107,88 @@ SILInstruction *ValueBase::getNextInstruction() {
   return nullptr;
 }
 
-Optional<ValueBase::DefiningInstructionResult>
+llvm::Optional<ValueBase::DefiningInstructionResult>
 ValueBase::getDefiningInstructionResult() {
   if (auto *inst = dyn_cast<SingleValueInstruction>(this))
     return DefiningInstructionResult{inst, 0};
   if (auto *result = dyn_cast<MultipleValueInstructionResult>(this))
     return DefiningInstructionResult{result->getParent(), result->getIndex()};
-  return None;
+  return llvm::None;
+}
+
+bool SILPhiArgument::isLexical() const {
+  if (!isPhi())
+    return false;
+
+  // FIXME: Cache this on the node.
+
+  // Does there exist an incoming value which is lexical?
+  //
+  // Invert the condition to "is every incoming value non-lexical?" in order to
+  // stop visiting incoming values once one lexical value is
+  // found--visitTransitiveIncomingPhiOperands stops once false is returned
+  // from it.
+  auto isEveryIncomingValueNonLexical =
+      visitTransitiveIncomingPhiOperands([&](auto *, auto *operand) {
+        auto value = operand->get();
+        SILPhiArgument *phi = dyn_cast<SILPhiArgument>(value);
+        if (phi && phi->isPhi()) {
+          return true;
+        }
+        // If this non-phi incoming value is lexical, then there is one at least
+        // one lexical value incoming to this phi, to it's lexical.
+        return !value->isLexical();
+      });
+  return !isEveryIncomingValueNonLexical;
 }
 
 bool ValueBase::isLexical() const {
-  if (auto *argument = dyn_cast<SILFunctionArgument>(this)) {
-    // TODO: Recognize guaranteed arguments as lexical too.
-    return argument->getOwnershipKind() == OwnershipKind::Owned &&
-           argument->getLifetime().isLexical();
-  }
+  if (auto *argument = dyn_cast<SILFunctionArgument>(this))
+    return argument->getLifetime().isLexical();
+  auto *phi = dyn_cast<SILPhiArgument>(this);
+  if (phi && phi->isPhi())
+    return phi->isLexical();
   if (auto *bbi = dyn_cast<BeginBorrowInst>(this))
     return bbi->isLexical();
   if (auto *mvi = dyn_cast<MoveValueInst>(this))
     return mvi->isLexical();
   return false;
+}
+
+namespace swift::test {
+// Arguments:
+// - value
+// Dumps:
+// - value
+// - whether it's lexical
+static FunctionTest IsLexicalTest("is-lexical", [](auto &function,
+                                                   auto &arguments,
+                                                   auto &test) {
+  auto value = arguments.takeValue();
+  auto isLexical = value->isLexical();
+  value->dump();
+  auto *boolString = isLexical ? "true" : "false";
+  llvm::errs() << boolString << "\n";
+});
+} // end namespace swift::test
+
+bool ValueBase::isGuaranteedForwarding() const {
+  if (getOwnershipKind() != OwnershipKind::Guaranteed) {
+    return false;
+  }
+  // NOTE: canOpcodeForwardInnerGuaranteedValues returns true for transformation
+  // terminator results.
+  if (canOpcodeForwardInnerGuaranteedValues(this) ||
+      isa<SILFunctionArgument>(this)) {
+    return true;
+  }
+  // If not a phi, return false
+  auto *phi = dyn_cast<SILPhiArgument>(this);
+  if (!phi || !phi->isPhi()) {
+    return false;
+  }
+
+  return phi->isGuaranteedForwarding();
 }
 
 bool ValueBase::hasDebugTrace() const {
@@ -214,18 +287,25 @@ ValueOwnershipKind::ValueOwnershipKind(const SILFunction &F, SILType Type,
   }
 
   switch (Convention) {
-  case SILArgumentConvention::Indirect_In:
-  case SILArgumentConvention::Indirect_In_Constant:
-    value = moduleConventions.useLoweredAddresses() ? OwnershipKind::None
-                                                    : OwnershipKind::Owned;
-    break;
   case SILArgumentConvention::Indirect_In_Guaranteed:
-    value = moduleConventions.useLoweredAddresses() ? OwnershipKind::None
-                                                    : OwnershipKind::Guaranteed;
+    value = moduleConventions.isTypeIndirectForIndirectParamConvention(
+                Type.getASTType())
+                ? OwnershipKind::None
+                : OwnershipKind::Guaranteed;
+    break;
+  case SILArgumentConvention::Indirect_In:
+    value = moduleConventions.isTypeIndirectForIndirectParamConvention(
+                Type.getASTType())
+                ? OwnershipKind::None
+                : OwnershipKind::Owned;
     break;
   case SILArgumentConvention::Indirect_Inout:
   case SILArgumentConvention::Indirect_InoutAliasable:
   case SILArgumentConvention::Indirect_Out:
+  case SILArgumentConvention::Pack_Inout:
+  case SILArgumentConvention::Pack_Out:
+  case SILArgumentConvention::Pack_Owned:
+  case SILArgumentConvention::Pack_Guaranteed:
     value = OwnershipKind::None;
     return;
   case SILArgumentConvention::Direct_Owned:
@@ -251,15 +331,15 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &os,
 
 ValueOwnershipKind::ValueOwnershipKind(StringRef S)
     : value(OwnershipKind::Any) {
-  auto Result = llvm::StringSwitch<Optional<OwnershipKind::innerty>>(S)
+  auto Result = llvm::StringSwitch<llvm::Optional<OwnershipKind::innerty>>(S)
                     .Case("unowned", OwnershipKind::Unowned)
                     .Case("owned", OwnershipKind::Owned)
                     .Case("guaranteed", OwnershipKind::Guaranteed)
                     .Case("none", OwnershipKind::None)
-                    .Default(None);
-  if (!Result.hasValue())
+                    .Default(llvm::None);
+  if (!Result.has_value())
     llvm_unreachable("Invalid string representation of ValueOwnershipKind");
-  value = Result.getValue();
+  value = Result.value();
 }
 
 ValueOwnershipKind
@@ -432,8 +512,6 @@ StringRef OperandOwnership::asString() const {
     return "interior-pointer";
   case OperandOwnership::GuaranteedForwarding:
     return "guaranteed-forwarding";
-  case OperandOwnership::GuaranteedForwardingPhi:
-    return "guaranteed-forwarding-phi";
   case OperandOwnership::EndBorrow:
     return "end-borrow";
   case OperandOwnership::Reborrow:

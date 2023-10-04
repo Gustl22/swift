@@ -76,6 +76,67 @@ import Swift
 /// like the reason for cancellation.
 /// This reflects the fact that a task can be canceled for many reasons,
 /// and additional reasons can accrue during the cancellation process.
+///
+/// ### Task closure lifetime
+/// Tasks are initialized by passing a closure containing the code that will be executed by a given task.
+///
+/// After this code has run to completion, the task has completed, resulting in either
+/// a failure or result value, this closure is eagerly released.
+///
+/// Retaining a task object doesn't indefinitely retain the closure,
+/// because any references that a task holds are released
+/// after the task completes.
+/// Consequently, tasks rarely need to capture weak references to values.
+///
+/// For example, in the following snippet of code it is not necessary to capture the actor as `weak`,
+/// because as the task completes it'll let go of the actor reference, breaking the
+/// reference cycle between the Task and the actor holding it.
+///
+/// ```
+/// struct Work: Sendable {}
+///
+/// actor Worker {
+///     var work: Task<Void, Never>?
+///     var result: Work?
+///
+///     deinit {
+///         assert(work != nil)
+///         // even though the task is still retained,
+///         // once it completes it no longer causes a reference cycle with the actor
+///
+///         print("deinit actor")
+///     }
+///
+///     func start() {
+///         work = Task {
+///             print("start task work")
+///             try? await Task.sleep(for: .seconds(3))
+///             self.result = Work() // we captured self
+///             print("completed task work")
+///             // but as the task completes, this reference is released
+///         }
+///         // we keep a strong reference to the task
+///     }
+/// }
+/// ```
+///
+/// And using it like this:
+///
+/// ```
+/// await Actor().start()
+/// ```
+///
+/// Note that there is nothing, other than the Task's use of `self` retaining the actor,
+/// And that the start method immediately returns, without waiting for the unstructured `Task` to finish.
+/// So once the task completes and its the closure is destroyed, the strong reference to the "self" of the actor is also released allowing the actor to deinitialize as expected.
+///
+/// Therefore, the above call will consistently result in the following output:
+///
+/// ```
+/// start task work
+/// completed task work
+/// deinit actor
+/// ```
 @available(SwiftStdlib 5.1, *)
 @frozen
 public struct Task<Success: Sendable, Failure: Error>: Sendable {
@@ -186,6 +247,52 @@ extension Task: Equatable {
   }
 }
 
+#if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+@available(SwiftStdlib 5.9, *)
+extension Task where Failure == Error {
+    @_spi(MainActorUtilities)
+    @MainActor
+    @available(SwiftStdlib 5.9, *)
+    @discardableResult
+    public static func startOnMainActor(
+        priority: TaskPriority? = nil,
+        @_inheritActorContext @_implicitSelfCapture _ work: __owned @Sendable @escaping @MainActor() async throws -> Success
+    ) -> Task<Success, Error> {
+        let flags = taskCreateFlags(priority: priority, isChildTask: false,
+                                    copyTaskLocals: true, inheritContext: true,
+                                    enqueueJob: false,
+                                    addPendingGroupTaskUnconditionally: false,
+                                    isDiscardingTask: false)
+        let (task, _) = Builtin.createAsyncTask(flags, work)
+        _startTaskOnMainActor(task)
+        return Task<Success, Error>(task)
+    }
+}
+#endif
+
+#if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+@available(SwiftStdlib 5.9, *)
+extension Task where Failure == Never {
+    @_spi(MainActorUtilities)
+    @MainActor
+    @available(SwiftStdlib 5.9, *)
+    @discardableResult
+    public static func startOnMainActor(
+        priority: TaskPriority? = nil,
+        @_inheritActorContext @_implicitSelfCapture _ work: __owned @Sendable @escaping @MainActor() async -> Success
+    ) -> Task<Success, Never> {
+        let flags = taskCreateFlags(priority: priority, isChildTask: false,
+                                    copyTaskLocals: true, inheritContext: true,
+                                    enqueueJob: false,
+                                    addPendingGroupTaskUnconditionally: false,
+                                    isDiscardingTask: false)
+        let (task, _) = Builtin.createAsyncTask(flags, work)
+        _startTaskOnMainActor(task)
+        return Task(task)
+    }
+}
+#endif
+
 // ==== Task Priority ----------------------------------------------------------
 
 /// The priority of a task.
@@ -273,6 +380,26 @@ extension TaskPriority: Comparable {
   }
 }
 
+
+@available(SwiftStdlib 5.9, *)
+extension TaskPriority: CustomStringConvertible {
+  @available(SwiftStdlib 5.9, *)
+  public var description: String {
+    switch self.rawValue {
+    case Self.low.rawValue:
+      return "\(Self.self).low"
+    case Self.medium.rawValue:
+      return "\(Self.self).medium"
+    case Self.high.rawValue:
+      return "\(Self.self).high"
+    case Self.background.rawValue:
+      return "\(Self.self).background"
+    default:
+      return "\(Self.self)(rawValue: \(self.rawValue))"
+    }
+  }
+}
+
 @available(SwiftStdlib 5.1, *)
 extension TaskPriority: Codable { }
 
@@ -287,10 +414,10 @@ extension Task where Success == Never, Failure == Never {
   /// If the system can't provide a priority,
   /// this property's value is `Priority.default`.
   public static var currentPriority: TaskPriority {
-    withUnsafeCurrentTask { task in
+    withUnsafeCurrentTask { unsafeTask in
       // If we are running on behalf of a task, use that task's priority.
-      if let unsafeTask = task {
-         return TaskPriority(rawValue: _taskCurrentPriority(unsafeTask._task))
+      if let unsafeTask {
+         return unsafeTask.priority
       }
 
       // Otherwise, query the system.
@@ -311,6 +438,7 @@ extension Task where Success == Never, Failure == Never {
       return nil
     }
   }
+
 }
 
 @available(SwiftStdlib 5.1, *)
@@ -438,7 +566,8 @@ struct JobFlags {
 func taskCreateFlags(
   priority: TaskPriority?, isChildTask: Bool, copyTaskLocals: Bool,
   inheritContext: Bool, enqueueJob: Bool,
-  addPendingGroupTaskUnconditionally: Bool
+  addPendingGroupTaskUnconditionally: Bool,
+  isDiscardingTask: Bool
 ) -> Int {
   var bits = 0
   bits |= (bits & ~0xFF) | Int(priority?.rawValue ?? 0)
@@ -456,6 +585,9 @@ func taskCreateFlags(
   }
   if addPendingGroupTaskUnconditionally {
     bits |= 1 << 13
+  }
+  if isDiscardingTask {
+    bits |= 1 << 14
   }
   return bits
 }
@@ -508,7 +640,8 @@ extension Task where Failure == Never {
     let flags = taskCreateFlags(
       priority: priority, isChildTask: false, copyTaskLocals: true,
       inheritContext: true, enqueueJob: true,
-      addPendingGroupTaskUnconditionally: false)
+      addPendingGroupTaskUnconditionally: false,
+      isDiscardingTask: false)
 
     // Create the asynchronous task.
     let (task, _) = Builtin.createAsyncTask(flags, operation)
@@ -568,8 +701,8 @@ extension Task where Failure == Error {
     let flags = taskCreateFlags(
       priority: priority, isChildTask: false, copyTaskLocals: true,
       inheritContext: true, enqueueJob: true,
-      addPendingGroupTaskUnconditionally: false
-    )
+      addPendingGroupTaskUnconditionally: false,
+      isDiscardingTask: false)
 
     // Create the asynchronous task future.
     let (task, _) = Builtin.createAsyncTask(flags, operation)
@@ -627,7 +760,8 @@ extension Task where Failure == Never {
     let flags = taskCreateFlags(
       priority: priority, isChildTask: false, copyTaskLocals: false,
       inheritContext: false, enqueueJob: true,
-      addPendingGroupTaskUnconditionally: false)
+      addPendingGroupTaskUnconditionally: false,
+      isDiscardingTask: false)
 
     // Create the asynchronous task future.
     let (task, _) = Builtin.createAsyncTask(flags, operation)
@@ -686,8 +820,8 @@ extension Task where Failure == Error {
     let flags = taskCreateFlags(
       priority: priority, isChildTask: false, copyTaskLocals: false,
       inheritContext: false, enqueueJob: true,
-      addPendingGroupTaskUnconditionally: false
-    )
+      addPendingGroupTaskUnconditionally: false,
+      isDiscardingTask: false)
 
     // Create the asynchronous task future.
     let (task, _) = Builtin.createAsyncTask(flags, operation)
@@ -820,6 +954,15 @@ public struct UnsafeCurrentTask {
     TaskPriority(rawValue: _taskCurrentPriority(_task))
   }
 
+  /// The current task's base priority.
+  ///
+  /// - SeeAlso: `TaskPriority`
+  /// - SeeAlso: `Task.basePriority`
+  @available(SwiftStdlib 5.9, *)
+  public var basePriority: TaskPriority {
+    TaskPriority(rawValue: _taskBasePriority(_task))
+  }
+
   /// Cancel the current task.
   public func cancel() {
     _taskCancel(_task)
@@ -849,6 +992,9 @@ extension UnsafeCurrentTask: Equatable {
 @available(SwiftStdlib 5.1, *)
 @_silgen_name("swift_task_getCurrent")
 func _getCurrentAsyncTask() -> Builtin.NativeObject?
+
+@_silgen_name("swift_task_startOnMainActor")
+fileprivate func _startTaskOnMainActor(_ task: Builtin.NativeObject)
 
 @available(SwiftStdlib 5.1, *)
 @_silgen_name("swift_task_getJobFlags")
@@ -1008,8 +1154,8 @@ extension Task where Failure == Error {
   public static func runInline(_ body: () async throws -> Success) rethrows -> Success {
     return try _runInlineHelper(
       body: {
-        do { 
-          let value = try await body() 
+        do {
+          let value = try await body()
           return Result.success(value)
         }
         catch let error {

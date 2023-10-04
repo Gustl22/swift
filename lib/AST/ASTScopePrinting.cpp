@@ -54,7 +54,8 @@ void ASTScopeImpl::dumpOneScopeMapLocation(
 
   llvm::errs() << "***Scope at " << lineColumn.first << ":" << lineColumn.second
                << "***\n";
-  auto *locScope = findInnermostEnclosingScope(loc, &llvm::errs());
+  auto *parentModule = getSourceFile()->getParentModule();
+  auto *locScope = findInnermostEnclosingScope(parentModule, loc, &llvm::errs());
   locScope->print(llvm::errs(), 0, false, false);
 
   namelookup::ASTScopeDeclGatherer gatherer;
@@ -148,11 +149,10 @@ NullablePtr<const void> ASTScopeImpl::addressForPrinting() const {
 void GenericTypeOrExtensionScope::printSpecifics(llvm::raw_ostream &out) const {
   if (shouldHaveABody() && !doesDeclHaveABody())
     out << "<no body>";
-  // Sadly, the following can trip assertions
-  //  else if (auto *n = getCorrespondingNominalTypeDecl().getPtrOrNull())
-  //    out << "'" << n->getFullName() << "'";
-  //  else
-  //    out << "<no extended nominal?!>";
+  else if (auto *n = getCorrespondingNominalTypeDecl().getPtrOrNull())
+    out << "'" << n->getName() << "'";
+  else
+    out << "<no extended nominal?!>";
 }
 
 void GenericParamScope::printSpecifics(llvm::raw_ostream &out) const {
@@ -176,6 +176,14 @@ void AbstractPatternEntryScope::printSpecifics(llvm::raw_ostream &out) const {
 
 void SubscriptDeclScope::printSpecifics(llvm::raw_ostream &out) const {
   decl->dumpRef(out);
+}
+
+void MacroDeclScope::printSpecifics(llvm::raw_ostream &out) const {
+  decl->dumpRef(out);
+}
+
+void MacroExpansionDeclScope::printSpecifics(llvm::raw_ostream &out) const {
+  out << decl->getMacroName();
 }
 
 void ConditionalClausePatternUseScope::printSpecifics(

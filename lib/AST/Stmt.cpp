@@ -20,6 +20,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/Pattern.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Statistic.h"
 #include "llvm/ADT/PointerUnion.h"
 
@@ -40,6 +41,54 @@ StringRef Stmt::getKindName(StmtKind K) {
 #include "swift/AST/StmtNodes.def"
   }
   llvm_unreachable("bad StmtKind");
+}
+
+StringRef Stmt::getDescriptiveKindName(StmtKind K) {
+  switch (K) {
+  case StmtKind::Brace:
+    return "brace";
+  case StmtKind::Return:
+    return "return";
+  case StmtKind::Yield:
+    return "yield";
+  case StmtKind::Then:
+    return "then";
+  case StmtKind::Defer:
+    return "defer";
+  case StmtKind::If:
+    return "if";
+  case StmtKind::Guard:
+    return "guard";
+  case StmtKind::While:
+    return "while";
+  case StmtKind::Do:
+    return "do";
+  case StmtKind::DoCatch:
+    return "do-catch";
+  case StmtKind::RepeatWhile:
+    return "repeat-while";
+  case StmtKind::ForEach:
+    return "for-in";
+  case StmtKind::Switch:
+    return "switch";
+  case StmtKind::Case:
+    return "case";
+  case StmtKind::Break:
+    return "break";
+  case StmtKind::Continue:
+    return "continue";
+  case StmtKind::Fallthrough:
+    return "fallthrough";
+  case StmtKind::Fail:
+    return "return";
+  case StmtKind::Throw:
+    return "throw";
+  case StmtKind::Discard:
+    return "discard";
+  case StmtKind::PoundAssert:
+    return "#assert";
+  }
+  llvm_unreachable("Unhandled case in switch!");
 }
 
 // Helper functions to check statically whether a method has been
@@ -128,11 +177,10 @@ SourceLoc Stmt::getEndLoc() const {
   llvm_unreachable("statement type not handled!");
 }
 
-BraceStmt::BraceStmt(SourceLoc lbloc, ArrayRef<ASTNode> elts,
-                     SourceLoc rbloc, Optional<bool> implicit)
-  : Stmt(StmtKind::Brace, getDefaultImplicitFlag(implicit, lbloc)),
-    LBLoc(lbloc), RBLoc(rbloc)
-{
+BraceStmt::BraceStmt(SourceLoc lbloc, ArrayRef<ASTNode> elts, SourceLoc rbloc,
+                     llvm::Optional<bool> implicit)
+    : Stmt(StmtKind::Brace, getDefaultImplicitFlag(implicit, lbloc)),
+      LBLoc(lbloc), RBLoc(rbloc) {
   Bits.BraceStmt.NumElements = elts.size();
   std::uninitialized_copy(elts.begin(), elts.end(),
                           getTrailingObjects<ASTNode>());
@@ -146,7 +194,7 @@ BraceStmt::BraceStmt(SourceLoc lbloc, ArrayRef<ASTNode> elts,
 
 BraceStmt *BraceStmt::create(ASTContext &ctx, SourceLoc lbloc,
                              ArrayRef<ASTNode> elts, SourceLoc rbloc,
-                             Optional<bool> implicit) {
+                             llvm::Optional<bool> implicit) {
   assert(std::none_of(elts.begin(), elts.end(),
                       [](ASTNode node) -> bool { return node.isNull(); }) &&
          "null element in BraceStmt");
@@ -160,6 +208,17 @@ SourceLoc BraceStmt::getStartLoc() const {
   if (LBLoc) {
     return LBLoc;
   }
+  return getContentStartLoc();
+}
+
+SourceLoc BraceStmt::getEndLoc() const {
+  if (RBLoc) {
+    return RBLoc;
+  }
+  return getContentEndLoc();
+}
+
+SourceLoc BraceStmt::getContentStartLoc() const {
   for (auto elt : getElements()) {
     if (auto loc = elt.getStartLoc()) {
       return loc;
@@ -168,10 +227,7 @@ SourceLoc BraceStmt::getStartLoc() const {
   return SourceLoc();
 }
 
-SourceLoc BraceStmt::getEndLoc() const {
-  if (RBLoc) {
-    return RBLoc;
-  }
+SourceLoc BraceStmt::getContentEndLoc() const {
   for (auto elt : llvm::reverse(getElements())) {
     if (auto loc = elt.getEndLoc()) {
       return loc;
@@ -191,6 +247,11 @@ ASTNode BraceStmt::findAsyncNode() {
   // that aren't nested within closures or nested declarations.
   class FindInnerAsync : public ASTWalker {
     ASTNode AsyncNode;
+
+    /// Walk only the macro arguments.
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
+    }
 
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
       // If we've found an 'await', record it and terminate the traversal.
@@ -239,6 +300,48 @@ ASTNode BraceStmt::findAsyncNode() {
   return asyncFinder.getAsyncNode();
 }
 
+static bool hasSingleActiveElement(ArrayRef<ASTNode> elts) {
+  while (true) {
+    // Single element brace.
+    if (elts.size() == 1)
+      return true;
+
+    // See if we have a #if as the first element of a 2 element brace, if so we
+    // can recuse into its active clause. If so, the second element will be the
+    // active element.
+    if (elts.size() == 2) {
+      if (auto *D = elts.front().dyn_cast<Decl *>()) {
+        if (auto *ICD = dyn_cast<IfConfigDecl>(D)) {
+          elts = ICD->getActiveClauseElements();
+          continue;
+        }
+      }
+    }
+    return false;
+  }
+}
+
+ASTNode BraceStmt::getSingleActiveElement() const {
+  return hasSingleActiveElement(getElements()) ? getLastElement() : nullptr;
+}
+
+Expr *BraceStmt::getSingleActiveExpression() const {
+  return getSingleActiveElement().dyn_cast<Expr *>();
+}
+
+Stmt *BraceStmt::getSingleActiveStatement() const {
+  return getSingleActiveElement().dyn_cast<Stmt *>();
+}
+
+IsSingleValueStmtResult Stmt::mayProduceSingleValue(Evaluator &eval) const {
+  return evaluateOrDefault(eval, IsSingleValueStmtRequest{this},
+                           IsSingleValueStmtResult::circularReference());
+}
+
+IsSingleValueStmtResult Stmt::mayProduceSingleValue(ASTContext &ctx) const {
+  return mayProduceSingleValue(ctx.evaluator);
+}
+
 SourceLoc ReturnStmt::getStartLoc() const {
   if (ReturnLoc.isInvalid() && Result)
     return Result->getStartLoc();
@@ -251,8 +354,8 @@ SourceLoc ReturnStmt::getEndLoc() const {
 }
 
 YieldStmt *YieldStmt::create(const ASTContext &ctx, SourceLoc yieldLoc,
-                             SourceLoc lpLoc, ArrayRef<Expr*> yields,
-                             SourceLoc rpLoc, Optional<bool> implicit) {
+                             SourceLoc lpLoc, ArrayRef<Expr *> yields,
+                             SourceLoc rpLoc, llvm::Optional<bool> implicit) {
   void *buffer = ctx.Allocate(totalSizeToAlloc<Expr*>(yields.size()),
                               alignof(YieldStmt));
   return ::new(buffer) YieldStmt(yieldLoc, lpLoc, yields, rpLoc, implicit);
@@ -262,8 +365,29 @@ SourceLoc YieldStmt::getEndLoc() const {
   return RPLoc.isInvalid() ? getYields()[0]->getEndLoc() : RPLoc;
 }
 
+ThenStmt *ThenStmt::createParsed(ASTContext &ctx, SourceLoc thenLoc,
+                                 Expr *result) {
+  return new (ctx) ThenStmt(thenLoc, result, /*isImplicit*/ false);
+}
+
+ThenStmt *ThenStmt::createImplicit(ASTContext &ctx, Expr *result) {
+  return new (ctx) ThenStmt(SourceLoc(), result, /*isImplicit*/ true);
+}
+
+SourceRange ThenStmt::getSourceRange() const {
+  auto range = getResult()->getSourceRange();
+  if (!range)
+    return ThenLoc;
+
+  if (ThenLoc)
+    range.widen(ThenLoc);
+
+  return range;
+}
+
 SourceLoc ThrowStmt::getEndLoc() const { return SubExpr->getEndLoc(); }
 
+SourceLoc DiscardStmt::getEndLoc() const { return SubExpr->getEndLoc(); }
 
 SourceLoc DeferStmt::getEndLoc() const {
   return tempDecl->getBody()->getEndLoc();
@@ -332,7 +456,7 @@ Expr *ForEachStmt::getTypeCheckedSequence() const {
 DoCatchStmt *DoCatchStmt::create(ASTContext &ctx, LabeledStmtInfo labelInfo,
                                  SourceLoc doLoc, Stmt *body,
                                  ArrayRef<CaseStmt *> catches,
-                                 Optional<bool> implicit) {
+                                 llvm::Optional<bool> implicit) {
   void *mem = ctx.Allocate(totalSizeToAlloc<CaseStmt *>(catches.size()),
                            alignof(DoCatchStmt));
   return ::new (mem) DoCatchStmt(labelInfo, doLoc, body, catches, implicit);
@@ -361,6 +485,66 @@ void LabeledConditionalStmt::setCond(StmtCondition e) {
       pat->markOwnedByStatement(this);
   
   Cond = e;
+}
+
+/// Whether or not this conditional stmt rebinds self with a `let self`
+/// or `let self = self` condition. If `requireLoadExpr` is `true`,
+/// additionally requires that the RHS of the self condition is a `LoadExpr`.
+bool LabeledConditionalStmt::rebindsSelf(ASTContext &Ctx,
+                                         bool requireLoadExpr) const {
+  return llvm::any_of(getCond(), [&Ctx, requireLoadExpr](const auto &cond) {
+    return cond.rebindsSelf(Ctx, requireLoadExpr);
+  });
+}
+
+/// Whether or not this conditional stmt rebinds self with a `let self`
+/// or `let self = self` condition. If `requireLoadExpr` is `true`,
+/// additionally requires that the RHS of the self condition is a `LoadExpr`.
+bool StmtConditionElement::rebindsSelf(ASTContext &Ctx,
+                                       bool requireLoadExpr) const {
+  auto pattern = getPatternOrNull();
+  if (!pattern) {
+    return false;
+  }
+
+  // Check whether or not this pattern defines a new `self` decl
+  bool isSelfRebinding = false;
+  if (pattern->getBoundName() == Ctx.Id_self) {
+    isSelfRebinding = true;
+  }
+
+  else if (auto OSP = dyn_cast<OptionalSomePattern>(pattern)) {
+    if (auto subPattern = OSP->getSubPattern()) {
+      isSelfRebinding = subPattern->getBoundName() == Ctx.Id_self;
+    }
+  }
+
+  if (!isSelfRebinding) {
+    return false;
+  }
+
+  // Check that the RHS expr is exactly `self` and not something else
+  Expr *exprToCheckForDRE = getInitializerOrNull();
+  if (!exprToCheckForDRE) {
+    return false;
+  }
+
+  if (requireLoadExpr && !isa<LoadExpr>(exprToCheckForDRE)) {
+    return false;
+  }
+
+  if (auto *load = dyn_cast<LoadExpr>(exprToCheckForDRE)) {
+    exprToCheckForDRE = load->getSubExpr();
+  }
+
+  if (auto *DRE = dyn_cast<DeclRefExpr>(
+          exprToCheckForDRE->getSemanticsProvidingExpr())) {
+    auto *decl = DRE->getDecl();
+    return decl && decl->hasName() ? decl->getName().isSimpleName(Ctx.Id_self)
+                                   : false;
+  }
+
+  return false;
 }
 
 PoundAvailableInfo *
@@ -457,18 +641,46 @@ static StmtCondition exprToCond(Expr *C, ASTContext &Ctx) {
 }
 
 IfStmt::IfStmt(SourceLoc IfLoc, Expr *Cond, Stmt *Then, SourceLoc ElseLoc,
-               Stmt *Else, Optional<bool> implicit, ASTContext &Ctx)
-  : IfStmt(LabeledStmtInfo(), IfLoc, exprToCond(Cond, Ctx), Then, ElseLoc, Else,
-           implicit) {
+               Stmt *Else, llvm::Optional<bool> implicit, ASTContext &Ctx)
+    : IfStmt(LabeledStmtInfo(), IfLoc, exprToCond(Cond, Ctx), Then, ElseLoc,
+             Else, implicit) {}
+
+ArrayRef<Stmt *> IfStmt::getBranches(SmallVectorImpl<Stmt *> &scratch) const {
+  assert(scratch.empty());
+  scratch.push_back(getThenStmt());
+
+  auto *elseBranch = getElseStmt();
+  while (elseBranch) {
+    if (auto *IS = dyn_cast<IfStmt>(elseBranch)) {
+      // Look through else ifs.
+      elseBranch = IS->getElseStmt();
+      scratch.push_back(IS->getThenStmt());
+      continue;
+    }
+    // An unconditional else, we're done.
+    scratch.push_back(elseBranch);
+    break;
+  }
+  return scratch;
+}
+
+bool IfStmt::isSyntacticallyExhaustive() const {
+  auto *elseBranch = getElseStmt();
+  while (elseBranch) {
+    // Look through else ifs.
+    if (auto *IS = dyn_cast<IfStmt>(elseBranch)) {
+      elseBranch = IS->getElseStmt();
+      continue;
+    }
+    // An unconditional else.
+    return true;
+  }
+  return false;
 }
 
 GuardStmt::GuardStmt(SourceLoc GuardLoc, Expr *Cond, BraceStmt *Body,
-                     Optional<bool> implicit, ASTContext &Ctx)
-  : GuardStmt(GuardLoc, exprToCond(Cond, Ctx), Body, implicit) {
-    
-}
-  
-
+                     llvm::Optional<bool> implicit, ASTContext &Ctx)
+    : GuardStmt(GuardLoc, exprToCond(Cond, Ctx), Body, implicit) {}
 
 SourceLoc RepeatWhileStmt::getEndLoc() const { return Cond->getEndLoc(); }
 
@@ -490,8 +702,8 @@ CaseStmt::CaseStmt(CaseParentKind parentKind, SourceLoc itemIntroducerLoc,
                    ArrayRef<CaseLabelItem> caseLabelItems,
                    SourceLoc unknownAttrLoc, SourceLoc itemTerminatorLoc,
                    BraceStmt *body,
-                   Optional<MutableArrayRef<VarDecl *>> caseBodyVariables,
-                   Optional<bool> implicit,
+                   llvm::Optional<MutableArrayRef<VarDecl *>> caseBodyVariables,
+                   llvm::Optional<bool> implicit,
                    NullablePtr<FallthroughStmt> fallthroughStmt)
     : Stmt(StmtKind::Case, getDefaultImplicitFlag(implicit, itemIntroducerLoc)),
       UnknownAttrLoc(unknownAttrLoc), ItemIntroducerLoc(itemIntroducerLoc),
@@ -518,19 +730,18 @@ CaseStmt::CaseStmt(CaseParentKind parentKind, SourceLoc itemIntroducerLoc,
     new (&items[i]) CaseLabelItem(caseLabelItems[i]);
     items[i].getPattern()->markOwnedByStatement(this);
   }
-  for (auto *vd : caseBodyVariables.getValueOr(MutableArrayRef<VarDecl *>())) {
+  for (auto *vd : caseBodyVariables.value_or(MutableArrayRef<VarDecl *>())) {
     vd->setParentPatternStmt(this);
   }
 }
 
-CaseStmt *CaseStmt::create(ASTContext &ctx, CaseParentKind ParentKind,
-                           SourceLoc caseLoc,
-                           ArrayRef<CaseLabelItem> caseLabelItems,
-                           SourceLoc unknownAttrLoc, SourceLoc colonLoc,
-                           BraceStmt *body,
-                           Optional<MutableArrayRef<VarDecl *>> caseVarDecls,
-                           Optional<bool> implicit,
-                           NullablePtr<FallthroughStmt> fallthroughStmt) {
+CaseStmt *
+CaseStmt::create(ASTContext &ctx, CaseParentKind ParentKind, SourceLoc caseLoc,
+                 ArrayRef<CaseLabelItem> caseLabelItems,
+                 SourceLoc unknownAttrLoc, SourceLoc colonLoc, BraceStmt *body,
+                 llvm::Optional<MutableArrayRef<VarDecl *>> caseVarDecls,
+                 llvm::Optional<bool> implicit,
+                 NullablePtr<FallthroughStmt> fallthroughStmt) {
   void *mem =
       ctx.Allocate(totalSizeToAlloc<FallthroughStmt *, CaseLabelItem>(
                        fallthroughStmt.isNonNull(), caseLabelItems.size()),
@@ -619,6 +830,28 @@ SwitchStmt *SwitchStmt::create(LabeledStmtInfo LabelInfo, SourceLoc SwitchLoc,
     caseStmt->setParentStmt(theSwitch);
 
   return theSwitch;
+}
+
+LabeledStmt *BreakStmt::getTarget() const {
+  auto &eval = getDeclContext()->getASTContext().evaluator;
+  return evaluateOrDefault(eval, BreakTargetRequest{this}, nullptr);
+}
+
+LabeledStmt *ContinueStmt::getTarget() const {
+  auto &eval = getDeclContext()->getASTContext().evaluator;
+  return evaluateOrDefault(eval, ContinueTargetRequest{this}, nullptr);
+}
+
+SourceLoc swift::extractNearestSourceLoc(const Stmt *S) {
+  return S->getStartLoc();
+}
+
+ArrayRef<Stmt *>
+SwitchStmt::getBranches(SmallVectorImpl<Stmt *> &scratch) const {
+  assert(scratch.empty());
+  for (auto *CS : getCases())
+    scratch.push_back(CS->getBody());
+  return scratch;
 }
 
 // See swift/Basic/Statistic.h for declaration: this enables tracing Stmts, is

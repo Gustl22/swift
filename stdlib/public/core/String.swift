@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2023 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -349,6 +349,7 @@ internal func unimplemented_utf8_32bit(
 /// [scalars]: http://www.unicode.org/glossary/#unicode_scalar_value
 /// [equivalence]: http://www.unicode.org/glossary/#canonical_equivalent
 @frozen
+@_eagerMove
 public struct String {
   public // @SPI(Foundation)
   var _guts: _StringGuts
@@ -398,6 +399,26 @@ extension String {
     #if INTERNAL_CHECKS_ENABLED
     _guts._dump()
     #endif // INTERNAL_CHECKS_ENABLED
+  }
+}
+
+extension String {
+  /// Returns a boolean value indicating whether this string is identical to
+  /// `other`.
+  ///
+  /// Two string values are identical if there is no way to distinguish between
+  /// them.
+  ///
+  /// Comparing strings this way includes comparing (normally) hidden
+  /// implementation details such as the memory location of any underlying
+  /// string storage object. Therefore, identical strings are guaranteed to
+  /// compare equal with `==`, but not all equal strings are considered
+  /// identical.
+  ///
+  /// - Performance: O(1)
+  @_alwaysEmitIntoClient
+  public func _isIdentical(to other: Self) -> Bool {
+    self._guts.rawBits == other._guts.rawBits
   }
 }
 
@@ -537,7 +558,9 @@ extension String {
     ) throws -> Int
   ) rethrows {
     if _fastPath(capacity <= _SmallString.capacity) {
-      let smol = try _SmallString(initializingUTF8With: initializer)
+      let smol = try _SmallString(initializingUTF8With: {
+        try initializer(.init(start: $0.baseAddress, count: capacity))
+      })
       // Fast case where we fit in a _SmallString and don't need UTF8 validation
       if _fastPath(smol.isASCII) {
         self = String(_StringGuts(smol))
@@ -676,11 +699,49 @@ extension String: ExpressibleByStringLiteral {
 extension String: CustomDebugStringConvertible {
   /// A representation of the string that is suitable for debugging.
   public var debugDescription: String {
-    var result = "\""
-    for us in self.unicodeScalars {
-      result += us.escaped(asASCII: false)
+    func hasBreak(between left: String, and right: Unicode.Scalar) -> Bool {
+      // Note: we know `left` ends with an ASCII character, so we only need to
+      // look at its last scalar.
+      var state = _GraphemeBreakingState()
+      return state.shouldBreak(between: left.unicodeScalars.last!, and: right)
     }
-    result += "\""
+
+    // Prevent unquoted scalars in the string from combining with the opening
+    // `"` or the tail of the preceding quoted scalar.
+    var result = "\""
+    var wantBreak = true // true if next scalar must not combine with the last
+    for us in self.unicodeScalars {
+      if let escaped = us._escaped(asASCII: false) {
+        result += escaped
+        wantBreak = true
+      } else if wantBreak && !hasBreak(between: result, and: us) {
+        result += us.escaped(asASCII: true)
+        wantBreak = true
+      } else {
+        result.unicodeScalars.append(us)
+        wantBreak = false
+      }
+    }
+    // Also prevent the last scalar from combining with the closing `"`.
+    var suffix = "\"".unicodeScalars
+    while !result.isEmpty {
+      // Append first scalar of suffix, then check if it combines.
+      result.unicodeScalars.append(suffix.first!)
+      let i = result.index(before: result.endIndex)
+      let j = result.unicodeScalars.index(before: result.endIndex)
+      if i >= j {
+        // All good; append the rest and we're done.
+        result.unicodeScalars.append(contentsOf: suffix.dropFirst())
+        break
+      }
+      // Cancel appending the scalar, then quote the last scalar in `result` and
+      // prepend it to `suffix`.
+      result.unicodeScalars.removeLast()
+      let last = result.unicodeScalars.removeLast()
+      suffix.insert(
+        contentsOf: last.escaped(asASCII: true).unicodeScalars,
+        at: suffix.startIndex)
+    }
     return result
   }
 }

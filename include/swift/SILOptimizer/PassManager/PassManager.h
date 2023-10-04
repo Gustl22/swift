@@ -17,6 +17,7 @@
 #include "swift/SILOptimizer/Analysis/Analysis.h"
 #include "swift/SILOptimizer/PassManager/PassPipeline.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
+#include "swift/SILOptimizer/Utils/SILSSAUpdater.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
@@ -40,6 +41,7 @@ class SILCombiner;
 
 namespace irgen {
 class IRGenModule;
+class IRGenerator;
 }
 
 /// The main entrypoint for executing a pipeline pass on a SIL module.
@@ -68,6 +70,14 @@ class SwiftPassInvocation {
   /// All slabs, allocated by the pass.
   SILModule::SlabList allocatedSlabs;
 
+  SILSSAUpdater *ssaUpdater = nullptr;
+
+  /// IRGen module for passes that request it (e.g. simplification pass)
+  irgen::IRGenModule *irgenModule = nullptr;
+
+  /// IRGenerator used by IRGenModule above
+  irgen::IRGenerator *irgen = nullptr;
+
   static constexpr int BlockSetCapacity = 8;
   char blockSetStorage[sizeof(BasicBlockSet) * BlockSetCapacity];
   bool aliveBlockSets[BlockSetCapacity];
@@ -78,7 +88,11 @@ class SwiftPassInvocation {
   bool aliveNodeSets[NodeSetCapacity];
   int numNodeSetsAllocated = 0;
 
-  void endPassRunChecks();
+  int numClonersAllocated = 0;
+
+  bool needFixStackNesting = false;
+
+  void endPass();
 
 public:
   SwiftPassInvocation(SILPassManager *passManager, SILFunction *function,
@@ -88,11 +102,15 @@ public:
   SwiftPassInvocation(SILPassManager *passManager) :
     passManager(passManager) {}
 
+  ~SwiftPassInvocation();
+
   SILPassManager *getPassManager() const { return passManager; }
   
   SILTransform *getTransform() const { return transform; }
 
   SILFunction *getFunction() const { return function; }
+
+  irgen::IRGenModule *getIRGenModule();
 
   FixedSizeSlab *allocSlab(FixedSizeSlab *afterSlab);
 
@@ -133,6 +151,23 @@ public:
   void beginTransformFunction(SILFunction *function);
 
   void endTransformFunction();
+
+  void notifyNewCloner() { numClonersAllocated++; }
+  void notifyClonerDestroyed() { numClonersAllocated--; }
+
+  void setNeedFixStackNesting(bool newValue) { needFixStackNesting = newValue; }
+  bool getNeedFixStackNesting() const { return needFixStackNesting; }
+
+  void initializeSSAUpdater(SILType type, ValueOwnershipKind ownership) {
+    if (!ssaUpdater)
+      ssaUpdater = new SILSSAUpdater;
+    ssaUpdater->initialize(type, ownership);
+  }
+
+  SILSSAUpdater *getSSAUpdater() const {
+    assert(ssaUpdater && "SSAUpdater not initialized");
+    return ssaUpdater;
+  }
 };
 
 /// The SIL pass manager.
@@ -198,6 +233,8 @@ class SILPassManager {
   /// Set to true when a pass invalidates an analysis.
   bool CurrentPassHasInvalidated = false;
 
+  bool currentPassDependsOnCalleeBodies = false;
+
   /// True if we need to stop running passes and restart again on the
   /// same function.
   bool RestartPipeline = false;
@@ -216,12 +253,11 @@ class SILPassManager {
 
   std::chrono::nanoseconds totalPassRuntime = std::chrono::nanoseconds(0);
 
+public:
   /// C'tor. It creates and registers all analysis passes, which are defined
-  /// in Analysis.def. This is private as it should only be used by
-  /// ExecuteSILPipelineRequest.
+  /// in Analysis.def.
   SILPassManager(SILModule *M, bool isMandatory, irgen::IRGenModule *IRMod);
 
-public:
   const SILOptions &getOptions() const;
 
   /// Searches for an analysis of type T in the list of registered
@@ -333,6 +369,10 @@ public:
     CompletedPassesMap[F].reset();
   }
 
+  void setDependingOnCalleeBodies() {
+    currentPassDependsOnCalleeBodies = true;
+  }
+
   /// Reset the state of the pass manager and remove all transformation
   /// owned by the pass manager. Analysis passes will be kept.
   void resetAndRemoveTransformations();
@@ -374,6 +414,7 @@ public:
                                   SILTransform *trans);
 
   static bool isPassDisabled(StringRef passName);
+  static bool isInstructionPassDisabled(StringRef instName);
   static bool disablePassesForFunction(SILFunction *function);
 
 private:

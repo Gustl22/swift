@@ -40,11 +40,20 @@ swift::getTopLevelDeclsForDisplay(ModuleDecl *M,
   auto startingSize = Results.size();
   M->getDisplayDecls(Results, Recursive);
 
-  // Force Sendable on all types, which might synthesize some extensions.
+  // Force Sendable on all public types, which might synthesize some extensions.
   // FIXME: We can remove this if @_nonSendable stops creating extensions.
   for (auto result : Results) {
-    if (auto NTD = dyn_cast<NominalTypeDecl>(result))
+    if (auto NTD = dyn_cast<NominalTypeDecl>(result)) {
+
+      // Restrict this logic to public and package types. Non-public types
+      // may refer to implementation details and fail at deserialization.
+      auto accessScope = NTD->getFormalAccessScope();
+      if (!M->isMainModule() &&
+          !accessScope.isPublic() && !accessScope.isPackage())
+        continue;
+
       (void)swift::isSendableType(M, NTD->getDeclaredInterfaceType());
+    }
   }
 
   // Remove what we fetched and fetch again, possibly now with additional
@@ -149,7 +158,7 @@ struct SynthesizedExtensionAnalyzer::Implementation {
       // If not from the same file, sort by file name.
       if (auto LFile = Ext->getSourceFileName()) {
         if (auto RFile = Rhs.Ext->getSourceFileName()) {
-          int Result = LFile.getValue().compare(RFile.getValue());
+          int Result = LFile.value().compare(RFile.value());
           if (Result != 0)
             return Result < 0;
         }
@@ -158,7 +167,7 @@ struct SynthesizedExtensionAnalyzer::Implementation {
       // Otherwise, sort by source order.
       if (auto LeftOrder = Ext->getSourceOrder()) {
         if (auto RightOrder = Rhs.Ext->getSourceOrder()) {
-          return LeftOrder.getValue() < RightOrder.getValue();
+          return LeftOrder.value() < RightOrder.value();
         }
       }
 
@@ -285,8 +294,9 @@ struct SynthesizedExtensionAnalyzer::Implementation {
                ExtensionDecl *EnablingExt, NormalProtocolConformance *Conf) {
     SynthesizedExtensionInfo Result(IsSynthesized, EnablingExt);
     ExtensionMergeInfo MergeInfo;
-    MergeInfo.Unmergable = !Ext->getRawComment(/*SerializedOK=*/false).isEmpty() || // With comments
-                           Ext->getAttrs().hasAttribute<AvailableAttr>(); // With @available
+    MergeInfo.Unmergable =
+        !Ext->getRawComment().isEmpty() ||             // With comments
+        Ext->getAttrs().hasAttribute<AvailableAttr>(); // With @available
     MergeInfo.InheritsCount = countInherits(Ext);
 
     // There's (up to) two extensions here: the extension with the items that we
@@ -344,16 +354,30 @@ struct SynthesizedExtensionAnalyzer::Implementation {
             return type;
           },
           LookUpConformanceInModule(M));
-        if (SubstReq.hasError())
+
+        SmallVector<Requirement, 2> subReqs;
+        switch (SubstReq.checkRequirement(subReqs)) {
+        case CheckRequirementResult::Success:
+          break;
+
+        case CheckRequirementResult::ConditionalConformance:
+          // FIXME: Need to handle conditional requirements here!
+          break;
+
+        case CheckRequirementResult::PackRequirement:
+          // FIXME
+          assert(false && "Refactor this");
           return true;
 
-        // FIXME: Need to handle conditional requirements here!
-        ArrayRef<Requirement> conditionalRequirements;
-        if (!SubstReq.isSatisfied(conditionalRequirements)) {
+        case CheckRequirementResult::SubstitutionFailure:
+          return true;
+
+        case CheckRequirementResult::RequirementFailure:
           if (!SubstReq.canBeSatisfied())
             return true;
 
           MergeInfo.addRequirement(Req);
+          break;
         }
       }
       return false;
@@ -643,6 +667,15 @@ class ExpressionTypeCollector: public SourceEntityWalker {
     if (E->getType().isNull())
       return false;
 
+    // We should not report a type for implicit expressions, except for
+    // - `OptionalEvaluationExpr` to show the correct type when there is optional chaining
+    // - `DotSyntaxCallExpr` to report the method type without the metatype
+    if (E->isImplicit() &&
+        !isa<OptionalEvaluationExpr>(E) &&
+        !isa<DotSyntaxCallExpr>(E)) {
+      return false;
+    }
+
     // If we have already reported types for this source range, we shouldn't
     // report again. This makes sure we always report the outtermost type of
     // several overlapping expressions.
@@ -822,7 +855,7 @@ public:
         PrintOptions Options;
         Options.SynthesizeSugarOnTypes = true;
         Options.FullyQualifiedTypes = FullyQualified;
-        auto Ty = VD->getType();
+        auto Ty = VD->getInterfaceType();
         // Skip this declaration and its children if the type is an error type.
         if (Ty->is<ErrorType>()) {
           return false;
@@ -915,30 +948,32 @@ Type swift::getResultTypeOfKeypathDynamicMember(SubscriptDecl *SD) {
 }
 
 SmallVector<std::pair<ValueDecl *, ValueDecl *>, 1>
-swift::getShorthandShadows(CaptureListExpr *CaptureList) {
+swift::getShorthandShadows(CaptureListExpr *CaptureList, DeclContext *DC) {
   SmallVector<std::pair<ValueDecl *, ValueDecl *>, 1> Result;
   for (auto Capture : CaptureList->getCaptureList()) {
-    if (Capture.PBD->getPatternList().size() != 1) {
+    if (Capture.PBD->getPatternList().size() != 1)
       continue;
-    }
-    auto *DRE = dyn_cast_or_null<DeclRefExpr>(Capture.PBD->getInit(0));
-    if (!DRE) {
+
+    Expr *Init = Capture.PBD->getInit(0);
+    if (!Init)
       continue;
-    }
 
     auto DeclaredVar = Capture.getVar();
-    if (DeclaredVar->getLoc() != DRE->getLoc()) {
+    if (DeclaredVar->getLoc() != Init->getLoc()) {
       // We have a capture like `[foo]` if the declared var and the
       // reference share the same location.
       continue;
     }
 
-    auto *ReferencedVar = dyn_cast_or_null<VarDecl>(DRE->getDecl());
-    if (!ReferencedVar) {
-      continue;
+    if (auto UDRE = dyn_cast<UnresolvedDeclRefExpr>(Init)) {
+      if (DC) {
+        Init = resolveDeclRefExpr(UDRE, DC, /*replaceInvalidRefsWithErrors=*/false);
+      }
     }
 
-    assert(DeclaredVar->getName() == ReferencedVar->getName());
+    auto *ReferencedVar = Init->getReferencedDecl().getDecl();
+    if (!ReferencedVar)
+      continue;
 
     Result.emplace_back(std::make_pair(DeclaredVar, ReferencedVar));
   }
@@ -946,26 +981,26 @@ swift::getShorthandShadows(CaptureListExpr *CaptureList) {
 }
 
 SmallVector<std::pair<ValueDecl *, ValueDecl *>, 1>
-swift::getShorthandShadows(LabeledConditionalStmt *CondStmt) {
+swift::getShorthandShadows(LabeledConditionalStmt *CondStmt, DeclContext *DC) {
   SmallVector<std::pair<ValueDecl *, ValueDecl *>, 1> Result;
   for (const StmtConditionElement &Cond : CondStmt->getCond()) {
-    if (Cond.getKind() != StmtConditionElement::CK_PatternBinding) {
+    if (Cond.getKind() != StmtConditionElement::CK_PatternBinding)
       continue;
-    }
-    auto Init = dyn_cast<DeclRefExpr>(Cond.getInitializer());
-    if (!Init) {
-      continue;
-    }
-    auto ReferencedVar = dyn_cast_or_null<VarDecl>(Init->getDecl());
-    if (!ReferencedVar) {
-      continue;
+
+    Expr *Init = Cond.getInitializer();
+    if (auto UDRE = dyn_cast<UnresolvedDeclRefExpr>(Init)) {
+      if (DC) {
+        Init = resolveDeclRefExpr(UDRE, DC, /*replaceInvalidRefsWithErrors=*/false);
+      }
     }
 
+    auto ReferencedVar = Init->getReferencedDecl().getDecl();
+    if (!ReferencedVar)
+      continue;
+
     Cond.getPattern()->forEachVariable([&](VarDecl *DeclaredVar) {
-      if (DeclaredVar->getLoc() != Init->getLoc()) {
+      if (DeclaredVar->getLoc() != Init->getLoc())
         return;
-      }
-      assert(DeclaredVar->getName() == ReferencedVar->getName());
       Result.emplace_back(std::make_pair(DeclaredVar, ReferencedVar));
     });
   }

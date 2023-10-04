@@ -206,7 +206,7 @@ public:
     if (VD->hasInterfaceType()
         && (!ObjC
             || !isa<VarDecl>(VD)
-            || !cast<VarDecl>(VD)->getType()->hasRetainablePointerRepresentation()))
+            || !cast<VarDecl>(VD)->getTypeInContext()->hasRetainablePointerRepresentation()))
       checkType(VD->getInterfaceType(), VD->getLoc());
   }
 
@@ -215,6 +215,10 @@ public:
     // really present at this level.  We'll catch them when processing
     // the getter.
     return LazyInitializerWalking::None;
+  }
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
   }
 
   PreWalkResult<Expr *> walkToDeclRefExpr(DeclRefExpr *DRE) {
@@ -304,7 +308,7 @@ public:
             NTD->diagnose(diag::kind_declared_here,
                           DescriptiveDeclKind::Type);
 
-            D->diagnose(diag::decl_declared_here, D->getName());
+            D->diagnose(diag::decl_declared_here, D);
             return Action::SkipChildren(DRE);
           }
         }
@@ -670,8 +674,8 @@ void TypeChecker::computeCaptures(AnyFunctionRef AFR) {
         AFD->diagnose(diag::objc_generic_extension_using_type_parameter);
 
         // If it's possible, suggest adding @objc.
-        Optional<ForeignAsyncConvention> asyncConvention;
-        Optional<ForeignErrorConvention> errorConvention;
+        llvm::Optional<ForeignAsyncConvention> asyncConvention;
+        llvm::Optional<ForeignErrorConvention> errorConvention;
         if (!AFD->isObjC() &&
             isRepresentableInObjC(AFD, ObjCReason::MemberOfObjCMembersClass,
                                   asyncConvention, errorConvention)) {

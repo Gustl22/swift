@@ -34,26 +34,27 @@ class LocalizationKeyField;
 /// The basic structure of a doc comment attached to a Swift
 /// declaration.
 struct CommentParts {
-  Optional<const Paragraph *> Brief;
+  llvm::Optional<const Paragraph *> Brief;
   ArrayRef<const MarkupASTNode *> BodyNodes;
   ArrayRef<ParamField *> ParamFields;
-  Optional<const swift::markup::ReturnsField *> ReturnsField;
-  Optional<const swift::markup::ThrowsField *> ThrowsField;
+  llvm::Optional<const swift::markup::ReturnsField *> ReturnsField;
+  llvm::Optional<const swift::markup::ThrowsField *> ThrowsField;
   llvm::SmallSetVector<StringRef, 8> Tags;
-  Optional<const swift::markup::LocalizationKeyField *> LocalizationKeyField;
+  llvm::Optional<const swift::markup::LocalizationKeyField *>
+      LocalizationKeyField;
 
   bool isEmpty() const {
-    return !Brief.hasValue() &&
-           !ReturnsField.hasValue() &&
-           !ThrowsField.hasValue() &&
+    return !Brief.has_value() &&
+           !ReturnsField.has_value() &&
+           !ThrowsField.has_value() &&
            BodyNodes.empty() &&
            ParamFields.empty();
   }
 
   bool hasFunctionDocumentation() const {
     return !ParamFields.empty() ||
-             ReturnsField.hasValue() ||
-             ThrowsField.hasValue();
+             ReturnsField.has_value() ||
+             ThrowsField.has_value();
   }
 };
 
@@ -555,25 +556,24 @@ class Image final : public InlineContent,
 
   // FIXME: Hyperlink destinations can't be wrapped - use a Line
   StringRef Destination;
-  Optional<StringRef> Title;
+  llvm::Optional<StringRef> Title;
 
-  Image(StringRef Destination, Optional<StringRef> Title,
+  Image(StringRef Destination, llvm::Optional<StringRef> Title,
         ArrayRef<MarkupASTNode *> Children);
 
 public:
-  static Image *create(MarkupContext &MC,
-                      StringRef Destination,
-                      Optional<StringRef> Title,
-                      ArrayRef<MarkupASTNode *> Children);
+  static Image *create(MarkupContext &MC, StringRef Destination,
+                       llvm::Optional<StringRef> Title,
+                       ArrayRef<MarkupASTNode *> Children);
 
   StringRef getDestination() const { return Destination; }
 
   bool hasTitle() const {
-    return Title.hasValue();
+    return Title.has_value();
   }
 
   StringRef getTitle() const {
-    return StringRef(Title.getValue());
+    return StringRef(Title.value());
   }
 
   ArrayRef<MarkupASTNode *> getChildren() {
@@ -673,10 +673,10 @@ public:
   }
 
   bool isClosureParameter() const {
-    if (!Parts.hasValue())
+    if (!Parts.has_value())
       return false;
 
-    return Parts.getValue().hasFunctionDocumentation();
+    return Parts.value().hasFunctionDocumentation();
   }
 
   ArrayRef<MarkupASTNode *> getChildren() {

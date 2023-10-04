@@ -209,6 +209,15 @@ bool swift::rewriting::diagnoseRequirementErrors(
 
       break;
     }
+
+    case RequirementError::Kind::UnsupportedSameElement: {
+      if (error.requirement.hasError())
+        break;
+
+      ctx.Diags.diagnose(loc, diag::unsupported_same_element);
+      diagnosedError = true;
+      break;
+    }
     }
   }
 
@@ -282,7 +291,7 @@ void RewriteSystem::computeRedundantRequirementDiagnostics(
 
     auto requirementID = rule.getRequirementID();
 
-    if (!requirementID.hasValue()) {
+    if (!requirementID.has_value()) {
       if (!rule.isRedundant())
         nonExplicitNonRedundantRules.insert(ruleID);
 
@@ -396,7 +405,7 @@ void RewriteSystem::computeRedundantRequirementDiagnostics(
 static Requirement
 getRequirementForDiagnostics(Type subject, Symbol property,
                              const PropertyMap &map,
-                             TypeArrayView<GenericTypeParamType> genericParams,
+                             ArrayRef<GenericTypeParamType *> genericParams,
                              const MutableTerm &prefix) {
   switch (property.getKind()) {
   case Symbol::Kind::ConcreteType: {
@@ -430,7 +439,7 @@ getRequirementForDiagnostics(Type subject, Symbol property,
 void RewriteSystem::computeConflictingRequirementDiagnostics(
     SmallVectorImpl<RequirementError> &errors, SourceLoc signatureLoc,
     const PropertyMap &propertyMap,
-    TypeArrayView<GenericTypeParamType> genericParams) {
+    ArrayRef<GenericTypeParamType *> genericParams) {
   for (auto pair : ConflictingRules) {
     const auto &firstRule = getRule(pair.first);
     const auto &secondRule = getRule(pair.second);
@@ -467,7 +476,7 @@ void RewriteSystem::computeConflictingRequirementDiagnostics(
 void RewriteSystem::computeRecursiveRequirementDiagnostics(
     SmallVectorImpl<RequirementError> &errors, SourceLoc signatureLoc,
     const PropertyMap &propertyMap,
-    TypeArrayView<GenericTypeParamType> genericParams) {
+    ArrayRef<GenericTypeParamType *> genericParams) {
   for (unsigned ruleID : RecursiveRules) {
     const auto &rule = getRule(ruleID);
 

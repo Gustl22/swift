@@ -27,26 +27,37 @@
 #include "llvm/ProfileData/InstrProf.h"
 #include "llvm/Support/FileSystem.h"
 
-// This selects the coverage mapping format defined when `InstrProfData.inc`
-// is textually included.
-#define COVMAP_V3
-
 using namespace swift;
 using namespace irgen;
 
 using llvm::coverage::CounterMappingRegion;
 using llvm::coverage::CovMapVersion;
 
+// This affects the coverage mapping format defined when `InstrProfData.inc`
+// is textually included. Note that it means 'version >= 3', not 'version == 3'.
+#define COVMAP_V3
+
+/// This assert is here to make sure we make all the necessary code generation
+/// changes that are needed to support the new coverage mapping format. Note we
+/// cannot pin our version, as it must remain in sync with the version Clang is
+/// using.
+/// Do not bump without at least filing a bug and pinging a coverage maintainer.
+static_assert(CovMapVersion::CurrentVersion == CovMapVersion::Version6,
+              "Coverage mapping emission needs updating");
+
 static std::string getInstrProfSection(IRGenModule &IGM,
                                        llvm::InstrProfSectKind SK) {
   return llvm::getInstrProfSectionName(SK, IGM.Triple.getObjectFormat());
 }
 
-void IRGenModule::emitCoverageMapping() {
+void IRGenModule::emitCoverageMaps(ArrayRef<const SILCoverageMap *> Mappings) {
+  // If there aren't any coverage maps, there's nothing to emit.
+  if (Mappings.empty())
+    return;
+
   SmallVector<llvm::Constant *, 4> UnusedFuncNames;
-  std::vector<const SILCoverageMap *> Mappings;
-  for (const auto &M : getSILModule().getCoverageMaps()) {
-    auto FuncName = M.second->getPGOFuncName();
+  for (const auto *Mapping : Mappings) {
+    auto FuncName = Mapping->getPGOFuncName();
     auto VarLinkage = llvm::GlobalValue::LinkOnceAnyLinkage;
     auto FuncNameVarName = llvm::getPGOFuncNameVarName(FuncName, VarLinkage);
 
@@ -58,12 +69,7 @@ void IRGenModule::emitCoverageMapping() {
       auto *Var = llvm::createPGOFuncNameVar(Module, VarLinkage, FuncName);
       UnusedFuncNames.push_back(llvm::ConstantExpr::getBitCast(Var, Int8PtrTy));
     }
-    Mappings.push_back(M.second);
   }
-
-  // If there aren't any coverage maps, there's nothing to emit.
-  if (Mappings.empty())
-    return;
 
   // Emit the name data for any unused functions.
   if (!UnusedFuncNames.empty()) {
@@ -78,19 +84,31 @@ void IRGenModule::emitCoverageMapping() {
                              llvm::getCoverageUnusedNamesVarName());
   }
 
-  std::vector<StringRef> Files;
-  for (const auto &M : Mappings)
-    if (std::find(Files.begin(), Files.end(), M->getFile()) == Files.end())
-      Files.push_back(M->getFile());
-
-  auto remapper = getOptions().CoveragePrefixMap;
+  llvm::DenseMap<StringRef, unsigned> RawFileIndices;
+  llvm::SmallVector<StringRef, 8> RawFiles;
+  for (const auto &M : Mappings) {
+    auto Filename = M->getFilename();
+    auto Inserted = RawFileIndices.insert({Filename, RawFiles.size()}).second;
+    if (!Inserted)
+      continue;
+    RawFiles.push_back(Filename);
+  }
+  const auto &Remapper = getOptions().CoveragePrefixMap;
 
   llvm::SmallVector<std::string, 8> FilenameStrs;
-  for (StringRef Name : Files) {
-    llvm::SmallString<256> Path(Name);
-    llvm::sys::fs::make_absolute(Path);
-    FilenameStrs.push_back(remapper.remapPath(Path));
-  }
+  FilenameStrs.reserve(RawFiles.size() + 1);
+
+  // First element needs to be the current working directory. Note if this
+  // scheme ever changes, the FileID computation below will need updating.
+  SmallString<256> WorkingDirectory;
+  llvm::sys::fs::current_path(WorkingDirectory);
+  FilenameStrs.emplace_back(Remapper.remapPath(WorkingDirectory));
+
+  // Following elements are the filenames present. We use their relative path,
+  // which llvm-cov will turn back into absolute paths using the working
+  // directory element.
+  for (auto Name : RawFiles)
+    FilenameStrs.emplace_back(Remapper.remapPath(Name));
 
   // Encode the filenames.
   std::string Filenames;
@@ -114,13 +132,23 @@ void IRGenModule::emitCoverageMapping() {
     const uint64_t NameHash = llvm::IndexedInstrProf::ComputeHash(NameValue);
     std::string FuncRecordName = "__covrec_" + llvm::utohexstr(NameHash);
 
-    unsigned FileID =
-        std::find(Files.begin(), Files.end(), M->getFile()) - Files.begin();
+    // The file ID needs to be bumped by 1 to account for the working directory
+    // as the first element.
+    unsigned FileID = [&]() {
+      auto Result = RawFileIndices.find(M->getFilename());
+      assert(Result != RawFileIndices.end());
+      return Result->second + 1;
+    }();
+    assert(FileID < FilenameStrs.size());
+
     std::vector<CounterMappingRegion> Regions;
-    for (const auto &MR : M->getMappedRegions())
+    for (const auto &MR : M->getMappedRegions()) {
+      // The SubFileID here is 0, because it's an index into VirtualFileMapping,
+      // and we only ever have a single file associated for a function.
       Regions.emplace_back(CounterMappingRegion::makeRegion(
-          MR.Counter, /*FileID=*/0, MR.StartLine, MR.StartCol, MR.EndLine,
+          MR.Counter, /*SubFileID*/ 0, MR.StartLine, MR.StartCol, MR.EndLine,
           MR.EndCol));
+    }
     // Append each function's regions into the encoded buffer.
     ArrayRef<unsigned> VirtualFileMapping(FileID);
     llvm::coverage::CoverageMappingWriter W(VirtualFileMapping,
@@ -194,6 +222,27 @@ void IRGenModule::emitCoverageMapping() {
 }
 
 void IRGenerator::emitCoverageMapping() {
-  for (auto &IGM : *this)
-    IGM.second->emitCoverageMapping();
+  if (SIL.getCoverageMaps().empty())
+    return;
+
+  // Shard the coverage maps across their designated IRGenModules. This is
+  // necessary to ensure we don't output N copies of a coverage map when doing
+  // parallel IRGen, where N is the number of output object files.
+  //
+  // Note we don't just dump all the coverage maps into the primary IGM as
+  // that would require creating unecessary name data entries, since the name
+  // data is likely to already be present in the IGM that contains the entity
+  // being profiled (unless it has been optimized out). Matching the coverage
+  // map to its originating SourceFile also matches the behavior of a debug
+  // build where the files are compiled separately.
+  llvm::DenseMap<IRGenModule *, std::vector<const SILCoverageMap *>> MapsToEmit;
+  for (const auto &M : SIL.getCoverageMaps()) {
+    auto &Mapping = M.second;
+    auto *SF = Mapping->getParentSourceFile();
+    MapsToEmit[getGenModule(SF)].push_back(Mapping);
+  }
+  for (auto &IGMPair : *this) {
+    auto *IGM = IGMPair.second;
+    IGM->emitCoverageMaps(MapsToEmit[IGM]);
+  }
 }

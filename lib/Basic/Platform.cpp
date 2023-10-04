@@ -79,7 +79,7 @@ bool swift::triplesAreValidForZippering(const llvm::Triple &target,
   return false;
 }
 
-const Optional<llvm::VersionTuple>
+const llvm::Optional<llvm::VersionTuple>
 swift::minimumAvailableOSVersionForTriple(const llvm::Triple &triple) {
   if (triple.isMacOSX())
     return llvm::VersionTuple(10, 10, 0);
@@ -99,7 +99,7 @@ swift::minimumAvailableOSVersionForTriple(const llvm::Triple &triple) {
   if (triple.isWatchOS())
     return llvm::VersionTuple(2, 0);
 
-  return None;
+  return llvm::None;
 }
 
 bool swift::tripleRequiresRPathForSwiftLibrariesInOS(
@@ -175,8 +175,6 @@ static StringRef getPlatformNameForDarwin(const DarwinPlatformKind platform) {
 
 StringRef swift::getPlatformNameForTriple(const llvm::Triple &triple) {
   switch (triple.getOS()) {
-  case llvm::Triple::UnknownOS:
-    llvm_unreachable("unknown OS");
   case llvm::Triple::ZOS:
   case llvm::Triple::Ananas:
   case llvm::Triple::CloudABI:
@@ -234,6 +232,8 @@ StringRef swift::getPlatformNameForTriple(const llvm::Triple &triple) {
     return "haiku";
   case llvm::Triple::WASI:
     return "wasi";
+  case llvm::Triple::UnknownOS:
+    return "none";
   }
   llvm_unreachable("unsupported OS");
 }
@@ -335,15 +335,16 @@ getOSForAppleTargetSpecificModuleTriple(const llvm::Triple &triple) {
               .Default(tripleOSNameNoVersion);
 }
 
-static Optional<StringRef>
+static llvm::Optional<StringRef>
 getEnvironmentForAppleTargetSpecificModuleTriple(const llvm::Triple &triple) {
   auto tripleEnvironment = triple.getEnvironmentName();
-  return llvm::StringSwitch<Optional<StringRef>>(tripleEnvironment)
-              .Cases("unknown", "", None)
-  // These values are also supported, but are handled by the default case below:
-  //          .Case ("simulator", StringRef("simulator"))
-  //          .Case ("macabi", StringRef("macabi"))
-              .Default(tripleEnvironment);
+  return llvm::StringSwitch<llvm::Optional<StringRef>>(tripleEnvironment)
+      .Cases("unknown", "", llvm::None)
+      // These values are also supported, but are handled by the default case
+      // below:
+      //          .Case ("simulator", StringRef("simulator"))
+      //          .Case ("macabi", StringRef("macabi"))
+      .Default(tripleEnvironment);
 }
 
 llvm::Triple swift::getTargetSpecificModuleTriple(const llvm::Triple &triple) {
@@ -356,7 +357,7 @@ llvm::Triple swift::getTargetSpecificModuleTriple(const llvm::Triple &triple) {
 
     StringRef newOS = getOSForAppleTargetSpecificModuleTriple(triple);
 
-    Optional<StringRef> newEnvironment =
+    llvm::Optional<StringRef> newEnvironment =
         getEnvironmentForAppleTargetSpecificModuleTriple(triple);
 
     if (!newEnvironment)
@@ -395,16 +396,16 @@ llvm::Triple swift::getUnversionedTriple(const llvm::Triple &triple) {
                       unversionedOSName);
 }
 
-Optional<llvm::VersionTuple>
+llvm::Optional<llvm::VersionTuple>
 swift::getSwiftRuntimeCompatibilityVersionForTarget(
     const llvm::Triple &Triple) {
-  #define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
   if (Triple.isMacOSX()) {
     llvm::VersionTuple OSVersion;
     Triple.getMacOSXVersion(OSVersion);
     unsigned Major = OSVersion.getMajor();
-    unsigned Minor = OSVersion.getMinor().getValueOr(0);
+    unsigned Minor = OSVersion.getMinor().value_or(0);
 
     auto floorFor64 = [&Triple](llvm::VersionTuple v) {
       if (!Triple.isAArch64()) return v;
@@ -419,7 +420,7 @@ swift::getSwiftRuntimeCompatibilityVersionForTarget(
       if (Minor <= 14) {
         return floorFor64(llvm::VersionTuple(5, 0));
       } else if (Minor <= 15) {
-        if (OSVersion.getSubminor().getValueOr(0) <= 3) {
+        if (OSVersion.getSubminor().value_or(0) <= 3) {
           return floorFor64(llvm::VersionTuple(5, 1));
         } else {
           return floorFor64(llvm::VersionTuple(5, 2));
@@ -439,7 +440,7 @@ swift::getSwiftRuntimeCompatibilityVersionForTarget(
   } else if (Triple.isiOS()) { // includes tvOS
     llvm::VersionTuple OSVersion = Triple.getiOSVersion();
     unsigned Major = OSVersion.getMajor();
-    unsigned Minor = OSVersion.getMinor().getValueOr(0);
+    unsigned Minor = OSVersion.getMinor().value_or(0);
 
     auto floorForArchitecture = [&Triple, Major](llvm::VersionTuple v) {
       // arm64 simulators and macCatalyst are introduced in iOS 14.0/tvOS 14.0
@@ -479,7 +480,7 @@ swift::getSwiftRuntimeCompatibilityVersionForTarget(
   } else if (Triple.isWatchOS()) {
     llvm::VersionTuple OSVersion = Triple.getWatchOSVersion();
     unsigned Major = OSVersion.getMajor();
-    unsigned Minor = OSVersion.getMinor().getValueOr(0);
+    unsigned Minor = OSVersion.getMinor().value_or(0);
 
     auto floorFor64bits = [&Triple](llvm::VersionTuple v) {
       if (!Triple.isArch64Bit()) return v;
@@ -509,7 +510,7 @@ swift::getSwiftRuntimeCompatibilityVersionForTarget(
     }
   }
 
-  return None;
+  return llvm::None;
 }
 
 static const llvm::VersionTuple minimumMacCatalystDeploymentTarget() {
@@ -528,8 +529,8 @@ llvm::VersionTuple swift::getTargetSDKVersion(clang::DarwinSDKInfo &SDKInfo,
     if (const auto *MacOStoMacCatalystMapping = SDKInfo.getVersionMapping(
             clang::DarwinSDKInfo::OSEnvPair::macOStoMacCatalystPair())) {
       return MacOStoMacCatalystMapping
-          ->map(SDKVersion, minimumMacCatalystDeploymentTarget(), None)
-          .getValueOr(llvm::VersionTuple(0, 0, 0));
+          ->map(SDKVersion, minimumMacCatalystDeploymentTarget(), llvm::None)
+          .value_or(llvm::VersionTuple(0, 0, 0));
     }
     return llvm::VersionTuple(0, 0, 0);
   }

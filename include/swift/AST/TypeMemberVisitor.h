@@ -54,9 +54,14 @@ public:
     return RetTy();
   }
 
+  RetTy visitMacroExpansionDecl(MacroExpansionDecl *D) {
+    // Expansion already visited as auxiliary decls.
+    return RetTy();
+  }
+
   /// A convenience method to visit all the members.
   void visitMembers(NominalTypeDecl *D) {
-    for (Decl *member : D->getMembers()) {
+    for (Decl *member : D->getAllMembers()) {
       asImpl().visit(member);
     }
   }
@@ -66,7 +71,7 @@ public:
   ///
   /// \seealso IterableDeclContext::getImplementationContext()
   void visitImplementationMembers(NominalTypeDecl *D) {
-    for (Decl *member : D->getImplementationContext()->getMembers()) {
+    for (Decl *member : D->getImplementationContext()->getAllMembers()) {
       asImpl().visit(member);
     }
     

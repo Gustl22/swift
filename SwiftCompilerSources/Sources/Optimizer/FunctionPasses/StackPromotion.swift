@@ -38,46 +38,67 @@ import SIL
 /// a no-op, because a stack promoted object is initialized with an "immortal"
 /// reference count.
 /// Later optimizations can clean that up.
-let stackPromotion = FunctionPass(name: "stack-promotion", {
-  (function: Function, context: PassContext) in
+let stackPromotion = FunctionPass(name: "stack-promotion") {
+  (function: Function, context: FunctionPassContext) in
   
   let deadEndBlocks = context.deadEndBlocks
 
-  var changed = false
+  var needFixStackNesting = false
   for inst in function.instructions {
-    if let ar = inst as? AllocRefInstBase {
-      if deadEndBlocks.isDeadEnd(ar.block) {
-        // Don't stack promote any allocation inside a code region which ends up
-        // in a no-return block. Such allocations may missing their final release.
-        // We would insert the deallocation too early, which may result in a
-        // use-after-free problem.
-        continue
-      }
-      if !context.continueWithNextSubpassRun(for: ar) {
+    if let allocRef = inst as? AllocRefInstBase {
+      if !context.continueWithNextSubpassRun(for: allocRef) {
         break
       }
-
-      if tryPromoteAlloc(ar, deadEndBlocks, context) {
-        changed = true
+      if tryPromoteAlloc(allocRef, deadEndBlocks, context) {
+        needFixStackNesting = true
       }
     }
   }
-  if changed {
+  if needFixStackNesting {
     // Make sure that all stack allocating instructions are nested correctly.
-    context.fixStackNesting(function: function)
+    function.fixStackNesting(context)
   }
-})
+}
 
-private
-func tryPromoteAlloc(_ allocRef: AllocRefInstBase,
-                     _ deadEndBlocks: DeadEndBlocksAnalysis,
-                     _ context: PassContext) -> Bool {
+// Returns true if the allocation is promoted.
+private func tryPromoteAlloc(_ allocRef: AllocRefInstBase,
+                             _ deadEndBlocks: DeadEndBlocksAnalysis,
+                             _ context: FunctionPassContext) -> Bool {
   if allocRef.isObjC || allocRef.canAllocOnStack {
     return false
   }
+
   // The most important check: does the object escape the current function?
   if allocRef.isEscaping(context) {
     return false
+  }
+
+  if deadEndBlocks.isDeadEnd(allocRef.parentBlock) {
+
+    // Allocations inside a code region which ends up in a no-return block may missing their
+    // final release. Therefore we extend their lifetime indefinitely, e.g.
+    //
+    //  %k = alloc_ref $Klass
+    //  ...
+    //  unreachable  // The end of %k's lifetime
+    //
+    // There is one exception: if it's in a loop (within the dead-end region) we must not
+    // extend its lifetime. In this case we can be sure that its final release is not
+    // missing, because otherwise the object would be leaking. For example:
+    //
+    //  bb1:
+    //    %k = alloc_ref $Klass
+    //    ...                    // %k's lifetime must end somewhere here
+    //    cond_br %c, bb1, bb2
+    //  bb2:
+    //    unreachable
+    //
+    // Therefore, if the allocation is inside a loop, we can treat it like allocations in
+    // non dead-end regions.
+    if !isInLoop(block: allocRef.parentBlock, context) {
+      allocRef.setIsStackAllocatable(context)
+      return true
+    }
   }
 
   // Try to find the top most dominator block which dominates all use points.
@@ -117,11 +138,16 @@ func tryPromoteAlloc(_ allocRef: AllocRefInstBase,
   let domTree = context.dominatorTree
   let outerDominatingBlock = getDominatingBlockOfAllUsePoints(context: context, allocRef, domTree: domTree)
 
-  // The "inner" liferange contains all use points which are dominated by the allocation block
+  // The "inner" liferange contains all use points which are dominated by the allocation block.
+  // Note that this `visit` cannot fail because otherwise our initial `isEscaping` check would have failed already.
+  var innerRange = allocRef.visit(using: ComputeInnerLiferange(of: allocRef, domTree, context), context)!
+  defer { innerRange.deinitialize() }
+
   // The "outer" liferange contains all use points.
-  var (innerRange, outerBlockRange) = computeInnerAndOuterLiferanges(instruction: allocRef, in: outerDominatingBlock, domTree: domTree, context: context)
-  defer { innerRange.deinitialize(); outerBlockRange.deinitialize() }
-  
+  // Same here: this `visit` cannot fail.
+  var outerBlockRange = allocRef.visit(using: ComputeOuterBlockrange(dominatedBy: outerDominatingBlock, context), context)!
+  defer { outerBlockRange.deinitialize() }
+
   assert(innerRange.blockRange.isValid, "inner range should be valid because we did a dominance check")
 
   if !outerBlockRange.isValid {
@@ -155,7 +181,7 @@ func tryPromoteAlloc(_ allocRef: AllocRefInstBase,
   //   bb2:                                                        |
   //     destroy_value %o                                         _|
   //
-  if innerRange.blockRange.isControlFlowEdge(to: outerBlockRange) {
+  if innerRange.blockRange.hasControlFlowEdge(to: outerBlockRange) {
     return false
   }
 
@@ -170,8 +196,8 @@ func tryPromoteAlloc(_ allocRef: AllocRefInstBase,
   // Do the transformation!
   // Insert `dealloc_stack_ref` instructions at the exit- and end-points of the inner liferange.
   for exitInst in innerRange.exits {
-    if !deadEndBlocks.isDeadEnd(exitInst.block) {
-      let builder = Builder(at: exitInst, context)
+    if !deadEndBlocks.isDeadEnd(exitInst.parentBlock) {
+      let builder = Builder(before: exitInst, context)
       builder.createDeallocStackRef(allocRef)
     }
   }
@@ -186,18 +212,14 @@ func tryPromoteAlloc(_ allocRef: AllocRefInstBase,
   return true
 }
 
-//===----------------------------------------------------------------------===//
-//                              utility functions
-//===----------------------------------------------------------------------===//
-
-private func getDominatingBlockOfAllUsePoints(context: PassContext,
+private func getDominatingBlockOfAllUsePoints(context: FunctionPassContext,
                                               _ value: SingleValueInstruction,
                                               domTree: DominatorTree) -> BasicBlock {
   struct FindDominatingBlock : EscapeVisitorWithResult {
     var result: BasicBlock
     let domTree: DominatorTree
     mutating func visitUse(operand: Operand, path: EscapePath) -> UseResult {
-      let defBlock = operand.value.definingBlock
+      let defBlock = operand.value.parentBlock
       if defBlock.dominates(result, domTree) {
         result = defBlock
       }
@@ -205,78 +227,75 @@ private func getDominatingBlockOfAllUsePoints(context: PassContext,
     }
   }
   
-  return value.visit(using: FindDominatingBlock(result: value.block, domTree: domTree), context)!
+  return value.visit(using: FindDominatingBlock(result: value.parentBlock, domTree: domTree), context)!
 }
 
+private struct ComputeInnerLiferange : EscapeVisitorWithResult {
+  var result: InstructionRange
+  let domTree: DominatorTree
 
-func computeInnerAndOuterLiferanges(instruction: SingleValueInstruction, in domBlock: BasicBlock, domTree: DominatorTree, context: PassContext) -> (InstructionRange, BasicBlockRange) {
-  
-  /// All uses which are dominated by the `innerInstRange`s begin-block are included
-  /// in both, the `innerInstRange` and the `outerBlockRange`.
-  /// All _not_ dominated uses are only included in the `outerBlockRange`.
-  struct Visitor : EscapeVisitorWithResult {
-    var innerRange: InstructionRange
-    var outerBlockRange: BasicBlockRange
-    let domTree: DominatorTree
-    
-    var result: (InstructionRange, BasicBlockRange) { (innerRange, outerBlockRange) }
-    
-    init(instruction: Instruction, domBlock: BasicBlock, domTree: DominatorTree, context: PassContext) {
-      innerRange = InstructionRange(begin: instruction, context)
-      outerBlockRange = BasicBlockRange(begin: domBlock, context)
-      self.domTree = domTree
-    }
-    
-    mutating func visitUse(operand: Operand, path: EscapePath) -> UseResult {
-      let user = operand.instruction
-      if innerRange.blockRange.begin.dominates(user.block, domTree) {
-        innerRange.insert(user)
-      }
-      outerBlockRange.insert(user.block)
-      
-      let val = operand.value
-      let defBlock = val.definingBlock
-      
-      // Also insert the operand's definition. Otherwise we would miss allocation
-      // instructions (for which the `visitUse` closure is not called).
-      outerBlockRange.insert(defBlock)
-      
-      // We need to explicitly add predecessor blocks of phi-arguments becaues they
-      // are not necesesarily visited during the down-walk in `isEscaping()`.
-      // This is important for the special case where there is a back-edge from the
-      // inner range to the inner rage's begin-block:
-      //
-      //   bb0:                      // <- need to be in the outer range
-      //     br bb1(%some_init_val)
-      //   bb1(%arg):
-      //     %k = alloc_ref $Klass   // innerInstRange.begin
-      //     cond_br bb2, bb1(%k)    // back-edge to bb1 == innerInstRange.blockRange.begin
-      //
-      if val is BlockArgument {
-        outerBlockRange.insert(contentsOf: defBlock.predecessors)
-      }
-      return .continueWalk
-    }
+  init(of instruction: Instruction, _ domTree: DominatorTree, _ context: FunctionPassContext) {
+    result = InstructionRange(begin: instruction, context)
+    self.domTree = domTree
   }
 
-  return instruction.visit(using: Visitor(instruction: instruction,
-                                          domBlock: domBlock,
-                                          domTree: domTree,
-                                          context: context), context)!
+  mutating func visitUse(operand: Operand, path: EscapePath) -> UseResult {
+    let user = operand.instruction
+    let beginBlockOfRange = result.blockRange.begin
+    if beginBlockOfRange.dominates(user.parentBlock, domTree) {
+      result.insert(user)
+    }
+    return .continueWalk
+  }
+}
+
+private struct ComputeOuterBlockrange : EscapeVisitorWithResult {
+  var result: BasicBlockRange
+
+  init(dominatedBy: BasicBlock, _ context: FunctionPassContext) {
+    result = BasicBlockRange(begin: dominatedBy, context)
+  }
+
+  mutating func visitUse(operand: Operand, path: EscapePath) -> UseResult {
+    let user = operand.instruction
+    result.insert(user.parentBlock)
+
+    let value = operand.value
+    let operandsDefinitionBlock = value.parentBlock
+
+    // Also insert the operand's definition. Otherwise we would miss allocation
+    // instructions (for which the `visitUse` closure is not called).
+    result.insert(operandsDefinitionBlock)
+
+    // We need to explicitly add predecessor blocks of phis becaues they
+    // are not necesesarily visited during the down-walk in `isEscaping()`.
+    // This is important for the special case where there is a back-edge from the
+    // inner range to the inner rage's begin-block:
+    //
+    //   bb0:                      // <- need to be in the outer range
+    //     br bb1(%some_init_val)
+    //   bb1(%arg):
+    //     %k = alloc_ref $Klass   // innerInstRange.begin
+    //     cond_br bb2, bb1(%k)    // back-edge to bb1 == innerInstRange.blockRange.begin
+    //
+    if let phi = Phi(value) {
+      result.insert(contentsOf: phi.predecessors)
+    }
+    return .continueWalk
+  }
 }
 
 private extension BasicBlockRange {
   /// Returns true if there is a direct edge connecting this range with the `otherRange`.
-  func isControlFlowEdge(to otherRange: BasicBlockRange) -> Bool {
+  func hasControlFlowEdge(to otherRange: BasicBlockRange) -> Bool {
     func isOnlyInOtherRange(_ block: BasicBlock) -> Bool {
-      return !inclusiveRangeContains(block) &&
-             otherRange.inclusiveRangeContains(block) && block != otherRange.begin
+      return !inclusiveRangeContains(block) && otherRange.inclusiveRangeContains(block)
     }
 
     for lifeBlock in inclusiveRange {
       assert(otherRange.inclusiveRangeContains(lifeBlock), "range must be a subset of other range")
       for succ in lifeBlock.successors {
-        if isOnlyInOtherRange(succ) {
+        if isOnlyInOtherRange(succ) && succ != otherRange.begin {
           return true
         }
         // The entry of the begin-block is conceptually not part of the range. We can check if
@@ -294,3 +313,16 @@ private extension BasicBlockRange {
   }
 }
 
+private func isInLoop(block startBlock: BasicBlock, _ context: FunctionPassContext) -> Bool {
+  var worklist = BasicBlockWorklist(context)
+  defer { worklist.deinitialize() }
+
+  worklist.pushIfNotVisited(contentsOf: startBlock.successors)
+  while let block = worklist.pop() {
+    if block == startBlock {
+      return true
+    }
+    worklist.pushIfNotVisited(contentsOf: block.successors)
+  }
+  return false
+}

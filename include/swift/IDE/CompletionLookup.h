@@ -26,7 +26,7 @@
 #include "swift/IDE/CodeCompletionResult.h"
 #include "swift/IDE/CodeCompletionStringPrinter.h"
 #include "swift/IDE/PossibleParamInfo.h"
-#include "swift/Parse/CodeCompletionCallbacks.h"
+#include "swift/Parse/IDEInspectionCallbacks.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "swift/Strings.h"
 
@@ -42,6 +42,9 @@ bool DefaultFilter(ValueDecl *VD, DeclVisibilityKind Kind,
 
 bool KeyPathFilter(ValueDecl *decl, DeclVisibilityKind,
                    DynamicLookupInfo dynamicLookupInfo);
+
+bool MacroFilter(ValueDecl *decl, DeclVisibilityKind,
+                 DynamicLookupInfo dynamicLookupInfo);
 
 /// Returns \c true only if the completion is happening for top-level
 /// declrarations. i.e.:
@@ -102,6 +105,9 @@ class CompletionLookup final : public swift::VisibleDeclConsumer {
     TypeInDeclContext,
     ImportFromModule,
     GenericRequirement,
+
+    /// Look up stored properties within a type.
+    StoredProperty,
   };
 
   LookupKind Kind;
@@ -128,7 +134,7 @@ class CompletionLookup final : public swift::VisibleDeclConsumer {
   bool CanCurrDeclContextHandleAsync = false;
   /// Actor isolations that were determined during constraint solving but that
   /// haven't been saved to the AST.
-  llvm::DenseMap<AbstractClosureExpr *, ClosureActorIsolation>
+  llvm::DenseMap<AbstractClosureExpr *, ActorIsolation>
       ClosureActorIsolations;
   bool HaveDot = false;
   bool IsUnwrappedOptional = false;
@@ -160,7 +166,7 @@ class CompletionLookup final : public swift::VisibleDeclConsumer {
   /// Innermost method that the code completion point is in.
   const AbstractFunctionDecl *CurrentMethod = nullptr;
 
-  Optional<SemanticContextKind> ForcedSemanticContext = None;
+  llvm::Optional<SemanticContextKind> ForcedSemanticContext = llvm::None;
   bool IsUnresolvedMember = false;
 
 public:
@@ -182,44 +188,27 @@ private:
 public:
   struct RequestedResultsTy {
     const ModuleDecl *TheModule;
-    bool OnlyTypes;
-    bool OnlyPrecedenceGroups;
+    CodeCompletionFilter Filter;
     bool NeedLeadingDot;
-    bool IncludeModuleQualifier;
 
-    static RequestedResultsTy fromModule(const ModuleDecl *TheModule) {
-      return {TheModule, false, false, false, true};
+    static RequestedResultsTy fromModule(const ModuleDecl *mod,
+                                         CodeCompletionFilter filter) {
+      return {mod, filter, /*NeedLeadingDot=*/false};
     }
 
-    RequestedResultsTy onlyTypes() const {
-      return {TheModule, true, false, NeedLeadingDot, IncludeModuleQualifier};
+    static RequestedResultsTy topLevelResults(CodeCompletionFilter filter) {
+      return {nullptr, filter, /*NeedLeadingDot=*/false};
     }
 
-    RequestedResultsTy onlyPrecedenceGroups() const {
-      assert(!OnlyTypes && "onlyTypes() already includes precedence groups");
-      return {TheModule, false, true, false, true};
-    }
-
-    RequestedResultsTy needLeadingDot(bool NeedDot) const {
-      return {TheModule, OnlyTypes, OnlyPrecedenceGroups, NeedDot,
-              IncludeModuleQualifier};
-    }
-
-    RequestedResultsTy withModuleQualifier(bool IncludeModule) const {
-      return {TheModule, OnlyTypes, OnlyPrecedenceGroups, NeedLeadingDot,
-              IncludeModule};
-    }
-
-    static RequestedResultsTy toplevelResults() {
-      return {nullptr, false, false, false, true};
+    RequestedResultsTy needLeadingDot(bool needDot) const {
+      return {TheModule, Filter, needDot};
     }
 
     friend bool operator==(const RequestedResultsTy &LHS,
                            const RequestedResultsTy &RHS) {
-      return LHS.TheModule == RHS.TheModule && LHS.OnlyTypes == RHS.OnlyTypes &&
-             LHS.OnlyPrecedenceGroups == RHS.OnlyPrecedenceGroups &&
-             LHS.NeedLeadingDot == RHS.NeedLeadingDot &&
-             LHS.IncludeModuleQualifier == RHS.IncludeModuleQualifier;
+      return LHS.TheModule == RHS.TheModule &&
+             LHS.Filter.containsOnly(RHS.Filter) &&
+             LHS.NeedLeadingDot == RHS.NeedLeadingDot;
     }
   };
 
@@ -267,7 +256,7 @@ public:
   }
 
   void setClosureActorIsolations(
-      llvm::DenseMap<AbstractClosureExpr *, ClosureActorIsolation>
+      llvm::DenseMap<AbstractClosureExpr *, ActorIsolation>
           ClosureActorIsolations) {
     this->ClosureActorIsolations = ClosureActorIsolations;
   }
@@ -327,8 +316,9 @@ public:
   void collectImportedModules(llvm::StringSet<> &directImportedModules,
                               llvm::StringSet<> &allImportedModules);
 
-  void addModuleName(ModuleDecl *MD,
-                     Optional<ContextualNotRecommendedReason> R = None);
+  void
+  addModuleName(ModuleDecl *MD,
+                llvm::Optional<ContextualNotRecommendedReason> R = llvm::None);
 
   void addImportModuleNames();
 
@@ -337,6 +327,12 @@ public:
                                          DynamicLookupInfo dynamicLookupInfo);
 
   bool isUnresolvedMemberIdealType(Type Ty);
+
+  /// Creates a \c CodeCompletionResultBuilder in this lookup’s sink and sets
+  /// the current expected type context in it
+  CodeCompletionResultBuilder
+  makeResultBuilder(CodeCompletionResultKind kind,
+                    SemanticContextKind semanticContext) const;
 
   void addValueBaseName(CodeCompletionResultBuilder &Builder,
                         DeclBaseName Name);
@@ -366,7 +362,7 @@ public:
 
   void analyzeActorIsolation(
       const ValueDecl *VD, Type T, bool &implicitlyAsync,
-      Optional<ContextualNotRecommendedReason> &NotRecommended);
+      llvm::Optional<ContextualNotRecommendedReason> &NotRecommended);
 
   void addVarDeclRef(const VarDecl *VD, DeclVisibilityKind Reason,
                      DynamicLookupInfo dynamicLookupInfo);
@@ -397,7 +393,7 @@ public:
                                    const AbstractFunctionDecl *AFD,
                                    bool forceAsync = false);
 
-  void addPoundAvailable(Optional<StmtKind> ParentKind);
+  void addPoundAvailable(llvm::Optional<StmtKind> ParentKind);
 
   void addPoundSelector(bool needPound);
 
@@ -407,11 +403,11 @@ public:
 
   void addSubscriptCallPattern(
       const AnyFunctionType *AFT, const SubscriptDecl *SD,
-      const Optional<SemanticContextKind> SemanticContext = None);
+      const llvm::Optional<SemanticContextKind> SemanticContext = llvm::None);
 
   void addFunctionCallPattern(
       const AnyFunctionType *AFT, const AbstractFunctionDecl *AFD = nullptr,
-      const Optional<SemanticContextKind> SemanticContext = None);
+      const llvm::Optional<SemanticContextKind> SemanticContext = llvm::None);
 
   bool isImplicitlyCurriedInstanceMethod(const AbstractFunctionDecl *FD);
 
@@ -420,8 +416,8 @@ public:
 
   void addConstructorCall(const ConstructorDecl *CD, DeclVisibilityKind Reason,
                           DynamicLookupInfo dynamicLookupInfo,
-                          Optional<Type> BaseType, Optional<Type> Result,
-                          bool IsOnType = true,
+                          llvm::Optional<Type> BaseType,
+                          llvm::Optional<Type> Result, bool IsOnType = true,
                           Identifier addName = Identifier());
 
   void addConstructorCallsForType(Type type, Identifier name,
@@ -450,6 +446,7 @@ public:
   void addEnumElementRef(const EnumElementDecl *EED, DeclVisibilityKind Reason,
                          DynamicLookupInfo dynamicLookupInfo,
                          bool HasTypeContext);
+  void addMacroExpansion(const MacroDecl *MD, DeclVisibilityKind Reason);
 
   void addKeyword(
       StringRef Name, Type TypeAnnotation = Type(),
@@ -462,8 +459,8 @@ public:
       CodeCompletionKeywordKind KeyKind = CodeCompletionKeywordKind::None,
       CodeCompletionFlair flair = {});
 
-  void addDeclAttrParamKeyword(StringRef Name, StringRef Annotation,
-                               bool NeedSpecify);
+  void addDeclAttrParamKeyword(StringRef Name, ArrayRef<StringRef> Parameters,
+                               StringRef Annotation, bool NeedSpecify);
 
   void addDeclAttrKeyword(StringRef Name, StringRef Annotation);
 
@@ -474,13 +471,17 @@ public:
                                          DynamicLookupInfo dynamicLookupInfo);
 
 private:
+  /// Normalize the type for 'isDupelicate' check.
+  Type normalizeTypeForDuplicationCheck(Type Ty);
+
   /// Returns true if duplicate checking is enabled (via
   /// \c shouldCheckForDuplicates) and this decl + type combination has been
   /// checked previously. Returns false otherwise.
   bool isDuplicate(const ValueDecl *D, Type Ty) {
     if (!CheckForDuplicates)
       return false;
-    return !PreviouslySeen.insert({D, Ty}).second;
+    return !PreviouslySeen.insert({D, normalizeTypeForDuplicationCheck(Ty)})
+                .second;
   }
 
   /// Returns true if duplicate checking is enabled (via
@@ -490,7 +491,8 @@ private:
     if (!CheckForDuplicates)
       return false;
     Type Ty = getTypeOfMember(D, dynamicLookupInfo);
-    return !PreviouslySeen.insert({D, Ty}).second;
+    return !PreviouslySeen.insert({D, normalizeTypeForDuplicationCheck(Ty)})
+                .second;
   }
 
 public:
@@ -508,9 +510,9 @@ public:
 
   bool tryFunctionCallCompletions(
       Type ExprType, const ValueDecl *VD,
-      Optional<SemanticContextKind> SemanticContext = None);
+      llvm::Optional<SemanticContextKind> SemanticContext = llvm::None);
 
-  bool tryModuleCompletions(Type ExprType, bool TypesOnly = false);
+  bool tryModuleCompletions(Type ExprType, CodeCompletionFilter Filter);
 
   /// If the given ExprType is optional, this adds completions for the unwrapped
   /// type.
@@ -520,7 +522,17 @@ public:
 
   void getPostfixKeywordCompletions(Type ExprType, Expr *ParsedExpr);
 
-  void getValueExprCompletions(Type ExprType, ValueDecl *VD = nullptr);
+  /// Add code completion results after an expression of type \p ExprType.
+  /// This includes members as well as call patterns if \p ExprType is a
+  /// function type.
+  /// If \p IsDeclUnapplied is \c true, we are completing after a refernce to
+  /// \p VD that hasn't been called yet. Thus, \p VD has type \p ExprType and we
+  /// can use \p VD to enrich call pattern completions of \p ExprType.
+  void getValueExprCompletions(Type ExprType, ValueDecl *VD = nullptr,
+                               bool IsDeclUnapplied = false);
+
+  /// Add completions for stored properties of \p D.
+  void getStoredPropertyCompletions(const NominalTypeDecl *D);
 
   void collectOperators(SmallVectorImpl<OperatorDecl *> &results);
 
@@ -528,28 +540,19 @@ public:
 
   void addPostfixOperatorCompletion(OperatorDecl *op, Type resultType);
 
-  void tryPostfixOperator(Expr *expr, PostfixOperatorDecl *op);
-
-  void addAssignmentOperator(Type RHSType, Type resultType);
+  void addAssignmentOperator(Type RHSType);
 
   void addInfixOperatorCompletion(OperatorDecl *op, Type resultType,
                                   Type RHSType);
 
-  void tryInfixOperatorCompletion(Expr *foldedExpr, InfixOperatorDecl *op);
-
-  Expr *typeCheckLeadingSequence(Expr *LHS, ArrayRef<Expr *> leadingSequence);
-
-  void getOperatorCompletions(Expr *LHS, ArrayRef<Expr *> leadingSequence);
-
   void addTypeRelationFromProtocol(CodeCompletionResultBuilder &builder,
                                    CodeCompletionLiteralKind kind);
-
-  /// Add '#file', '#line', et at.
-  void addPoundLiteralCompletions(bool needPound);
 
   void addValueLiteralCompletions();
 
   void addObjCPoundKeywordCompletions(bool needPound);
+
+  void getMacroCompletions(CodeCompletionMacroRoles roles);
 
   struct FilteredDeclConsumer : public swift::VisibleDeclConsumer {
     swift::VisibleDeclConsumer &Consumer;
@@ -590,17 +593,20 @@ public:
 
   static bool canUseAttributeOnDecl(DeclAttrKind DAK, bool IsInSil,
                                     bool IsConcurrencyEnabled,
-                                    Optional<DeclKind> DK);
+                                    llvm::Optional<DeclKind> DK,
+                                    StringRef Name);
 
-  void getAttributeDeclCompletions(bool IsInSil, Optional<DeclKind> DK);
+  void getAttributeDeclCompletions(bool IsInSil, llvm::Optional<DeclKind> DK);
 
-  void getAttributeDeclParamCompletions(DeclAttrKind AttrKind, int ParamIndex);
+  void getAttributeDeclParamCompletions(CustomSyntaxAttributeKind AttrKind,
+                                        int ParamIndex, bool HasLabel);
 
   void getTypeAttributeKeywordCompletions();
 
   void collectPrecedenceGroups();
 
-  void getPrecedenceGroupCompletions(CodeCompletionCallbacks::PrecedenceGroupCompletionKind SK);
+  void getPrecedenceGroupCompletions(
+      CodeCompletionCallbacks::PrecedenceGroupCompletionKind SK);
 
   void getPoundAvailablePlatformCompletions();
 
@@ -612,7 +618,7 @@ public:
   void getTypeCompletionsInDeclContext(SourceLoc Loc,
                                        bool ModuleQualifier = true);
 
-  void getToplevelCompletions(bool OnlyTypes);
+  void getToplevelCompletions(CodeCompletionFilter Filter);
 
   void lookupExternalModuleDecls(const ModuleDecl *TheModule,
                                  ArrayRef<std::string> AccessPath,
@@ -621,6 +627,8 @@ public:
   void getStmtLabelCompletions(SourceLoc Loc, bool isContinue);
 
   void getOptionalBindingCompletions(SourceLoc Loc);
+
+  void getWithoutConstraintTypes();
 };
 
 } // end namespace ide
@@ -631,18 +639,15 @@ using RequestedResultsTy = swift::ide::CompletionLookup::RequestedResultsTy;
 template <>
 struct DenseMapInfo<RequestedResultsTy> {
   static inline RequestedResultsTy getEmptyKey() {
-    return {DenseMapInfo<swift::ModuleDecl *>::getEmptyKey(), false, false,
-            false, false};
+    return {DenseMapInfo<swift::ModuleDecl *>::getEmptyKey(), {}, false};
   }
   static inline RequestedResultsTy getTombstoneKey() {
-    return {DenseMapInfo<swift::ModuleDecl *>::getTombstoneKey(), false, false,
-            false, false};
+    return {DenseMapInfo<swift::ModuleDecl *>::getTombstoneKey(), {}, false};
   }
   static unsigned getHashValue(const RequestedResultsTy &Val) {
     return hash_combine(
         DenseMapInfo<swift::ModuleDecl *>::getHashValue(Val.TheModule),
-        Val.OnlyTypes, Val.OnlyPrecedenceGroups, Val.NeedLeadingDot,
-        Val.IncludeModuleQualifier);
+        Val.Filter.toRaw(), Val.NeedLeadingDot);
   }
   static bool isEqual(const RequestedResultsTy &LHS,
                       const RequestedResultsTy &RHS) {

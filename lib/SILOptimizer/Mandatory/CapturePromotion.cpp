@@ -465,9 +465,10 @@ ClosureCloner::initCloned(SILOptFunctionBuilder &functionBuilder,
   auto *fn = functionBuilder.createFunction(
       orig->getLinkage(), clonedName, clonedTy, orig->getGenericEnvironment(),
       orig->getLocation(), orig->isBare(), IsNotTransparent, serialized,
-      IsNotDynamic, IsNotDistributed, orig->getEntryCount(), orig->isThunk(),
-      orig->getClassSubclassScope(), orig->getInlineStrategy(),
-      orig->getEffectsKind(), orig, orig->getDebugScope());
+      IsNotDynamic, IsNotDistributed, IsNotRuntimeAccessible,
+      orig->getEntryCount(), orig->isThunk(), orig->getClassSubclassScope(),
+      orig->getInlineStrategy(), orig->getEffectsKind(), orig,
+      orig->getDebugScope());
   for (auto &attr : orig->getSemanticsAttrs())
     fn->addSemanticsAttr(attr);
   return fn;
@@ -493,10 +494,7 @@ void ClosureCloner::populateCloned() {
       // Simply create a new argument which copies the original argument
       auto *mappedValue = clonedEntryBB->createFunctionArgument(
           (*ai)->getType(), (*ai)->getDecl());
-      mappedValue->setNoImplicitCopy(
-          cast<SILFunctionArgument>(*ai)->isNoImplicitCopy());
-      mappedValue->setLifetimeAnnotation(
-          cast<SILFunctionArgument>(*ai)->getLifetimeAnnotation());
+      mappedValue->copyFlags(cast<SILFunctionArgument>(*ai));
       entryArgs.push_back(mappedValue);
       continue;
     }
@@ -510,10 +508,7 @@ void ClosureCloner::populateCloned() {
                        .getObjectType();
     auto *newArg =
         clonedEntryBB->createFunctionArgument(boxedTy, (*ai)->getDecl());
-    newArg->setNoImplicitCopy(
-        cast<SILFunctionArgument>(*ai)->isNoImplicitCopy());
-    newArg->setLifetimeAnnotation(
-        cast<SILFunctionArgument>(*ai)->getLifetimeAnnotation());
+    newArg->copyFlags(cast<SILFunctionArgument>(*ai));
     SILValue mappedValue = newArg;
 
     // If SIL ownership is enabled, we need to perform a borrow here if we have
@@ -692,6 +687,7 @@ void ClosureCloner::visitEndAccessInst(EndAccessInst *eai) {
 /// The two relevant cases are a direct load from a promoted address argument or
 /// a load of a struct_element_addr of a promoted address argument.
 void ClosureCloner::visitLoadBorrowInst(LoadBorrowInst *lbi) {
+  getBuilder().setCurrentDebugScope(getOpScope(lbi->getDebugScope()));
   assert(lbi->getFunction()->hasOwnership() &&
          "We should only see a load borrow in ownership qualified SIL");
   if (SILValue value = getProjectBoxMappedVal(lbi->getOperand())) {
@@ -734,6 +730,7 @@ void ClosureCloner::visitLoadBorrowInst(LoadBorrowInst *lbi) {
 /// The two relevant cases are a direct load from a promoted address argument or
 /// a load of a struct_element_addr of a promoted address argument.
 void ClosureCloner::visitLoadInst(LoadInst *li) {
+  getBuilder().setCurrentDebugScope(getOpScope(li->getDebugScope()));
   if (SILValue value = getProjectBoxMappedVal(li->getOperand())) {
     // Loads of the address argument get eliminated completely; the uses of
     // the loads get mapped to uses of the new object type argument.
@@ -1558,7 +1555,9 @@ processPartialApplyInst(SILOptFunctionBuilder &funcBuilder,
         builder.setInsertionPoint(std::next(SILBasicBlock::iterator(dsi)));
         insertDestroyOfCapturedArguments(
             newPAI, builder,
-            [&](SILValue arg) -> bool { return newCaptures.count(arg); });
+            [&](SILValue arg) -> SILValue {
+              return newCaptures.count(arg) ? arg : SILValue();
+            });
       }
     }
     // Map the mark dependence arguments.

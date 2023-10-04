@@ -73,6 +73,9 @@ public:
   /// descriptive style that's specific to Swift (currently experimental).
   FormattingStyle PrintedFormattingStyle = FormattingStyle::LLVM;
 
+  /// Whether to emit macro expansion buffers into separate, temporary files.
+  bool EmitMacroExpansionFiles = true;
+
   std::string DiagnosticDocumentationPath = "";
 
   std::string LocalizationCode = "";
@@ -80,10 +83,24 @@ public:
   /// Path to a directory of diagnostic localization tables.
   std::string LocalizationPath = "";
 
+  /// A list of prefixes that are appended to expected- that the diagnostic
+  /// verifier should check for diagnostics.
+  ///
+  /// For example, if one placed the phrase "NAME", the verifier will check for:
+  /// expected-$NAME{error,note,warning,remark} as well as the normal expected-
+  /// prefixes.
+  std::vector<std::string> AdditionalDiagnosticVerifierPrefixes;
+
   /// Return a hash code of any components from these options that should
   /// contribute to a Swift Bridging PCH hash.
   llvm::hash_code getPCHHashComponents() const {
     // Nothing here that contributes anything significant when emitting the PCH.
+    return llvm::hash_value(0);
+  }
+
+  /// Return a hash code of any components from these options that should
+  /// contribute to a Swift Dependency Scanning hash.
+  llvm::hash_code getModuleScanningHashComponents() const {
     return llvm::hash_value(0);
   }
 };

@@ -395,7 +395,7 @@ extension Substring: StringProtocol {
         i = _uncheckedIndex(after: i)
       }
     } else if i > end {
-      while i > end { // Note `<` instead of `==`
+      while i > end { // Note `>` instead of `==`
         count -= 1
         i = _uncheckedIndex(before: i)
       }
@@ -778,7 +778,7 @@ extension String {
   /// If `codeUnits` is an ill-formed code unit sequence, the result is `nil`.
   ///
   /// - Complexity: O(N), where N is the length of the resulting `String`'s
-  ///   UTF-16.
+  ///   UTF-8 representation.
   public init?(_ codeUnits: Substring.UTF8View) {
     let guts = codeUnits._wholeGuts
     guard guts.isOnUnicodeScalarBoundary(codeUnits.startIndex),

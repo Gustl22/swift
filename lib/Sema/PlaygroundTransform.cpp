@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2023 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -41,13 +41,18 @@ private:
   std::mt19937_64 &RNG;
   unsigned &TmpNameIndex;
   bool HighPerformance;
+  bool ExtendedCallbacks;
 
   DeclNameRef DebugPrintName;
   DeclNameRef PrintName;
   DeclNameRef PostPrintName;
+  DeclNameRef PostPrintExtendedName;
   DeclNameRef LogWithIDName;
+  DeclNameRef LogWithIDExtendedName;
   DeclNameRef LogScopeExitName;
+  DeclNameRef LogScopeExitExtendedName;
   DeclNameRef LogScopeEntryName;
+  DeclNameRef LogScopeEntryExtendedName;
   DeclNameRef SendDataName;
 
   struct BracePair {
@@ -126,12 +131,17 @@ public:
                unsigned &TmpNameIndex)
       : InstrumenterBase(C, DC), RNG(RNG), TmpNameIndex(TmpNameIndex),
         HighPerformance(HP),
+        ExtendedCallbacks(C.LangOpts.hasFeature(Feature::PlaygroundExtendedCallbacks)),
         DebugPrintName(C.getIdentifier("__builtin_debugPrint")),
         PrintName(C.getIdentifier("__builtin_print")),
         PostPrintName(C.getIdentifier("__builtin_postPrint")),
+        PostPrintExtendedName(C.getIdentifier("__builtin_postPrint_extended")),
         LogWithIDName(C.getIdentifier("__builtin_log_with_id")),
+        LogWithIDExtendedName(C.getIdentifier("__builtin_log_with_id_extended")),
         LogScopeExitName(C.getIdentifier("__builtin_log_scope_exit")),
+        LogScopeExitExtendedName(C.getIdentifier("__builtin_log_scope_exit_extended")),
         LogScopeEntryName(C.getIdentifier("__builtin_log_scope_entry")),
+        LogScopeEntryExtendedName(C.getIdentifier("__builtin_log_scope_entry_extended")),
         SendDataName(C.getIdentifier("__builtin_send_data")) { }
 
   Stmt *transformStmt(Stmt *S) {
@@ -290,8 +300,9 @@ public:
       return D;
     if (auto *FD = dyn_cast<FuncDecl>(D)) {
       if (BraceStmt *B = FD->getBody()) {
+        const ParameterList *PL = FD->getParameters();
         TargetKindSetter TKS(BracePairs, BracePair::TargetKinds::Return);
-        BraceStmt *NB = transformBraceStmt(B);
+        BraceStmt *NB = transformBraceStmt(B, PL);
         if (NB != B) {
           FD->setBody(NB, AbstractFunctionDecl::BodyKind::TypeChecked);
           TypeChecker::checkFunctionEffects(FD);
@@ -380,7 +391,9 @@ public:
     return uniqueRef;
   }
 
-  BraceStmt *transformBraceStmt(BraceStmt *BS, bool TopLevel = false) override {
+  BraceStmt *transformBraceStmt(BraceStmt *BS,
+                                const ParameterList *PL = nullptr,
+                                bool TopLevel = false) override {
     ArrayRef<ASTNode> OriginalElements = BS->getElements();
     using ElementVector = SmallVector<swift::ASTNode, 3>;
     ElementVector Elements(OriginalElements.begin(), OriginalElements.end());
@@ -578,7 +591,7 @@ public:
         if (auto *PBD = dyn_cast<PatternBindingDecl>(D)) {
           if (!PBD->isAsyncLet()) {
             if (VarDecl *VD = PBD->getSingleVar()) {
-              if (VD->getParentInitializer()) {
+              if (VD->getParentExecutableInitializer()) {
                 Added<Stmt *> Log = logVarDecl(VD);
                 if (*Log) {
                   Elements.insert(Elements.begin() + (EI + 1), *Log);
@@ -589,6 +602,27 @@ public:
           }
         } else {
           transformDecl(D);
+        }
+      }
+    }
+
+    // If we were given any parameters that apply to this brace block, we insert
+    // log calls for them now (before any of the other statements). We only log
+    // named parameters (not `{ _ in ... }`, for example).
+    if (PL && !HighPerformance) {
+      size_t EI = 0;
+      for (const auto &PD : *PL) {
+        if (PD->hasName()) {
+          DeclBaseName Name = PD->getName();
+          Expr *PVVarRef = new (Context)
+              DeclRefExpr(PD, DeclNameLoc(), /*implicit=*/true,
+                          AccessSemantics::Ordinary, PD->getTypeInContext());
+          Added<Stmt *> Log(buildLoggerCall(PVVarRef, PD->getSourceRange(),
+                                            Name.getIdentifier().str()));
+          if (*Log) {
+            Elements.insert(Elements.begin() + EI, *Log);
+            EI++;
+          }
         }
       }
     }
@@ -712,7 +746,7 @@ public:
   }
 
   Added<Stmt *> logPostPrint(SourceRange SR) {
-    return buildLoggerCallWithArgs(PostPrintName, {}, SR);
+    return buildLoggerCallWithArgs(ExtendedCallbacks ? PostPrintExtendedName : PostPrintName, {}, SR);
   }
 
   std::pair<PatternBindingDecl *, VarDecl *>
@@ -736,7 +770,7 @@ public:
     VD->setInterfaceType(MaybeLoadInitExpr->getType()->mapTypeOutOfContext());
     VD->setImplicit();
 
-    NamedPattern *NP = NamedPattern::createImplicit(Context, VD);
+    NamedPattern *NP = NamedPattern::createImplicit(Context, VD, VD->getTypeInContext());
     PatternBindingDecl *PBD = PatternBindingDecl::createImplicit(
         Context, StaticSpellingKind::None, NP, MaybeLoadInitExpr, TypeCheckDC);
 
@@ -750,17 +784,17 @@ public:
 
     std::uniform_int_distribution<unsigned> Distribution(0, 0x7fffffffu);
     const unsigned id_num = Distribution(RNG);
-    Expr *IDExpr = IntegerLiteralExpr::createFromUnsigned(Context, id_num);
+    Expr *IDExpr = IntegerLiteralExpr::createFromUnsigned(Context, id_num, SourceLoc());
 
-    return buildLoggerCallWithArgs(LogWithIDName, { *E, NameExpr, IDExpr }, SR);
+    return buildLoggerCallWithArgs(ExtendedCallbacks ? LogWithIDExtendedName : LogWithIDName, { *E, NameExpr, IDExpr }, SR);
   }
 
   Added<Stmt *> buildScopeEntry(SourceRange SR) {
-    return buildLoggerCallWithArgs(LogScopeEntryName, {}, SR);
+    return buildLoggerCallWithArgs(ExtendedCallbacks ? LogScopeEntryExtendedName : LogScopeEntryName, {}, SR);
   }
 
   Added<Stmt *> buildScopeExit(SourceRange SR) {
-    return buildLoggerCallWithArgs(LogScopeExitName, {}, SR);
+    return buildLoggerCallWithArgs(ExtendedCallbacks ? LogScopeExitExtendedName : LogScopeExitName, {}, SR);
   }
 
   Added<Stmt *> buildLoggerCallWithArgs(DeclNameRef LoggerName,
@@ -779,23 +813,37 @@ public:
         Context.SourceMgr.getPresumedLineAndColumnForLoc(
             Lexer::getLocForEndOfToken(Context.SourceMgr, SR.End));
 
-    Expr *StartLine = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.first);
-    Expr *EndLine = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.first);
-    Expr *StartColumn = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.second);
-    Expr *EndColumn = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.second);
+    Expr *StartLine = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.first, SR.Start);
+    Expr *EndLine = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.first, SR.End);
+    Expr *StartColumn = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.second, SR.Start);
+    Expr *EndColumn = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.second, SR.End);
 
     Expr *ModuleExpr = buildIDArgumentExpr(ModuleIdentifier, SR);
     Expr *FileExpr = buildIDArgumentExpr(FileIdentifier, SR);
 
     llvm::SmallVector<Expr *, 6> ArgsWithSourceRange(Args.begin(), Args.end());
 
-    ArgsWithSourceRange.append(
-        {StartLine, EndLine, StartColumn, EndColumn, ModuleExpr, FileExpr});
-
     UnresolvedDeclRefExpr *LoggerRef = new (Context)
         UnresolvedDeclRefExpr(LoggerName, DeclRefKind::Ordinary,
                               DeclNameLoc(SR.End));
     LoggerRef->setImplicit(true);
+
+    if (ExtendedCallbacks) {
+      StringRef filePath = Context.SourceMgr.getDisplayNameForLoc(SR.Start);
+
+      Expr *FilePathExpr = new (Context) StringLiteralExpr(
+          Context.AllocateCopy(filePath), SourceRange(), /*implicit=*/true);
+
+      std::string moduleName = std::string(TypeCheckDC->getParentModule()->getName());
+      Expr *ModuleNameExpr = new (Context) StringLiteralExpr(
+          Context.AllocateCopy(moduleName), SourceRange(), /*implicit=*/true);
+
+      ArgsWithSourceRange.append(
+          {StartLine, EndLine, StartColumn, EndColumn, ModuleNameExpr, FilePathExpr});
+    } else {
+      ArgsWithSourceRange.append(
+          {StartLine, EndLine, StartColumn, EndColumn, ModuleExpr, FileExpr});
+    }
 
     auto *ArgList =
         ArgumentList::forImplicitUnlabeled(Context, ArgsWithSourceRange);
@@ -861,12 +909,17 @@ void swift::performPlaygroundTransform(SourceFile &SF, bool HighPerformance) {
     // FIXME: Remove this
     bool shouldWalkAccessorsTheOldWay() override { return true; }
 
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
+
     PreWalkAction walkToDeclPre(Decl *D) override {
       if (auto *FD = dyn_cast<AbstractFunctionDecl>(D)) {
         if (!FD->isImplicit()) {
           if (BraceStmt *Body = FD->getBody()) {
+            const ParameterList *PL = FD->getParameters();
             Instrumenter I(ctx, FD, RNG, HighPerformance, TmpNameIndex);
-            BraceStmt *NewBody = I.transformBraceStmt(Body);
+            BraceStmt *NewBody = I.transformBraceStmt(Body, PL);
             if (NewBody != Body) {
               FD->setBody(NewBody, AbstractFunctionDecl::BodyKind::TypeChecked);
               TypeChecker::checkFunctionEffects(FD);
@@ -878,7 +931,7 @@ void swift::performPlaygroundTransform(SourceFile &SF, bool HighPerformance) {
         if (!TLCD->isImplicit()) {
           if (BraceStmt *Body = TLCD->getBody()) {
             Instrumenter I(ctx, TLCD, RNG, HighPerformance, TmpNameIndex);
-            BraceStmt *NewBody = I.transformBraceStmt(Body, true);
+            BraceStmt *NewBody = I.transformBraceStmt(Body, nullptr, true);
             if (NewBody != Body) {
               TLCD->setBody(NewBody);
               TypeChecker::checkTopLevelEffects(TLCD);

@@ -50,15 +50,15 @@ void UnitTestSourceFileDepGraphFactory::addAllUsedDecls() {
 
 void UnitTestSourceFileDepGraphFactory::addADefinedDecl(StringRef s,
                                                         const NodeKind kind) {
-  const Optional<DependencyKey> key =
+  const llvm::Optional<DependencyKey> key =
       parseADefinedDecl(s, kind, DeclAspect::interface);
   if (!key)
     return;
   auto fingerprintString = s.split(fingerprintSeparator).second.str();
-  const Optional<Fingerprint> fingerprint =
-    swift::mockFingerprintFromString(fingerprintString);
+  const llvm::Optional<Fingerprint> fingerprint =
+      swift::mockFingerprintFromString(fingerprintString);
 
-  AbstractSourceFileDepGraphFactory::addADefinedDecl(key.getValue(),
+  AbstractSourceFileDepGraphFactory::addADefinedDecl(key.value(),
                                                      fingerprint);
 }
 
@@ -80,7 +80,7 @@ UnitTestSourceFileDepGraphFactory::computeUseKey(StringRef s,
       isCascadingUse ? DeclAspect::interface : DeclAspect::implementation;
 
   if (!s.empty())
-    return parseADefinedDecl(s, kindOfUse, aspectOfUse).getValue();
+    return parseADefinedDecl(s, kindOfUse, aspectOfUse).value();
   StringRef swiftDepsRef(swiftDeps);
   return DependencyKey::Builder(NodeKind::sourceFileProvide, aspectOfUse)
           .withName(swiftDepsRef)
@@ -97,8 +97,10 @@ bool UnitTestSourceFileDepGraphFactory::isADefinedDecl(StringRef s) {
   return s.find(defUseSeparator) == StringRef::npos;
 }
 
-Optional<DependencyKey> UnitTestSourceFileDepGraphFactory::parseADefinedDecl(
-    StringRef s, const NodeKind kind, const DeclAspect aspect) {
+llvm::Optional<DependencyKey>
+UnitTestSourceFileDepGraphFactory::parseADefinedDecl(StringRef s,
+                                                     const NodeKind kind,
+                                                     const DeclAspect aspect) {
   static const char *privatePrefix = "#";
 
   s.consume_front(privatePrefix);
@@ -109,7 +111,7 @@ Optional<DependencyKey> UnitTestSourceFileDepGraphFactory::parseADefinedDecl(
   return DependencyKey(kind, aspect, context, name);
 }
 
-Optional<std::pair<DependencyKey, DependencyKey>>
+llvm::Optional<std::pair<DependencyKey, DependencyKey>>
 UnitTestSourceFileDepGraphFactory::parseAUsedDecl(const StringRef argString,
                                                   const NodeKind kind) {
   static const char *noncascadingPrefix = "#";
@@ -132,7 +134,7 @@ UnitTestSourceFileDepGraphFactory::parseAUsedDecl(const StringRef argString,
                         computeUseKey(defUseStrings.second, isCascadingUse));
 }
 
-Optional<bool>
+llvm::Optional<bool>
 UnitTestSourceFileDepGraphFactory::singleNameIsContext(const NodeKind kind) {
   switch (kind) {
   case NodeKind::nominal:
@@ -144,7 +146,7 @@ UnitTestSourceFileDepGraphFactory::singleNameIsContext(const NodeKind kind) {
   case NodeKind::sourceFileProvide:
     return false;
   case NodeKind::member:
-    return None;
+    return llvm::None;
   case NodeKind::kindCount:
     llvm_unreachable("impossible case");
   }
@@ -155,7 +157,7 @@ UnitTestSourceFileDepGraphFactory::parseContext(const StringRef s,
                                                 const NodeKind kind) {
   return !singleNameIsContext(kind)
              ? s.split(nameContextSeparator).first.str()
-             : singleNameIsContext(kind).getValue() ? s.str() : "";
+             : singleNameIsContext(kind).value() ? s.str() : "";
 }
 
 std::string UnitTestSourceFileDepGraphFactory::parseName(const StringRef s,
@@ -163,7 +165,7 @@ std::string UnitTestSourceFileDepGraphFactory::parseName(const StringRef s,
   const std::string name =
       !singleNameIsContext(kind)
           ? s.split(nameContextSeparator).second.str()
-          : singleNameIsContext(kind).getValue() ? "" : s.str();
+          : singleNameIsContext(kind).value() ? "" : s.str();
   assert(kind != NodeKind::member ||
          !name.empty() && "Should be a potentialMember");
   return name;

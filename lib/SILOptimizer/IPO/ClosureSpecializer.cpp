@@ -210,9 +210,21 @@ public:
     auto *PA = dyn_cast<PartialApplyInst>(newClosure);
     if (!PA || !PA->isOnStack())
       return false;
-    insertDestroyOfCapturedArguments(PA, B);
-    B.createDeallocStack(getClosure()->getLoc(), PA);
-    return true;
+
+    if (B.getFunction().hasOwnership()) {
+      // Under OSSA, the closure acts as an owned value whose lifetime is a
+      // borrow scope for the captures, so we need to end the borrow scope
+      // before ending the lifetimes of the captures themselves.
+      B.createDestroyValue(getClosure()->getLoc(), PA);
+      insertDestroyOfCapturedArguments(PA, B);
+      // The stack slot for the partial_apply doesn't get reified until after
+      // OSSA.
+      return false;
+    } else {
+      insertDestroyOfCapturedArguments(PA, B);
+      B.createDeallocStack(getClosure()->getLoc(), PA);
+      return true;
+    }
   }
 
   unsigned getClosureIndex() const { return ClosureIndex; }
@@ -448,7 +460,8 @@ static void rewriteApplyInst(const CallSiteDescriptor &CSDesc,
     // If we passed in the original closure as @owned, then insert a release
     // right after NewAI. This is to balance the +1 from being an @owned
     // argument to AI.
-    if (!CSDesc.isClosureConsumed() || !CSDesc.closureHasRefSemanticContext()) {
+    if (!CSDesc.isClosureConsumed() || CSDesc.isTrivialNoEscapeParameter() ||
+        !CSDesc.closureHasRefSemanticContext()) {
       break;
     }
 
@@ -469,7 +482,8 @@ static void rewriteApplyInst(const CallSiteDescriptor &CSDesc,
     // If we passed in the original closure as @owned, then insert a release
     // right after NewAI. This is to balance the +1 from being an @owned
     // argument to AI.
-    if (CSDesc.isClosureConsumed() && CSDesc.closureHasRefSemanticContext())
+    if (CSDesc.isClosureConsumed() && !CSDesc.isTrivialNoEscapeParameter() &&
+        CSDesc.closureHasRefSemanticContext())
       Builder.createReleaseValue(Closure->getLoc(), Closure,
                                  Builder.getDefaultAtomicity());
 
@@ -693,7 +707,8 @@ ClosureSpecCloner::initCloned(SILOptFunctionBuilder &FunctionBuilder,
       ClonedTy, ClosureUser->getGenericEnvironment(),
       ClosureUser->getLocation(), IsBare, ClosureUser->isTransparent(),
       CallSiteDesc.isSerialized(), IsNotDynamic, IsNotDistributed,
-      ClosureUser->getEntryCount(), ClosureUser->isThunk(),
+      IsNotRuntimeAccessible, ClosureUser->getEntryCount(),
+      ClosureUser->isThunk(),
       /*classSubclassScope=*/SubclassScope::NotApplicable,
       ClosureUser->getInlineStrategy(), ClosureUser->getEffectsKind(),
       ClosureUser, ClosureUser->getDebugScope());
@@ -808,10 +823,7 @@ void ClosureSpecCloner::populateCloned() {
     auto typeInContext = Cloned->getLoweredType(Arg->getType());
     auto *MappedValue =
         ClonedEntryBB->createFunctionArgument(typeInContext, Arg->getDecl());
-    MappedValue->setNoImplicitCopy(
-        cast<SILFunctionArgument>(Arg)->isNoImplicitCopy());
-    MappedValue->setLifetimeAnnotation(
-        cast<SILFunctionArgument>(Arg)->getLifetimeAnnotation());
+    MappedValue->copyFlags(cast<SILFunctionArgument>(Arg));
     entryArgs.push_back(MappedValue);
   }
 
@@ -1333,6 +1345,18 @@ bool SILClosureSpecializerTransform::gatherCallSites(
         if ((ClosureParamInfo.isGuaranteed() || IsClosurePassedTrivially) &&
             !OnlyHaveThinToThickClosure &&
             !findAllNonFailureExitBBs(ApplyCallee, NonFailureExitBBs)) {
+          continue;
+        }
+
+        // Specializing a readnone, readonly, releasenone function with a
+        // nontrivial context is illegal. Inserting a release in such a function
+        // results in miscompilation after other optimizations.
+        // For now, the specialization is disabled.
+        //
+        // TODO: A @noescape closure should never be converted to an @owned
+        // argument regardless of the function attribute.
+        if (!OnlyHaveThinToThickClosure
+            && ApplyCallee->getEffectsKind() <= EffectsKind::ReleaseNone) {
           continue;
         }
 

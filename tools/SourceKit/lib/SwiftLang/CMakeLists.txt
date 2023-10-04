@@ -9,7 +9,9 @@ add_sourcekit_library(SourceKitSwiftLang
   SwiftEditorInterfaceGen.cpp
   SwiftIndexing.cpp
   SwiftLangSupport.cpp
+  SwiftMangling.cpp
   SwiftSourceDocInfo.cpp
+  SwiftSyntacticMacroExpansion.cpp
   SwiftTypeContextInfo.cpp
     LLVM_LINK_COMPONENTS ${LLVM_TARGETS_TO_BUILD}
       bitreader
@@ -66,8 +68,3 @@ target_link_libraries(SourceKitSwiftLang PRIVATE
   clangAPINotes
   clangBasic)
 add_dependencies(SourceKitSwiftLang clang-tablegen-targets)
-
-if (SWIFT_SWIFT_PARSER)
-  target_link_libraries(SourceKitSwiftLang
-    PRIVATE swift_CompilerPluginSupport)
-endif()

@@ -320,7 +320,7 @@ template <typename T> class BlotMapVectorTest : public ::testing::Test {
 protected:
   T Map;
 
-  Optional<unsigned> NumExpectedLiveTesters;
+  llvm::Optional<unsigned> NumExpectedLiveTesters;
 
   static typename T::key_type *const dummy_key_ptr;
   static typename T::mapped_type *const dummy_value_ptr;
@@ -632,9 +632,9 @@ TEST(BlotMapVectorCustomTest, FindAsTest) {
 
   // Normal lookup tests
   EXPECT_EQ(1u, map.count(1));
-  EXPECT_EQ(1u, map.find(0)->getValue().second);
-  EXPECT_EQ(2u, map.find(1)->getValue().second);
-  EXPECT_EQ(3u, map.find(2)->getValue().second);
+  EXPECT_EQ(1u, map.find(0)->value().second);
+  EXPECT_EQ(2u, map.find(1)->value().second);
+  EXPECT_EQ(3u, map.find(2)->value().second);
   EXPECT_TRUE(map.find(3) == map.end());
 }
 

@@ -33,7 +33,7 @@ void reportEvaluatedRequest(UnifiedStatsReporter &stats,
                             const Request &request);
 
 struct FingerprintAndMembers {
-  Optional<Fingerprint> fingerprint = None;
+  llvm::Optional<Fingerprint> fingerprint = llvm::None;
   ArrayRef<Decl *> members = {};
   bool operator==(const FingerprintAndMembers &x) const {
     return fingerprint == x.fingerprint && members == x.members;
@@ -81,14 +81,14 @@ private:
 public:
   // Caching
   bool isCached() const { return true; }
-  Optional<BodyAndFingerprint> getCachedResult() const;
+  llvm::Optional<BodyAndFingerprint> getCachedResult() const;
   void cacheResult(BodyAndFingerprint value) const;
 };
 
 struct SourceFileParsingResult {
   ArrayRef<ASTNode> TopLevelItems;
-  Optional<ArrayRef<Token>> CollectedTokens;
-  Optional<StableHasher> InterfaceHasher;
+  llvm::Optional<ArrayRef<Token>> CollectedTokens;
+  llvm::Optional<StableHasher> InterfaceHasher;
 };
 
 /// Parse the top-level items of a SourceFile.
@@ -108,12 +108,30 @@ private:
 public:
   // Caching.
   bool isCached() const { return true; }
-  Optional<SourceFileParsingResult> getCachedResult() const;
+  llvm::Optional<SourceFileParsingResult> getCachedResult() const;
   void cacheResult(SourceFileParsingResult result) const;
 
 public:
   evaluator::DependencySource
   readDependencySource(const evaluator::DependencyRecorder &) const;
+};
+
+/// Parse the ExportedSourceFile for a given SourceFile.
+class ExportedSourceFileRequest
+    : public SimpleRequest<ExportedSourceFileRequest,
+                           void *(const SourceFile *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  void *evaluate(Evaluator &evaluator, const SourceFile *SF) const;
+
+public:
+  // Cached.
+  bool isCached() const { return true; }
 };
 
 /// Parse the top-level items of a SourceFile.
@@ -136,11 +154,11 @@ public:
 };
 
 void simple_display(llvm::raw_ostream &out,
-                    const CodeCompletionCallbacksFactory *factory);
+                    const IDEInspectionCallbacksFactory *factory);
 
-class CodeCompletionSecondPassRequest
-    : public SimpleRequest<CodeCompletionSecondPassRequest,
-                           bool(SourceFile *, CodeCompletionCallbacksFactory *),
+class IDEInspectionSecondPassRequest
+    : public SimpleRequest<IDEInspectionSecondPassRequest,
+                           bool(SourceFile *, IDEInspectionCallbacksFactory *),
                            RequestFlags::Uncached|RequestFlags::DependencySource> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -150,7 +168,7 @@ private:
 
   // Evaluation.
   bool evaluate(Evaluator &evaluator, SourceFile *SF,
-                CodeCompletionCallbacksFactory *Factory) const;
+                IDEInspectionCallbacksFactory *Factory) const;
 
 public:
   evaluator::DependencySource

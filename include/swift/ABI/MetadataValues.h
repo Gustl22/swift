@@ -49,6 +49,10 @@ enum {
   /// in a default actor.
   NumWords_DefaultActor = 12,
 
+  /// The number of words (in addition to the heap-object header)
+  /// in a non-default distributed actor.
+  NumWords_NonDefaultDistributedActor = 12,
+
   /// The number of words in a task.
   NumWords_AsyncTask = 24,
 
@@ -92,7 +96,7 @@ enum class MetadataKind : uint32_t {
 #define ABSTRACTMETADATAKIND(name, start, end)                                 \
   name##_Start = start, name##_End = end,
 #include "MetadataKind.def"
-  
+
   /// The largest possible non-isa-pointer metadata kind value.
   ///
   /// This is included in the enumeration to prevent against attempts to
@@ -138,6 +142,7 @@ const size_t MaximumAlignment = 16;
 
 /// The alignment of a DefaultActor.
 const size_t Alignment_DefaultActor = MaximumAlignment;
+const size_t Alignment_NonDefaultDistributedActor = MaximumAlignment;
 
 /// The alignment of a TaskGroup.
 const size_t Alignment_TaskGroup = MaximumAlignment;
@@ -163,7 +168,8 @@ public:
     IsNonBitwiseTakable = 0x00100000,
     HasEnumWitnesses =    0x00200000,
     Incomplete =          0x00400000,
-    // unused             0xFF800000,
+    IsNonCopyable =       0x00800000,
+    // unused             0xFF000000,
   };
 
   static constexpr const uint32_t MaxNumExtraInhabitants = 0x7FFFFFFF;
@@ -209,8 +215,8 @@ public:
                                    (isInline ? 0 : IsNonInline));
   }
 
-  /// True if values of this type can be copied with memcpy and
-  /// destroyed with a no-op.
+  /// True if values of this type can be copied with memcpy (if it's copyable)
+  /// and destroyed with a no-op.
   bool isPOD() const { return !(Data & IsNonPOD); }
   constexpr TargetValueWitnessFlags withPOD(bool isPOD) const {
     return TargetValueWitnessFlags((Data & ~IsNonPOD) |
@@ -226,6 +232,13 @@ public:
   constexpr TargetValueWitnessFlags withBitwiseTakable(bool isBT) const {
     return TargetValueWitnessFlags((Data & ~IsNonBitwiseTakable) |
                                    (isBT ? 0 : IsNonBitwiseTakable));
+  }
+  
+  /// True if values of this type can be copied.
+  bool isCopyable() const { return !(Data & IsNonCopyable); }
+  constexpr TargetValueWitnessFlags withCopyable(bool isCopyable) const {
+    return TargetValueWitnessFlags((Data & ~IsNonCopyable) |
+                                   (isCopyable ? 0 : IsNonCopyable));
   }
 
   /// True if this type's binary representation is that of an enum, and the
@@ -473,7 +486,7 @@ class ProtocolDescriptorFlags {
   };
 
   int_type Data;
-  
+
   constexpr ProtocolDescriptorFlags(int_type Data) : Data(Data) {}
 public:
   constexpr ProtocolDescriptorFlags() : Data(0) {}
@@ -498,7 +511,7 @@ public:
   constexpr ProtocolDescriptorFlags withResilient(bool s) const {
     return ProtocolDescriptorFlags((Data & ~IsResilient) | (s ? IsResilient : 0));
   }
-  
+
   /// Was the protocol defined in Swift 1 or 2?
   bool isSwift() const { return Data & IsSwift; }
 
@@ -506,24 +519,24 @@ public:
   ProtocolClassConstraint getClassConstraint() const {
     return ProtocolClassConstraint(bool(Data & ClassConstraint));
   }
-  
+
   /// What dispatch strategy does this protocol use?
   ProtocolDispatchStrategy getDispatchStrategy() const {
     return ProtocolDispatchStrategy((Data & DispatchStrategyMask)
                                       >> DispatchStrategyShift);
   }
-  
+
   /// Does the protocol require a witness table for method dispatch?
   bool needsWitnessTable() const {
     return swift::protocolRequiresWitnessTable(getDispatchStrategy());
   }
-  
+
   /// Return the identifier if this is a special runtime-known protocol.
   SpecialProtocol getSpecialProtocol() const {
     return SpecialProtocol(uint8_t((Data & SpecialProtocolMask)
                                  >> SpecialProtocolShift));
   }
-  
+
   /// Can new requirements with default witnesses be added resiliently?
   bool isResilient() const { return Data & IsResilient; }
 
@@ -649,17 +662,20 @@ private:
   enum : int_type {
     UnusedLowBits = 0x07,      // historical conformance kind
 
-    TypeMetadataKindMask = 0x7 << 3, // 8 type reference kinds
+    TypeMetadataKindMask = 0x7u << 3, // 8 type reference kinds
     TypeMetadataKindShift = 3,
 
-    IsRetroactiveMask = 0x01 << 6,
-    IsSynthesizedNonUniqueMask = 0x01 << 7,
+    IsRetroactiveMask = 0x01u << 6,
+    IsSynthesizedNonUniqueMask = 0x01u << 7,
 
-    NumConditionalRequirementsMask = 0xFF << 8,
+    NumConditionalRequirementsMask = 0xFFu << 8,
     NumConditionalRequirementsShift = 8,
 
-    HasResilientWitnessesMask = 0x01 << 16,
-    HasGenericWitnessTableMask = 0x01 << 17,
+    HasResilientWitnessesMask = 0x01u << 16,
+    HasGenericWitnessTableMask = 0x01u << 17,
+
+    NumConditionalPackDescriptorsMask = 0xFFu << 24,
+    NumConditionalPackDescriptorsShift = 24
   };
 
   int_type Value;
@@ -687,6 +703,11 @@ public:
   ConformanceFlags withNumConditionalRequirements(unsigned n) const {
     return ConformanceFlags((Value & ~NumConditionalRequirementsMask)
                             | (n << NumConditionalRequirementsShift));
+  }
+
+  ConformanceFlags withNumConditionalPackDescriptors(unsigned n) const {
+    return ConformanceFlags((Value & ~NumConditionalPackDescriptorsMask)
+                            | (n << NumConditionalPackDescriptorsShift));
   }
 
   ConformanceFlags withHasResilientWitnesses(bool hasResilientWitnesses) const {
@@ -732,6 +753,12 @@ public:
   unsigned getNumConditionalRequirements() const {
     return (Value & NumConditionalRequirementsMask)
               >> NumConditionalRequirementsShift;
+  }
+
+  /// Retrieve the # of conditional pack shape descriptors.
+  unsigned getNumConditionalPackShapeDescriptors() const {
+    return (Value & NumConditionalPackDescriptorsMask)
+              >> NumConditionalPackDescriptorsShift;
   }
 
   /// Whether this conformance has any resilient witnesses.
@@ -784,11 +811,11 @@ public:
     return ExistentialTypeFlags((Data & ~SpecialProtocolMask)
                                   | (int_type(sp) << SpecialProtocolShift));
   }
-  
+
   unsigned getNumWitnessTables() const {
     return Data & NumWitnessTablesMask;
   }
-  
+
   ProtocolClassConstraint getClassConstraint() const {
     return ProtocolClassConstraint(bool(Data & ClassConstraintMask));
   }
@@ -803,7 +830,7 @@ public:
     return SpecialProtocol(uint8_t((Data & SpecialProtocolMask)
                                      >> SpecialProtocolShift));
   }
-  
+
   int_type getIntValue() const {
     return Data;
   }
@@ -853,6 +880,7 @@ private:
     HasSuggestedValueWitnesses  = 0x00000400U,
     HasImplicitReqSigParams     = 0x00000800U,
     HasImplicitGenSigParams     = 0x00001000U,
+    HasTypePacks                = 0x00002000U,
   };
   int_type Data;
 
@@ -893,6 +921,12 @@ public:
     return ExtendedExistentialTypeShapeFlags(
       implicit ? (Data | HasImplicitGenSigParams)
                : (Data & ~HasImplicitGenSigParams));
+  }
+  constexpr ExtendedExistentialTypeShapeFlags
+  withTypePacks(bool hasTypePacks) const {
+    return ExtendedExistentialTypeShapeFlags(
+      hasTypePacks ? (Data | HasTypePacks)
+                   : (Data & ~HasTypePacks));
   }
 
   /// Is this a special kind of existential?
@@ -937,6 +971,14 @@ public:
   /// they must match GenericParamDescriptor::implicit().
   bool hasImplicitGenSigParams() const {
     return Data & HasImplicitGenSigParams;
+  }
+
+  /// Whether the generic context has type parameter packs. This
+  /// occurs when the existential has a superclass requirement
+  /// whose class declaration has a type parameter pack, eg
+  /// `any P & C<...>` with `class C<each T> {}`.
+  bool hasTypePacks() const {
+    return Data & HasTypePacks;
   }
 
   int_type getIntValue() const {
@@ -998,7 +1040,7 @@ class TargetFunctionTypeFlags {
     // NOTE: The next bit will need to introduce a separate flags word.
   };
   int_type Data;
-  
+
   constexpr TargetFunctionTypeFlags(int_type Data) : Data(Data) {}
 public:
   constexpr TargetFunctionTypeFlags() : Data(0) {}
@@ -1007,7 +1049,7 @@ public:
   withNumParameters(unsigned numParams) const {
     return TargetFunctionTypeFlags((Data & ~NumParametersMask) | numParams);
   }
-  
+
   constexpr TargetFunctionTypeFlags<int_type>
   withConvention(FunctionMetadataConvention c) const {
     return TargetFunctionTypeFlags((Data & ~ConventionMask)
@@ -1088,11 +1130,11 @@ public:
   int_type getIntValue() const {
     return Data;
   }
-  
+
   static TargetFunctionTypeFlags<int_type> fromIntValue(int_type Data) {
     return TargetFunctionTypeFlags(Data);
   }
-  
+
   bool operator==(TargetFunctionTypeFlags<int_type> other) const {
     return Data == other.Data;
   }
@@ -1349,6 +1391,12 @@ namespace SpecialPointerAuthDiscriminators {
   /// Protocol conformance descriptors.
   const uint16_t ProtocolConformanceDescriptor = 0xc6eb;
 
+  const uint16_t ProtocolDescriptor = 0xe909; // = 59657
+
+  // Type descriptors as arguments.
+  const uint16_t OpaqueTypeDescriptor = 0xbdd1; // = 48593
+  const uint16_t ContextDescriptor = 0xb5e3; // = 46563
+
   /// Pointer to value witness table stored in type metadata.
   ///
   /// Computed with ptrauth_string_discriminator("value_witness_table_t").
@@ -1442,6 +1490,11 @@ namespace SpecialPointerAuthDiscriminators {
 
   /// C type StoreExtraInhabitantTag function descriminator
   const uint16_t StoreExtraInhabitantTagFunction = 0x9bf6; // = 39926
+
+  // Relative protocol witness table descriminator
+  const uint16_t RelativeProtocolWitnessTable = 0xb830; // = 47152
+
+  const uint16_t TypeLayoutString = 0x8b65; // = 35685
 }
 
 /// The number of arguments that will be passed directly to a generic
@@ -1458,32 +1511,32 @@ constexpr unsigned WitnessTableFirstRequirementOffset = 1;
 enum class ContextDescriptorKind : uint8_t {
   /// This context descriptor represents a module.
   Module = 0,
-  
+
   /// This context descriptor represents an extension.
   Extension = 1,
-  
+
   /// This context descriptor represents an anonymous possibly-generic context
   /// such as a function body.
   Anonymous = 2,
 
   /// This context descriptor represents a protocol context.
   Protocol = 3,
-  
+
   /// This context descriptor represents an opaque type alias.
   OpaqueType = 4,
 
   /// First kind that represents a type of any sort.
   Type_First = 16,
-  
+
   /// This context descriptor represents a class.
   Class = Type_First,
-  
+
   /// This context descriptor represents a struct.
   Struct = Type_First + 1,
-  
+
   /// This context descriptor represents an enum.
   Enum = Type_First + 2,
-  
+
   /// Last kind that represents a type of any sort.
   Type_Last = 31,
 };
@@ -1514,34 +1567,34 @@ public:
   constexpr ContextDescriptorKind getKind() const {
     return ContextDescriptorKind(Value & 0x1Fu);
   }
-  
+
   /// Whether the context being described is generic.
   constexpr bool isGeneric() const {
     return (Value & 0x80u) != 0;
   }
-  
+
   /// Whether this is a unique record describing the referenced context.
   constexpr bool isUnique() const {
     return (Value & 0x40u) != 0;
   }
-  
+
   /// The format version of the descriptor. Higher version numbers may have
   /// additional fields that aren't present in older versions.
   constexpr uint8_t getVersion() const {
     return (Value >> 8u) & 0xFFu;
   }
-  
+
   /// The most significant two bytes of the flags word, which can have
   /// kind-specific meaning.
   constexpr uint16_t getKindSpecificFlags() const {
     return (Value >> 16u) & 0xFFFFu;
   }
-  
+
   constexpr ContextDescriptorFlags withKind(ContextDescriptorKind kind) const {
     return assert((uint8_t(kind) & 0x1F) == uint8_t(kind)),
       ContextDescriptorFlags((Value & 0xFFFFFFE0u) | uint8_t(kind));
   }
-  
+
   constexpr ContextDescriptorFlags withGeneric(bool isGeneric) const {
     return ContextDescriptorFlags((Value & 0xFFFFFF7Fu)
                                   | (isGeneric ? 0x80u : 0));
@@ -1560,7 +1613,7 @@ public:
   withKindSpecificFlags(uint16_t flags) const {
     return ContextDescriptorFlags((Value & 0xFFFFu) | (flags << 16u));
   }
-  
+
   constexpr uint32_t getIntValue() const {
     return Value;
   }
@@ -1591,9 +1644,12 @@ class TypeContextDescriptorFlags : public FlagSet<uint16_t> {
     /// Meaningful for all type-descriptor kinds.
     HasImportInfo = 2,
 
-    /// Set if the type descriptor has a pointer to a list of canonical 
+    /// Set if the type descriptor has a pointer to a list of canonical
     /// prespecializations.
     HasCanonicalMetadataPrespecializations = 3,
+
+    /// Set if the metadata contains a pointer to a layout string
+    HasLayoutString = 4,
 
     // Type-specific flags:
 
@@ -1676,6 +1732,10 @@ public:
   FLAGSET_DEFINE_FLAG_ACCESSORS(HasImportInfo, hasImportInfo, setHasImportInfo)
 
   FLAGSET_DEFINE_FLAG_ACCESSORS(HasCanonicalMetadataPrespecializations, hasCanonicalMetadataPrespecializations, setHasCanonicalMetadataPrespecializations)
+
+  FLAGSET_DEFINE_FLAG_ACCESSORS(HasLayoutString,
+                                hasLayoutString,
+                                setHasLayoutString)
 
   FLAGSET_DEFINE_FLAG_ACCESSORS(Class_HasVTable,
                                 class_hasVTable,
@@ -1777,57 +1837,81 @@ public:
                                 setHasMangledName)
 };
 
+class GenericContextDescriptorFlags {
+  uint16_t Value;
+
+public:
+  constexpr GenericContextDescriptorFlags() : Value(0) {}
+
+  explicit constexpr GenericContextDescriptorFlags(uint16_t value)
+    : Value(value) {}
+
+  constexpr GenericContextDescriptorFlags(bool hasTypePacks)
+    : GenericContextDescriptorFlags(
+        GenericContextDescriptorFlags((uint16_t)0)
+          .withHasTypePacks(hasTypePacks)) {}
+
+  /// Whether this generic context has at least one type parameter
+  /// pack, in which case the generic context will have a trailing
+  /// GenericPackShapeHeader.
+  constexpr bool hasTypePacks() const {
+    return (Value & 0x1) != 0;
+  }
+
+  constexpr GenericContextDescriptorFlags
+  withHasTypePacks(bool hasTypePacks) const {
+    return GenericContextDescriptorFlags((uint16_t)(
+      (Value & ~0x1) | (hasTypePacks ? 0x1 : 0)));
+  }
+
+  constexpr uint16_t getIntValue() const {
+    return Value;
+  }
+};
+
 enum class GenericParamKind : uint8_t {
   /// A type parameter.
   Type = 0,
-  
+
+  /// A type parameter pack.
+  TypePack = 1,
+
   Max = 0x3F,
 };
 
 class GenericParamDescriptor {
+  /// Don't set 0x40 for compatibility with pre-Swift 5.8 runtimes
   uint8_t Value;
-  
+
   explicit constexpr GenericParamDescriptor(uint8_t Value)
     : Value(Value) {}
 public:
   constexpr GenericParamDescriptor(GenericParamKind kind,
-                                   bool hasKeyArgument,
-                                   bool hasExtraArgument)
+                                   bool hasKeyArgument)
     : GenericParamDescriptor(GenericParamDescriptor(0)
                          .withKind(kind)
-                         .withKeyArgument(hasKeyArgument)
-                         .withExtraArgument(hasExtraArgument))
+                         .withKeyArgument(hasKeyArgument))
   {}
-  
+
   constexpr bool hasKeyArgument() const {
     return (Value & 0x80u) != 0;
-  }
-
-  constexpr bool hasExtraArgument() const {
-    return (Value & 0x40u) != 0;
   }
 
   constexpr GenericParamKind getKind() const {
     return GenericParamKind(Value & 0x3Fu);
   }
-  
+
   constexpr GenericParamDescriptor
   withKeyArgument(bool hasKeyArgument) const {
     return GenericParamDescriptor((Value & 0x7Fu)
       | (hasKeyArgument ? 0x80u : 0));
   }
-  
-  constexpr GenericParamDescriptor
-  withExtraArgument(bool hasExtraArgument) const {
-    return GenericParamDescriptor((Value & 0xBFu)
-      | (hasExtraArgument ? 0x40u : 0));
-  }
-  
+
   constexpr GenericParamDescriptor withKind(GenericParamKind kind) const {
     return assert((uint8_t(kind) & 0x3Fu) == uint8_t(kind)),
       GenericParamDescriptor((Value & 0xC0u) | uint8_t(kind));
   }
-  
+
   constexpr uint8_t getIntValue() const {
     return Value;
   }
@@ -1844,8 +1928,7 @@ public:
   /// The default parameter descriptor for an implicit parameter.
   static constexpr GenericParamDescriptor implicit() {
     return GenericParamDescriptor(GenericParamKind::Type,
-                                  /*key argument*/ true,
-                                  /*extra argument*/ false);
+                                  /*key argument*/ true);
   }
 };
 
@@ -1875,55 +1958,61 @@ enum class GenericRequirementKind : uint8_t {
   /// A "same-conformance" requirement, implied by a same-type or base-class
   /// constraint that binds a parameter with protocol requirements.
   SameConformance = 3,
-  /// A layout constraint.
+  /// A same-shape requirement between generic parameter packs.
+  SameShape = 4,
+  /// A layout requirement.
   Layout = 0x1F,
 };
 
 class GenericRequirementFlags {
+  /// Don't set 0x40 for compatibility with pre-Swift 5.8 runtimes
   uint32_t Value;
-  
+
   explicit constexpr GenericRequirementFlags(uint32_t Value)
     : Value(Value) {}
 public:
   constexpr GenericRequirementFlags(GenericRequirementKind kind,
                                     bool hasKeyArgument,
-                                    bool hasExtraArgument)
+                                    bool isPackRequirement)
     : GenericRequirementFlags(GenericRequirementFlags(0)
                          .withKind(kind)
                          .withKeyArgument(hasKeyArgument)
-                         .withExtraArgument(hasExtraArgument))
+                         .withPackRequirement(isPackRequirement))
   {}
-  
+
   constexpr bool hasKeyArgument() const {
     return (Value & 0x80u) != 0;
   }
 
-  constexpr bool hasExtraArgument() const {
-    return (Value & 0x40u) != 0;
+  /// If this is true, the subject type of the requirement is a pack.
+  /// When the requirement is a conformance requirement, the corresponding
+  /// entry in the generic arguments array becomes a TargetWitnessTablePack.
+  constexpr bool isPackRequirement() const {
+    return (Value & 0x20u) != 0;
   }
 
   constexpr GenericRequirementKind getKind() const {
     return GenericRequirementKind(Value & 0x1Fu);
   }
-  
+
   constexpr GenericRequirementFlags
   withKeyArgument(bool hasKeyArgument) const {
     return GenericRequirementFlags((Value & 0x7Fu)
       | (hasKeyArgument ? 0x80u : 0));
   }
-  
+
   constexpr GenericRequirementFlags
-  withExtraArgument(bool hasExtraArgument) const {
+  withPackRequirement(bool isPackRequirement) const {
     return GenericRequirementFlags((Value & 0xBFu)
-      | (hasExtraArgument ? 0x40u : 0));
+      | (isPackRequirement ? 0x20u : 0));
   }
-  
+
   constexpr GenericRequirementFlags
   withKind(GenericRequirementKind kind) const {
     return assert((uint8_t(kind) & 0x1Fu) == uint8_t(kind)),
       GenericRequirementFlags((Value & 0xE0u) | uint8_t(kind));
   }
-  
+
   constexpr uint32_t getIntValue() const {
     return Value;
   }
@@ -1932,6 +2021,11 @@ public:
 enum class GenericRequirementLayoutKind : uint32_t {
   // A class constraint.
   Class = 0,
+};
+
+enum class GenericPackKind : uint16_t {
+  Metadata = 0,
+  WitnessTable = 1
 };
 
 class GenericEnvironmentFlags {
@@ -2260,6 +2354,7 @@ public:
     Task_InheritContext                           = 11,
     Task_EnqueueJob                               = 12,
     Task_AddPendingGroupTaskUnconditionally       = 13,
+    Task_IsDiscardingTask                         = 14,
   };
 
   explicit constexpr TaskCreateFlags(size_t bits) : FlagSet(bits) {}
@@ -2286,6 +2381,9 @@ public:
   FLAGSET_DEFINE_FLAG_ACCESSORS(Task_AddPendingGroupTaskUnconditionally,
                                 addPendingGroupTaskUnconditionally,
                                 setAddPendingGroupTaskUnconditionally)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Task_IsDiscardingTask,
+                                isDiscardingTask,
+                                setIsDiscardingTask)
 };
 
 /// Flags for schedulable jobs.
@@ -2343,8 +2441,9 @@ public:
 
 /// Kinds of task status record.
 enum class TaskStatusRecordKind : uint8_t {
-  /// A DeadlineStatusRecord, which represents an active deadline.
-  Deadline = 0,
+  /// A TaskDependencyStatusRecord which tracks what the current task is
+  /// dependent on.
+  TaskDependency = 0,
 
   /// A ChildTaskStatusRecord, which represents the potential for
   /// active child tasks.
@@ -2381,6 +2480,24 @@ enum class TaskOptionRecordKind : uint8_t {
   AsyncLetWithBuffer = 3,
   /// Request a child task for swift_task_run_inline.
   RunInline = UINT8_MAX,
+};
+
+/// Flags for TaskGroup.
+class TaskGroupFlags : public FlagSet<uint32_t> {
+public:
+  enum {
+    // 8 bits are reserved for future use
+    /// Request the TaskGroup to immediately release completed tasks,
+    /// and not store their results. This also effectively disables `next()`.
+    TaskGroup_DiscardResults = 8,
+  };
+
+  explicit TaskGroupFlags(uint32_t bits) : FlagSet(bits) {}
+  constexpr TaskGroupFlags() {}
+
+  FLAGSET_DEFINE_FLAG_ACCESSORS(TaskGroup_DiscardResults,
+                                isDiscardResults,
+                                setIsDiscardResults)
 };
 
 /// Flags for cancellation records.

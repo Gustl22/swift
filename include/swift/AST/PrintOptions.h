@@ -257,6 +257,10 @@ struct PrintOptions {
   /// Protocols marked with @_show_in_interface are still printed.
   bool SkipUnderscoredStdlibProtocols = false;
 
+  /// Whether to skip unsafe C++ class methods that were renamed
+  /// (e.g. __fooUnsafe). See IsSafeUseOfCxxDecl.
+  bool SkipUnsafeCXXMethods = false;
+
   /// Whether to skip extensions that don't add protocols or no members.
   bool SkipEmptyExtensionDecls = true;
 
@@ -272,6 +276,10 @@ struct PrintOptions {
   /// Whether to skip printing 'import' declarations.
   bool SkipImports = false;
 
+  /// Whether to skip over the C++ inline namespace when printing its members or
+  /// when printing it out as a qualifier.
+  bool SkipInlineCXXNamespace = false;
+
   /// Whether to skip printing overrides and witnesses for
   /// protocol requirements.
   bool SkipOverrides = false;
@@ -284,10 +292,6 @@ struct PrintOptions {
   bool PrintLongAttrsOnSeparateLines = false;
 
   bool PrintImplicitAttrs = true;
-
-  /// Whether to print the \c any keyword for existential
-  /// types.
-  bool PrintExplicitAny = false;
 
   /// Whether to desugar the constraint for an existential type.
   bool DesugarExistentialConstraint = false;
@@ -315,6 +319,9 @@ struct PrintOptions {
   /// Suppress emitting @available(*, noasync)
   bool SuppressNoAsyncAvailabilityAttr = false;
 
+  /// Whether to print the \c{/*not inherited*/} comment on factory initializers.
+  bool PrintFactoryInitializerComment = true;
+
   /// How to print opaque return types.
   enum class OpaqueReturnTypePrintingMode {
     /// 'some P1 & P2'.
@@ -338,6 +345,9 @@ struct PrintOptions {
   /// in a nominal type or extension, which is semantically unstable but can
   /// prevent printing from doing "extra" work.
   bool PrintCurrentMembersOnly = false;
+
+  /// Whether to suppress printing of custom attributes that are expanded macros.
+  bool SuppressExpandedMacros = true;
 
   /// List of attribute kinds that should not be printed.
   std::vector<AnyAttrKind> ExcludeAttrList = {DAK_Transparent, DAK_Effects,
@@ -467,6 +477,9 @@ struct PrintOptions {
   /// of the alias.
   bool PrintTypeAliasUnderlyingType = false;
 
+  /// Print the definition of a macro, e.g. `= #externalMacro(...)`.
+  bool PrintMacroDefinitions = true;
+
   /// Use aliases when printing references to modules to avoid ambiguities
   /// with types sharing a name with a module.
   bool AliasModuleNames = false;
@@ -530,6 +543,22 @@ struct PrintOptions {
   /// parameter.
   bool PrintSpecializeAttributeWithAvailability = true;
 
+  /// Whether to always desugar array types from `[base_type]` to `Array<base_type>`
+  bool AlwaysDesugarArraySliceTypes = false;
+
+  /// Whether to always desugar dictionary types
+  /// from `[key_type:value_type]` to `Dictionary<key_type,value_type>`
+  bool AlwaysDesugarDictionaryTypes = false;
+
+  /// Whether to always desugar optional types from `base_type?` to `Optional<base_type>`
+  bool AlwaysDesugarOptionalTypes = false;
+
+  /// Whether to always print explicit `Pack{...}` around pack
+  /// types.
+  ///
+  /// This is set to \c false for diagnostic arguments.
+  bool PrintExplicitPackTypes = true;
+
   /// \see ShouldQualifyNestedDeclarations
   enum class QualifyNestedDeclarations {
     Never,
@@ -544,10 +573,15 @@ struct PrintOptions {
       QualifyNestedDeclarations::Never;
 
   /// If true, we print a protocol's primary associated types using the
-  /// primary associated type syntax: protocol Foo<Type1, ...>.
+  /// primary associated type syntax: `protocol Foo<Type1, ...>`.
   ///
   /// If false, we print them as ordinary associated types.
   bool PrintPrimaryAssociatedTypes = true;
+
+  /// Whether or not to print `@attached(extension)` attributes on
+  /// macro declarations. This is used for feature suppression in
+  /// Swift interface printing.
+  bool PrintExtensionMacroAttributes = true;
 
   /// If this is not \c nullptr then function bodies (including accessors
   /// and constructors) will be printed by this function.
@@ -583,7 +617,7 @@ struct PrintOptions {
   /// The print options used for formatting diagnostic arguments.
   static PrintOptions forDiagnosticArguments() {
     PrintOptions result;
-    result.PrintExplicitAny = true;
+    result.PrintExplicitPackTypes = false;
     return result;
   }
 
@@ -623,6 +657,7 @@ struct PrintOptions {
     result.SkipSwiftPrivateClangDecls = true;
     result.SkipPrivateStdlibDecls = true;
     result.SkipUnderscoredStdlibProtocols = true;
+    result.SkipUnsafeCXXMethods = true;
     result.SkipDeinit = true;
     result.EmptyLineBetweenMembers = true;
     result.CascadeDocComment = true;
@@ -633,6 +668,7 @@ struct PrintOptions {
     result.EnumRawValues = EnumRawValueMode::PrintObjCOnly;
     result.MapCrossImportOverlaysToDeclaringModule = true;
     result.PrintCurrentMembersOnly = false;
+    result.SuppressExpandedMacros = true;
     return result;
   }
 
@@ -649,6 +685,7 @@ struct PrintOptions {
                                               bool preferTypeRepr,
                                               bool printFullConvention,
                                               bool printSPIs,
+                                              bool useExportedModuleNames,
                                               bool aliasModuleNames,
                                               llvm::SmallSet<StringRef, 4>
                                                 *aliasModuleNamesTargets
@@ -699,7 +736,6 @@ struct PrintOptions {
   static PrintOptions printQualifiedSILType() {
     PrintOptions result = PrintOptions::printSIL();
     result.FullyQualifiedTypesIfAmbiguous = true;
-    result.PrintExplicitAny = true;
     return result;
   }
 
@@ -736,6 +772,7 @@ struct PrintOptions {
     PO.PrintDocumentationComments = false;
     PO.ExcludeAttrList.push_back(DAK_Available);
     PO.SkipPrivateStdlibDecls = true;
+    PO.SkipUnsafeCXXMethods = true;
     PO.ExplodeEnumCaseDecls = true;
     PO.ShouldQualifyNestedDeclarations = QualifyNestedDeclarations::TypesOnly;
     PO.PrintParameterSpecifiers = true;

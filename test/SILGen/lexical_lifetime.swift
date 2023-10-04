@@ -26,6 +26,10 @@ enum E {
 @_silgen_name("use_generic")
 func use_generic<T>(_ t: T) {}
 
+struct NonlexicalBox<X> {
+  @_eagerMove var x: X
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Declarations                                                               }}
 ////////////////////////////////////////////////////////////////////////////////
@@ -88,8 +92,8 @@ func lexical_borrow_let_class_in_enum() {
 
 // CHECK-LABEL: sil hidden [ossa] @lexical_borrow_arg_owned_class : $@convention(thin) (@owned C) -> () {
 // CHECK:       {{bb[^,]+}}([[INSTANCE:%[^,]+]] : @owned $C):
-// CHECK:         [[LIFETIME:%[^,]+]] = begin_borrow [lexical] [[INSTANCE]] 
-// CHECK:         debug_value [[LIFETIME]] 
+// CHECK:         debug_value [[INSTANCE]]
+// CHECK:         [[LIFETIME:%[^,]+]] = begin_borrow [[INSTANCE]] 
 // CHECK:         [[ADDR:%[^,]+]] = alloc_stack $C
 // CHECK:         [[SB:%.*]] = store_borrow [[LIFETIME]] to [[ADDR]] 
 // CHECK:         [[USE_GENERIC:%[^,]+]] = function_ref @use_generic
@@ -146,6 +150,8 @@ extension C {
   __consuming
   func eagermove_method_attr() {}
 }
+
+func f<T>() -> (NonlexicalBox<T>) {}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Test                                                                       }}

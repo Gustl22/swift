@@ -25,6 +25,7 @@
 #include "RuntimeInvocationsTracking.h"
 #include "WeakReference.h"
 #include "swift/Runtime/Debug.h"
+#include "swift/Runtime/CustomRRABI.h"
 #include "swift/Runtime/InstrumentsSupport.h"
 #include "swift/shims/GlobalObjects.h"
 #include "swift/shims/RuntimeShims.h"
@@ -34,7 +35,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <new>
-#include <thread>
 #if SWIFT_OBJC_INTEROP
 # include <objc/NSObject.h>
 # include <objc/runtime.h>
@@ -42,6 +42,9 @@
 # include <objc/objc.h>
 # include "swift/Runtime/ObjCBridge.h"
 # include <dlfcn.h>
+#endif
+#if SWIFT_STDLIB_HAS_MALLOC_TYPE
+# include <malloc_type_private.h>
 #endif
 #include "Leaks.h"
 
@@ -114,12 +117,112 @@ static HeapObject *_swift_tryRetain_(HeapObject *object)
     return _ ## name ## _ args; \
 } while(0)
 
+#if SWIFT_STDLIB_HAS_MALLOC_TYPE
+static malloc_type_summary_t
+computeMallocTypeSummary(const HeapMetadata *heapMetadata) {
+  assert(isHeapMetadataKind(heapMetadata->getKind()));
+  auto *classMetadata = heapMetadata->getClassObject();
+  auto *typeDesc = heapMetadata->getTypeContextDescriptor();
+
+  // Pruned metadata or unclassified
+  if (!classMetadata || !typeDesc)
+    return {.type_kind = MALLOC_TYPE_KIND_SWIFT};
+
+  // Objc
+  if (classMetadata->isPureObjC())
+    return {.type_kind = MALLOC_TYPE_KIND_OBJC};
+
+  malloc_type_summary_t summary = {.type_kind = MALLOC_TYPE_KIND_SWIFT};
+  summary.layout_semantics.reference_count =
+      (classMetadata->getFlags() & ClassFlags::UsesSwiftRefcounting);
+
+  auto *fieldDesc = typeDesc->Fields.get();
+  if (!fieldDesc)
+    return summary;
+
+  bool isGenericData = true;
+  for (auto &field : *fieldDesc) {
+    if (field.isIndirectCase()) {
+      isGenericData = false;
+      if (field.isVar())
+        summary.layout_semantics.data_pointer = true;
+      else
+        summary.layout_semantics.immutable_pointer = true;
+    }
+  }
+  summary.layout_semantics.generic_data = isGenericData;
+
+  return summary;
+
+// FIXME: these are all the things we are potentially interested in
+//  typedef struct {
+// 	  bool data_pointer : 1;
+// 	  bool struct_pointer : 1;
+// 	  bool immutable_pointer : 1;
+// 	  bool anonymous_pointer : 1;
+// 	  bool reference_count : 1;
+// 	  bool resource_handle : 1;
+// 	  bool spatial_bounds : 1;
+// 	  bool tainted_data : 1;
+// 	  bool generic_data : 1;
+// 	  uint16_t unused : 7;
+// } malloc_type_layout_semantics_t;
+}
+
+struct MallocTypeCacheEntry {
+// union malloc_type_descriptor_t {
+//   struct {
+//     uint32_t hash;
+//     malloc_type_summary_t summary;
+//   };
+//   malloc_type_id_t type_id;
+// };
+  malloc_type_descriptor_t desc;
+
+  friend llvm::hash_code hash_value(const MallocTypeCacheEntry &entry) {
+    return hash_value(entry.desc.hash);
+  }
+  bool matchesKey(uint32_t key) const { return desc.hash == key; }
+};
+static ConcurrentReadableHashMap<MallocTypeCacheEntry> MallocTypes;
+
+static malloc_type_id_t getMallocTypeId(const HeapMetadata *heapMetadata) {
+  uint64_t metadataPtrBits = reinterpret_cast<uint64_t>(heapMetadata);
+  uint32_t key = (metadataPtrBits >> 32) ^ (metadataPtrBits >> 0);
+
+  {
+    auto snapshot = MallocTypes.snapshot();
+    if (auto *entry = snapshot.find(key))
+      return entry->desc.type_id;
+  }
+
+  malloc_type_descriptor_t desc = {
+    .hash = key,
+    .summary = computeMallocTypeSummary(heapMetadata)
+  };
+
+  MallocTypes.getOrInsert(
+      key, [desc](MallocTypeCacheEntry *entry, bool created) {
+        if (created)
+          entry->desc = desc;
+        return true;
+      });
+
+  return desc.type_id;
+}
+#endif // SWIFT_STDLIB_HAS_MALLOC_TYPE
+
 static HeapObject *_swift_allocObject_(HeapMetadata const *metadata,
                                        size_t requiredSize,
                                        size_t requiredAlignmentMask) {
   assert(isAlignmentMask(requiredAlignmentMask));
+#if SWIFT_STDLIB_HAS_MALLOC_TYPE
+  auto object = reinterpret_cast<HeapObject *>(swift_slowAllocTyped(
+      requiredSize, requiredAlignmentMask, getMallocTypeId(metadata)));
+#else
   auto object = reinterpret_cast<HeapObject *>(
       swift_slowAlloc(requiredSize, requiredAlignmentMask));
+#endif
 
   // NOTE: this relies on the C++17 guaranteed semantics of no null-pointer
   // check on the placement new allocator which we have observed on Windows,
@@ -228,7 +331,8 @@ public:
   FullMetadata<GenericBoxHeapMetadata> Data;
 
   BoxCacheEntry(const Metadata *type)
-    : Data{HeapMetadataHeader{{destroyGenericBox}, {/*vwtable*/ nullptr}},
+    : Data{HeapMetadataHeader{ {/*type layout*/nullptr}, {destroyGenericBox},
+                               {/*vwtable*/ nullptr}},
            GenericBoxHeapMetadata{MetadataKind::HeapGenericLocalVariable,
                                   GenericBoxHeapMetadata::getHeaderOffset(type),
                                   type}} {
@@ -359,6 +463,8 @@ HeapObject *swift::swift_retain(HeapObject *object) {
 #endif
 }
 
+CUSTOM_RR_ENTRYPOINTS_DEFINE_ENTRYPOINTS(swift_retain)
+
 SWIFT_RUNTIME_EXPORT
 HeapObject *(*SWIFT_RT_DECLARE_ENTRY _swift_retain)(HeapObject *object) =
     _swift_retain_;
@@ -411,6 +517,8 @@ void swift::swift_release(HeapObject *object) {
   CALL_IMPL(swift_release, (object));
 #endif
 }
+
+CUSTOM_RR_ENTRYPOINTS_DEFINE_ENTRYPOINTS(swift_release)
 
 SWIFT_RUNTIME_EXPORT
 void (*SWIFT_RT_DECLARE_ENTRY _swift_release)(HeapObject *object) =
@@ -705,6 +813,21 @@ void swift::swift_rootObjCDealloc(HeapObject *self) {
 void swift::swift_deallocClassInstance(HeapObject *object,
                                        size_t allocatedSize,
                                        size_t allocatedAlignMask) {
+  size_t retainCount = swift_retainCount(object);
+  if (SWIFT_UNLIKELY(retainCount > 1)) {
+    auto descriptor = object->metadata->getTypeContextDescriptor();
+
+    swift::fatalError(0,
+                      "Object %p of class %s deallocated with non-zero retain "
+                      "count %zd. This object's deinit, or something called "
+                      "from it, may have created a strong reference to self "
+                      "which outlived deinit, resulting in a dangling "
+                      "reference.\n",
+                      object,
+                      descriptor ? descriptor->Name.get() : "<unknown>",
+                      retainCount);
+  }
+
 #if SWIFT_OBJC_INTEROP
   // We need to let the ObjC runtime clean up any associated objects or weak
   // references associated with this object.
@@ -713,6 +836,7 @@ void swift::swift_deallocClassInstance(HeapObject *object,
 #else
   const bool fastDeallocSupported = true;
 #endif
+
   if (!fastDeallocSupported || !object->refCounts.getPureSwiftDeallocation()) {
     objc_destructInstance((id)object);
   }
@@ -732,6 +856,17 @@ void swift::swift_deallocPartialClassInstance(HeapObject *object,
   // Destroy ivars
   auto *classMetadata = _swift_getClassOfAllocated(object)->getClassObject();
   assert(classMetadata && "Not a class?");
+
+#if SWIFT_OBJC_INTEROP
+  // If the object's class is already pure ObjC class, just release it and move
+  // on. There are no ivar destroyers. This avoids attempting to mutate
+  // placeholder objects statically created in read-only memory.
+  if (classMetadata->isPureObjC()) {
+    objc_release((id)object);
+    return;
+  }
+#endif
+
   while (classMetadata != metadata) {
 #if SWIFT_OBJC_INTEROP
     // If we have hit a pure Objective-C class, we won't see another ivar

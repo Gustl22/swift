@@ -477,10 +477,10 @@ SILValue InstSimplifier::visitConvertFunctionInst(ConvertFunctionInst *cfi) {
   // SILCombine.
   //
   // (convert_function Y->X (convert_function x X->Y)) -> x
-  SILValue convertedValue = lookThroughOwnershipInsts(cfi->getConverted());
+  SILValue convertedValue = lookThroughOwnershipInsts(cfi->getOperand());
   if (auto *subCFI = dyn_cast<ConvertFunctionInst>(convertedValue))
-    if (subCFI->getConverted()->getType() == cfi->getType())
-      return lookThroughOwnershipInsts(subCFI->getConverted());
+    if (subCFI->getOperand()->getType() == cfi->getType())
+      return lookThroughOwnershipInsts(subCFI->getOperand());
 
   return SILValue();
 }
@@ -709,7 +709,7 @@ SILValue InstSimplifier::simplifyOverflowBuiltin(BuiltinInst *BI) {
     if (match(BI, m_CheckedTrunc(m_Ext(m_SILValue(Result)))))
       if (Result->getType() == BI->getType().getTupleElementType(0))
         if (auto signBit = computeSignBit(Result))
-          if (!signBit.getValue())
+          if (!signBit.value())
             return Result;
     }
     break;

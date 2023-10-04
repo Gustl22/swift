@@ -24,18 +24,32 @@
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/Located.h"
 #include "swift/Basic/SourceLoc.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TinyPtrVector.h"
+#include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/Support/VersionTuple.h"
 #include <system_error>
 
 namespace llvm {
 class FileCollectorBase;
+namespace vfs {
+class OutputBackend;
+}
+namespace cas {
+class CachingOnDiskFileSystem;
+}
 }
 
 namespace clang {
 class DependencyCollector;
+namespace tooling {
+namespace dependencies {
+struct ModuleID;
+class DependencyScanningTool;
+}
+}
 }
 
 namespace swift {
@@ -46,13 +60,14 @@ class ClangImporterOptions;
 class ClassDecl;
 class FileUnit;
 class ModuleDecl;
-class ModuleDependencies;
+class ModuleDependencyInfo;
+struct ModuleDependencyID;
 class ModuleDependenciesCache;
 class NominalTypeDecl;
 class SourceFile;
 class TypeDecl;
 class CompilerInstance;
-enum class ModuleDependenciesKind : int8_t;
+enum class ModuleDependencyKind : int8_t;
 
 enum class KnownProtocolKind : uint8_t;
 
@@ -156,6 +171,7 @@ public:
   virtual bool tryEmitForwardingModule(StringRef moduleName,
                                StringRef interfacePath,
                                ArrayRef<std::string> candidates,
+                               llvm::vfs::OutputBackend &backend,
                                StringRef outPath) = 0;
   virtual ~ModuleInterfaceChecker() = default;
 };
@@ -214,7 +230,7 @@ public:
 
   public:
     /// Returns true if the version has a valid source kind.
-    bool isValid() const { return SourceKind.hasValue(); }
+    bool isValid() const { return SourceKind.has_value(); }
 
     /// Returns the version, which may be empty if a version was not present or
     /// was unparsable.
@@ -223,7 +239,7 @@ public:
     /// Returns the kind of source of the module version. Do not call if
     /// \c isValid() returns false.
     ModuleVersionSourceKind getSourceKind() const {
-      return SourceKind.getValue();
+      return SourceKind.value();
     }
 
     void setVersion(llvm::VersionTuple version, ModuleVersionSourceKind kind) {
@@ -241,7 +257,8 @@ public:
   /// If a non-null \p versionInfo is provided, the module version will be
   /// parsed and populated.
   virtual bool canImportModule(ImportPath::Module named,
-                               ModuleVersionInfo *versionInfo) = 0;
+                               ModuleVersionInfo *versionInfo,
+                               bool isTestableImport = false) = 0;
 
   /// Import a module with the given module path.
   ///
@@ -321,10 +338,14 @@ public:
 
   /// Retrieve the dependencies for the given, named module, or \c None
   /// if no such module exists.
-  virtual Optional<ModuleDependencies> getModuleDependencies(
-      StringRef moduleName,
-      ModuleDependenciesCache &cache,
-      InterfaceSubContextDelegate &delegate) = 0;
+  virtual llvm::SmallVector<std::pair<ModuleDependencyID, ModuleDependencyInfo>, 1>
+  getModuleDependencies(StringRef moduleName,
+                        StringRef moduleOutputPath,
+                        llvm::IntrusiveRefCntPtr<llvm::cas::CachingOnDiskFileSystem> CacheFS,
+                        const llvm::DenseSet<clang::tooling::dependencies::ModuleID> &alreadySeenClangModules,
+                        clang::tooling::dependencies::DependencyScanningTool &clangScanningTool,
+                        InterfaceSubContextDelegate &delegate,
+                        bool isTestableImport = false) = 0;
 };
 
 } // namespace swift

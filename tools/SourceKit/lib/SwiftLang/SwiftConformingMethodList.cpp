@@ -16,7 +16,7 @@
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/IDE/ConformingMethodList.h"
-#include "swift/IDETool/CompletionInstance.h"
+#include "swift/IDETool/IDEInspectionInstance.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Comment.h"
 #include "clang/AST/Decl.h"
@@ -119,7 +119,7 @@ deliverResults(SourceKit::ConformingMethodListConsumer &SKConsumer,
             memberElem.BriefComment = RC->getBriefText(ClangContext);
         }
       } else {
-        memberElem.BriefComment = member->getBriefComment();
+        memberElem.BriefComment = member->getSemanticBriefComment();
       }
     }
 
@@ -160,12 +160,13 @@ void SwiftLangSupport::getConformingMethodList(
     ArrayRef<const char *> ExpectedTypeNames,
     SourceKitCancellationToken CancellationToken,
     SourceKit::ConformingMethodListConsumer &SKConsumer,
-    Optional<VFSOptions> vfsOptions) {
+    llvm::Optional<VFSOptions> vfsOptions) {
   std::string error;
 
   // FIXME: the use of None as primary file is to match the fact we do not read
   // the document contents using the editor documents infrastructure.
-  auto fileSystem = getFileSystem(vfsOptions, /*primaryFile=*/None, error);
+  auto fileSystem =
+      getFileSystem(vfsOptions, /*primaryFile=*/llvm::None, error);
   if (!fileSystem) {
     return SKConsumer.failed(error);
   }
@@ -176,11 +177,12 @@ void SwiftLangSupport::getConformingMethodList(
   }
 
   performWithParamsToCompletionLikeOperation(
-      UnresolvedInputFile, Offset, Args, fileSystem, CancellationToken,
+      UnresolvedInputFile, Offset, /*InsertCodeCompletionToken=*/true, Args,
+      fileSystem, CancellationToken,
       [&](CancellableResult<CompletionLikeOperationParams> ParmsResult) {
         ParmsResult.mapAsync<ConformingMethodListResults>(
             [&](auto &Params, auto DeliverTransformed) {
-              getCompletionInstance()->conformingMethodList(
+              getIDEInspectionInstance()->conformingMethodList(
                   Params.Invocation, Args, fileSystem, Params.completionBuffer,
                   Offset, Params.DiagC, ExpectedTypeNames,
                   Params.CancellationFlag, DeliverTransformed);

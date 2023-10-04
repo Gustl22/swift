@@ -105,13 +105,14 @@ void SplitterStep::computeFollowupSteps(
 
   if (CS.isDebugMode()) {
     auto &log = getDebugLogger();
+    auto indent = CS.solverState->getCurrentIndent();
     // Verify that the constraint graph is valid.
     CG.verify();
 
-    log << "---Constraint graph---\n";
+    log.indent(indent) << "---Constraint graph---\n";
     CG.print(CS.getTypeVariables(), log);
 
-    log << "---Connected components---\n";
+    log.indent(indent) << "---Connected components---\n";
     CG.printConnectedComponents(CS.getTypeVariables(), log);
   }
 
@@ -362,12 +363,6 @@ StepResult ComponentStep::take(bool prevFailed) {
   auto *conjunction = CS.selectConjunction();
 
   if (CS.isDebugMode()) {
-    if (!potentialBindings.empty()) {
-      auto &log = getDebugLogger();
-      log << "(Potential Binding(s): " << '\n';
-      log << potentialBindings;
-    }
-
     SmallVector<Constraint *, 4> disjunctions;
     CS.collectDisjunctions(disjunctions);
     std::vector<std::string> overloadDisjunctions;
@@ -380,17 +375,24 @@ StepResult ComponentStep::take(bool prevFailed) {
         overloadDisjunctions.push_back(
             constraints[0]->getFirstType()->getString(PO));
     }
+
+    if (!potentialBindings.empty() || !overloadDisjunctions.empty()) {
+      auto &log = getDebugLogger();
+      log << "(Potential Binding(s): " << '\n';
+      log << potentialBindings;
+    }
+
     if (!overloadDisjunctions.empty()) {
       auto &log = getDebugLogger();
-      log.indent(2);
+      log.indent(CS.solverState->getCurrentIndent() + 2);
       log << "Disjunction(s) = [";
       interleave(overloadDisjunctions, log, ", ");
       log << "]\n";
+    }
 
-      if (!potentialBindings.empty() || !overloadDisjunctions.empty()) {
-        auto &log = getDebugLogger();
-        log << ")\n";
-      }
+    if (!potentialBindings.empty() || !overloadDisjunctions.empty()) {
+      auto &log = getDebugLogger();
+      log << ")\n";
     }
   }
 
@@ -441,7 +443,9 @@ StepResult ComponentStep::take(bool prevFailed) {
 
   auto printConstraints = [&](const ConstraintList &constraints) {
     for (auto &constraint : constraints)
-      constraint.print(getDebugLogger(), &CS.getASTContext().SourceMgr);
+      constraint.print(
+          getDebugLogger().indent(CS.solverState->getCurrentIndent()),
+          &CS.getASTContext().SourceMgr, CS.solverState->getCurrentIndent());
   };
 
   // If we don't have any disjunction or type variable choices left, we're done
@@ -683,8 +687,8 @@ bool DisjunctionStep::shouldSkip(const DisjunctionChoice &choice) const {
     if (CS.isDebugMode()) {
       auto &log = getDebugLogger();
       log << "(skipping " + reason + " ";
-      choice.print(log, &ctx.SourceMgr);
-      log << '\n';
+      choice.print(log, &ctx.SourceMgr, CS.solverState->getCurrentIndent());
+      log << ")\n";
     }
 
     return true;
@@ -834,7 +838,7 @@ bool DisjunctionStep::attempt(const DisjunctionChoice &choice) {
           kind == ConstraintLocator::DynamicLookupResult) {
         assert(index == 0 || index == 1);
         if (index == 1)
-          CS.increaseScore(SK_ForceUnchecked);
+          CS.increaseScore(SK_ForceUnchecked, disjunctionLocator);
       }
     }
   }
@@ -941,7 +945,7 @@ StepResult ConjunctionStep::resume(bool prevFailed) {
 
       if (Solutions.size() == 1) {
         auto score = Solutions.front().getFixedScore();
-        if (score.Data[SK_Fix] > 0)
+        if (score.Data[SK_Fix] > 0 && !CS.isForCodeCompletion())
           Producer.markExhausted();
       }
     } else if (Solutions.size() != 1) {
@@ -1019,7 +1023,7 @@ StepResult ConjunctionStep::resume(bool prevFailed) {
                 ++numHoles;
               }
             }
-            CS.increaseScore(SK_Hole, numHoles);
+            CS.increaseScore(SK_Hole, Conjunction->getLocator(), numHoles);
           }
 
           if (CS.worseThanBestSolution())
@@ -1071,5 +1075,35 @@ void ConjunctionStep::restoreOuterState(const Score &solutionScore) const {
                                 CS.InactiveConstraints);
     for (auto &constraint : CS.ActiveConstraints)
       constraint.setActive(true);
+  }
+}
+
+void ConjunctionStep::SolverSnapshot::applySolution(const Solution &solution) {
+  CS.applySolution(solution);
+
+  if (!CS.shouldAttemptFixes())
+    return;
+
+  // If inference succeeded, we are done.
+  auto score = solution.getFixedScore();
+  if (score.Data[SK_Fix] == 0)
+    return;
+
+  // If this conjunction represents a closure and inference
+  // has failed, let's bind all of unresolved type variables
+  // in its interface type to holes to avoid extraneous
+  // fixes produced by outer context.
+  auto locator = Conjunction->getLocator();
+  if (locator->directlyAt<ClosureExpr>()) {
+    auto closureTy =
+        CS.getClosureType(castToExpr<ClosureExpr>(locator->getAnchor()));
+    CS.recordTypeVariablesAsHoles(closureTy);
+  }
+
+  // Same for a SingleValueStmtExpr, turn any unresolved type variables present
+  // in its type into holes.
+  if (locator->isForSingleValueStmtConjunction()) {
+    auto *SVE = castToExpr<SingleValueStmtExpr>(locator->getAnchor());
+    CS.recordTypeVariablesAsHoles(CS.getType(SVE));
   }
 }

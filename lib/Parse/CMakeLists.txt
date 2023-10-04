@@ -1,6 +1,6 @@
 
 
-if(CMAKE_HOST_SYSTEM_NAME STREQUAL Windows)
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
   set(SWIFT_GYB_FLAGS --line-directive "^\"#line %(line)d \\\"%(file)s\\\"^\"")
 else()
   set(SWIFT_GYB_FLAGS --line-directive "\'#line" "%(line)d" "\"%(file)s\"\'")
@@ -25,53 +25,41 @@ target_link_libraries(swiftParse PRIVATE
   swiftAST
 )
 
-if (SWIFT_SWIFT_PARSER)
-  # Link against the SwiftSyntax parser and libraries it depends on. The actual
-  # formulation of this is a hack to work around a CMake bug in Ninja file
-  # generation that results in multiple Ninja targets producing the same file in
-  # a downstream SourceKit target. This should be expressed as:
-  #
-  #   target_link_libraries(swiftParse
-  #     PRIVATE
-  #     SwiftSyntax::SwiftCompilerSupport
-  #     ...
-  #   )
+if (SWIFT_BUILD_SWIFT_SYNTAX)
   target_link_libraries(swiftParse
     PRIVATE
-    $<TARGET_OBJECTS:SwiftSyntax::SwiftBasicFormat>
-    $<TARGET_OBJECTS:SwiftSyntax::SwiftParser>
-    $<TARGET_OBJECTS:SwiftSyntax::SwiftParserDiagnostics>
-    $<TARGET_OBJECTS:SwiftSyntax::SwiftDiagnostics>
-    $<TARGET_OBJECTS:SwiftSyntax::SwiftSyntax>
-    $<TARGET_OBJECTS:SwiftSyntax::SwiftOperators>
-    $<TARGET_OBJECTS:SwiftSyntax::SwiftSyntaxBuilder>
-    $<TARGET_OBJECTS:SwiftSyntax::_SwiftSyntaxMacros>
-    $<TARGET_OBJECTS:SwiftSyntax::SwiftCompilerSupport>
-    $<TARGET_OBJECTS:swiftASTGen>
-  )
-
-  add_dependencies(swiftParse
-    SwiftSyntax::SwiftBasicFormat
-    SwiftSyntax::SwiftParser
-    SwiftSyntax::SwiftParserDiagnostics
-    SwiftSyntax::SwiftDiagnostics
-    SwiftSyntax::SwiftSyntax
-    SwiftSyntax::SwiftOperators
-    SwiftSyntax::SwiftSyntaxBuilder
-    SwiftSyntax::_SwiftSyntaxMacros
-    SwiftSyntax::SwiftCompilerSupport
+    SwiftBasicFormat
+    SwiftParser
+    SwiftParserDiagnostics
+    SwiftDiagnostics
+    SwiftSyntax
+    SwiftOperators
+    SwiftSyntaxBuilder
+    SwiftSyntaxMacros
     swiftASTGen
   )
 
-  target_include_directories(swiftParse
-    PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../swift-syntax/Sources/SwiftCompilerSupport
+  add_dependencies(swiftParse
+    SwiftBasicFormat
+    SwiftParser
+    SwiftParserDiagnostics
+    SwiftDiagnostics
+    SwiftSyntax
+    SwiftOperators
+    SwiftSyntaxBuilder
+    SwiftSyntaxMacros
+    swiftASTGen
   )
 
   target_compile_definitions(swiftParse
     PRIVATE
-    SWIFT_SWIFT_PARSER
+    SWIFT_BUILD_SWIFT_SYNTAX
   )
+endif()
+
+if(SWIFT_COMPILER_VERSION)
+  set_property(SOURCE ParseVersion.cpp APPEND_STRING PROPERTY COMPILE_FLAGS
+    " -DSWIFT_COMPILER_VERSION=\"\\\"${SWIFT_COMPILER_VERSION}\\\"\"")
 endif()
 
 set_swift_llvm_is_available(swiftParse)

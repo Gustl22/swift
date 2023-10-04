@@ -85,6 +85,10 @@ static bool isSpecializableRepresentation(SILFunctionTypeRepresentation Rep,
   case SILFunctionTypeRepresentation::Thick:
   case SILFunctionTypeRepresentation::CFunctionPointer:
   case SILFunctionTypeRepresentation::CXXMethod:
+  case SILFunctionTypeRepresentation::KeyPathAccessorGetter:
+  case SILFunctionTypeRepresentation::KeyPathAccessorSetter:
+  case SILFunctionTypeRepresentation::KeyPathAccessorEquals:
+  case SILFunctionTypeRepresentation::KeyPathAccessorHash:
     return true;
   case SILFunctionTypeRepresentation::WitnessMethod:
     return OptForPartialApply;
@@ -284,10 +288,11 @@ static bool usesGenerics(SILFunction *F,
 
 // Map the parameter, result and error types out of context to get the interface
 // type.
-static void mapInterfaceTypes(SILFunction *F,
-                              MutableArrayRef<SILParameterInfo> InterfaceParams,
-                              MutableArrayRef<SILResultInfo> InterfaceResults,
-                              Optional<SILResultInfo> &InterfaceErrorResult) {
+static void
+mapInterfaceTypes(SILFunction *F,
+                  MutableArrayRef<SILParameterInfo> InterfaceParams,
+                  MutableArrayRef<SILResultInfo> InterfaceResults,
+                  llvm::Optional<SILResultInfo> &InterfaceErrorResult) {
 
   for (auto &Param : InterfaceParams) {
     if (!Param.getInterfaceType()->hasArchetype())
@@ -305,14 +310,14 @@ static void mapInterfaceTypes(SILFunction *F,
     Result = InterfaceResult;
   }
 
-  if (InterfaceErrorResult.hasValue()) {
-    if (InterfaceErrorResult.getValue().getInterfaceType()->hasArchetype()) {
+  if (InterfaceErrorResult.has_value()) {
+    if (InterfaceErrorResult.value().getInterfaceType()->hasArchetype()) {
       InterfaceErrorResult =
-          SILResultInfo(InterfaceErrorResult.getValue()
+          SILResultInfo(InterfaceErrorResult.value()
                             .getInterfaceType()
                             ->mapTypeOutOfContext()
                             ->getCanonicalType(),
-                        InterfaceErrorResult.getValue().getConvention());
+                        InterfaceErrorResult.value().getConvention());
     }
   }
 }
@@ -396,7 +401,7 @@ FunctionSignatureTransformDescriptor::createOptimizedSILFunctionType() {
     witnessMethodConformance = ProtocolConformanceRef::forInvalid();
   }
 
-  Optional<SILResultInfo> InterfaceErrorResult;
+  llvm::Optional<SILResultInfo> InterfaceErrorResult;
   if (ExpectedFTy->hasErrorResult()) {
     InterfaceErrorResult = ExpectedFTy->getErrorResult();
   }
@@ -422,8 +427,8 @@ void FunctionSignatureTransformDescriptor::computeOptimizedArgInterface(
     ArgumentDescriptor &AD, SmallVectorImpl<SILParameterInfo> &Out) {
   // If this argument is live, but we cannot optimize it.
   if (!AD.canOptimizeLiveArg()) {
-    if (AD.PInfo.hasValue())
-      Out.push_back(AD.PInfo.getValue());
+    if (AD.PInfo.has_value())
+      Out.push_back(AD.PInfo.value());
     return;
   }
 
@@ -450,7 +455,7 @@ void FunctionSignatureTransformDescriptor::computeOptimizedArgInterface(
       }
 
       // Ty is not trivial, pass it through as the original calling convention.
-      auto ParameterConvention = AD.PInfo.getValue().getConvention();
+      auto ParameterConvention = AD.PInfo.value().getConvention();
       if (AD.OwnedToGuaranteed) {
         if (ParameterConvention == ParameterConvention::Direct_Owned)
           ParameterConvention = ParameterConvention::Direct_Guaranteed;
@@ -471,7 +476,7 @@ void FunctionSignatureTransformDescriptor::computeOptimizedArgInterface(
   // parameter, change the parameter to @guaranteed and continue...
   if (AD.OwnedToGuaranteed) {
     ++NumOwnedConvertedToGuaranteed;
-    auto ParameterConvention = AD.PInfo.getValue().getConvention();
+    auto ParameterConvention = AD.PInfo.value().getConvention();
     if (ParameterConvention == ParameterConvention::Direct_Owned)
       ParameterConvention = ParameterConvention::Direct_Guaranteed;
     else if (ParameterConvention == ParameterConvention::Indirect_In)
@@ -480,14 +485,14 @@ void FunctionSignatureTransformDescriptor::computeOptimizedArgInterface(
       llvm_unreachable("Unknown parameter convention transformation");
     }
 
-    SILParameterInfo NewInfo(AD.PInfo.getValue().getInterfaceType(),
+    SILParameterInfo NewInfo(AD.PInfo.value().getInterfaceType(),
                              ParameterConvention);
     Out.push_back(NewInfo);
     return;
   }
 
   // Otherwise just propagate through the parameter info.
-  Out.push_back(AD.PInfo.getValue());
+  Out.push_back(AD.PInfo.value());
 }
 
 //===----------------------------------------------------------------------===//
@@ -523,7 +528,7 @@ void FunctionSignatureTransform::createFunctionSignatureOptimizedFunction() {
   TransformDescriptor.OptimizedFunction = FunctionBuilder.createFunction(
       linkage, Name, NewFTy, NewFGenericEnv, F->getLocation(), F->isBare(),
       F->isTransparent(), F->isSerialized(), IsNotDynamic, IsNotDistributed,
-      F->getEntryCount(), F->isThunk(),
+      IsNotRuntimeAccessible, F->getEntryCount(), F->isThunk(),
       /*classSubclassScope=*/SubclassScope::NotApplicable,
       F->getInlineStrategy(), F->getEffectsKind(), nullptr, F->getDebugScope());
   SILFunction *NewF = TransformDescriptor.OptimizedFunction.get();
@@ -568,8 +573,7 @@ void FunctionSignatureTransform::createFunctionSignatureOptimizedFunction() {
   for (auto &ArgDesc : TransformDescriptor.ArgumentDescList) {
     auto *NewArg =
         ThunkBody->createFunctionArgument(ArgDesc.Arg->getType(), ArgDesc.Decl);
-    NewArg->setNoImplicitCopy(ArgDesc.Arg->isNoImplicitCopy());
-    NewArg->setLifetimeAnnotation(ArgDesc.Arg->getLifetimeAnnotation());
+    NewArg->copyFlags(ArgDesc.Arg);
   }
 
   SILLocation Loc = RegularLocation::getAutoGeneratedLocation();

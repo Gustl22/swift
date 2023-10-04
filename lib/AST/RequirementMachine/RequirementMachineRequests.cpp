@@ -152,7 +152,7 @@ static void splitConcreteEquivalenceClasses(
     ArrayRef<Requirement> requirements,
     const ProtocolDecl *proto,
     const RequirementMachine *machine,
-    TypeArrayView<GenericTypeParamType> genericParams,
+    ArrayRef<GenericTypeParamType *> genericParams,
     SmallVectorImpl<StructuralRequirement> &splitRequirements,
     unsigned &attempt) {
   bool debug = machine->getDebugOptions().contains(
@@ -409,7 +409,7 @@ RequirementSignatureRequest::evaluate(Evaluator &evaluator,
 
     // The requirement signature for the actual protocol that the result
     // was kicked off with.
-    Optional<RequirementSignature> result;
+    llvm::Optional<RequirementSignature> result;
 
     if (debug) {
       llvm::dbgs() << "\nRequirement signatures:\n";
@@ -620,7 +620,8 @@ AbstractGenericSignatureRequest::evaluate(
             return Type(type);
           },
           MakeAbstractConformanceForGenericType(),
-          SubstFlags::AllowLoweredTypes);
+          SubstFlags::AllowLoweredTypes |
+          SubstFlags::PreservePackExpansionLevel);
       resugaredRequirements.push_back(resugaredReq);
     }
 
@@ -748,8 +749,29 @@ InferredGenericSignatureRequest::evaluate(
 
   SmallVector<StructuralRequirement, 4> requirements;
   SmallVector<RequirementError, 4> errors;
+
+  SourceLoc loc = [&]() {
+    if (genericParamList) {
+      auto loc = genericParamList->getLAngleLoc();
+      if (loc.isValid())
+        return loc;
+    }
+    if (whereClause) {
+      auto loc = whereClause.getLoc();
+      if (loc.isValid())
+        return loc;
+    }
+    for (auto sourcePair : inferenceSources) {
+      auto *typeRepr = sourcePair.getTypeRepr();
+      auto loc = typeRepr ? typeRepr->getStartLoc() : SourceLoc();
+      if (loc.isValid())
+        return loc;
+    }
+    return SourceLoc();
+  }();
+
   for (const auto &req : parentSig.getRequirements())
-    requirements.push_back({req, SourceLoc(), /*wasInferred=*/false});
+    requirements.push_back({req, loc, /*wasInferred=*/false});
 
   DeclContext *lookupDC = nullptr;
 
@@ -760,10 +782,7 @@ InferredGenericSignatureRequest::evaluate(
     return false;
   };
 
-  SourceLoc loc;
   if (genericParamList) {
-    loc = genericParamList->getLAngleLoc();
-
     // Extensions never have a parent signature.
     assert(genericParamList->getOuterParameters() == nullptr || !parentSig);
 
@@ -810,9 +829,6 @@ InferredGenericSignatureRequest::evaluate(
   if (whereClause) {
     lookupDC = whereClause.dc;
 
-    if (loc.isInvalid())
-      loc = whereClause.getLoc();
-
     std::move(whereClause).visitRequirements(
         TypeResolutionStage::Structural,
         visitRequirement);
@@ -825,11 +841,9 @@ InferredGenericSignatureRequest::evaluate(
   for (auto sourcePair : inferenceSources) {
     auto *typeRepr = sourcePair.getTypeRepr();
     auto typeLoc = typeRepr ? typeRepr->getStartLoc() : SourceLoc();
-    if (loc.isInvalid())
-      loc = typeLoc;
 
     inferRequirements(sourcePair.getType(), typeLoc, moduleForInference,
-                      requirements);
+                      lookupDC, requirements);
   }
 
   // Finish by adding any remaining requirements. This is used to introduce
@@ -951,6 +965,12 @@ InferredGenericSignatureRequest::evaluate(
           continue;
 
         if (reduced->isTypeParameter()) {
+          // If one side is a parameter pack and the other is not, this is a
+          // same-element requirement that cannot be expressed with only one
+          // type parameter.
+          if (genericParam->isParameterPack() != reduced->isParameterPack())
+            continue;
+
           ctx.Diags.diagnose(loc, diag::requires_generic_params_made_equal,
                              genericParam, result->getSugaredType(reduced))
             .warnUntilSwiftVersion(6);

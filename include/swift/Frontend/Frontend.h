@@ -30,12 +30,13 @@
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/ClangImporter/ClangImporter.h"
+#include "swift/Frontend/CachedDiagnostics.h"
 #include "swift/Frontend/DiagnosticVerifier.h"
 #include "swift/Frontend/FrontendOptions.h"
 #include "swift/Frontend/ModuleInterfaceSupport.h"
 #include "swift/IRGen/TBDGen.h"
 #include "swift/Migrator/MigratorOptions.h"
-#include "swift/Parse/CodeCompletionCallbacks.h"
+#include "swift/Parse/IDEInspectionCallbacks.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Sema/SourceLoader.h"
 #include "swift/Serialization/Validation.h"
@@ -44,9 +45,14 @@
 #include "clang/Basic/FileManager.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/CAS/ActionCache.h"
+#include "llvm/CAS/ObjectStore.h"
 #include "llvm/Option/ArgList.h"
+#include "llvm/Support/BLAKE3.h"
+#include "llvm/Support/HashingOutputBackend.h"
 #include "llvm/Support/Host.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/VirtualOutputBackend.h"
 
 #include <memory>
 
@@ -95,13 +101,14 @@ class CompilerInvocation {
   IRGenOptions IRGenOpts;
   TBDGenOptions TBDGenOpts;
   ModuleInterfaceOptions ModuleInterfaceOpts;
-  llvm::MemoryBuffer *CodeCompletionBuffer = nullptr;
+  llvm::MemoryBuffer *IDEInspectionTargetBuffer = nullptr;
 
-  /// Code completion offset in bytes from the beginning of the main
-  /// source file.  Valid only if \c isCodeCompletion() == true.
-  unsigned CodeCompletionOffset = ~0U;
+  /// The offset that IDEInspection wants to further examine in offset of bytes
+  /// from the beginning of the main source file.  Valid only if
+  /// \c isIDEInspection() == true.
+  unsigned IDEInspectionOffset = ~0U;
 
-  CodeCompletionCallbacksFactory *CodeCompletionFactory = nullptr;
+  IDEInspectionCallbacksFactory *IDEInspectionFactory = nullptr;
 
 public:
   CompilerInvocation();
@@ -161,8 +168,16 @@ public:
     ClangImporterOpts.ModuleCachePath = Path.str();
   }
 
+  void setClangScannerModuleCachePath(StringRef Path) {
+    ClangImporterOpts.ClangScannerModuleCachePath = Path.str();
+  }
+
   StringRef getClangModuleCachePath() const {
     return ClangImporterOpts.ModuleCachePath;
+  }
+
+  StringRef getClangScannerModuleCachePath() const {
+    return ClangImporterOpts.ClangScannerModuleCachePath;
   }
 
   void setImportSearchPaths(const std::vector<std::string> &Paths) {
@@ -187,12 +202,8 @@ public:
     return SearchPathOpts.getFrameworkSearchPaths();
   }
 
-  void setCompilerPluginLibraryPaths(const std::vector<std::string> &Paths) {
-    SearchPathOpts.setCompilerPluginLibraryPaths(Paths);
-  }
-
-  ArrayRef<std::string> getCompilerPluginLibraryPaths() {
-    return SearchPathOpts.getCompilerPluginLibraryPaths();
+  void setVFSOverlays(const std::vector<std::string> &Overlays) {
+    SearchPathOpts.VFSOverlayFiles = Overlays;
   }
 
   void setExtraClangArgs(const std::vector<std::string> &Args) {
@@ -219,13 +230,16 @@ public:
   /// and SDK version. This function is also used by LLDB.
   static std::string
   computePrebuiltCachePath(StringRef RuntimeResourcePath, llvm::Triple target,
-                           Optional<llvm::VersionTuple> sdkVer);
+                           llvm::Optional<llvm::VersionTuple> sdkVer);
 
   /// If we haven't explicitly passed -prebuilt-module-cache-path, set it to
   /// the default value of <resource-dir>/<platform>/prebuilt-modules.
   /// @note This should be called once, after search path options and frontend
   ///       options have been parsed.
   void setDefaultPrebuiltCacheIfNecessary();
+
+  /// If we haven't explicitly passed -blocklist-paths, set it to the default value.
+  void setDefaultBlocklistsIfNecessary();
 
   /// Computes the runtime resource path relative to the given Swift
   /// executable.
@@ -322,28 +336,33 @@ public:
     return FrontendOpts.InputsAndOutputs.getSingleOutputFilename();
   }
 
-  void setCodeCompletionPoint(llvm::MemoryBuffer *Buf, unsigned Offset) {
+  void setIDEInspectionTarget(llvm::MemoryBuffer *Buf, unsigned Offset) {
     assert(Buf);
-    CodeCompletionBuffer = Buf;
-    CodeCompletionOffset = Offset;
+    IDEInspectionTargetBuffer = Buf;
+    IDEInspectionOffset = Offset;
     // We don't need typo-correction for code-completion.
     // FIXME: This isn't really true, but is a performance issue.
     LangOpts.TypoCorrectionLimit = 0;
   }
 
-  std::pair<llvm::MemoryBuffer *, unsigned> getCodeCompletionPoint() const {
-    return std::make_pair(CodeCompletionBuffer, CodeCompletionOffset);
+  std::pair<llvm::MemoryBuffer *, unsigned> getIDEInspectionTarget() const {
+    return std::make_pair(IDEInspectionTargetBuffer, IDEInspectionOffset);
   }
 
   /// \returns true if we are doing code completion.
-  bool isCodeCompletion() const {
-    return CodeCompletionOffset != ~0U;
+  bool isIDEInspection() const {
+    return IDEInspectionOffset != ~0U;
   }
 
   /// Retrieve a module hash string that is suitable for uniquely
   /// identifying the conditions under which the module was built, for use
   /// in generating a cached PCH file for the bridging header.
   std::string getPCHHash() const;
+
+  /// Retrieve a module hash string that is suitable for uniquely
+  /// identifying the conditions under which the current module is built,
+  /// from the perspective of a dependency scanning action.
+  std::string getModuleScanningHash() const;
 
   /// Retrieve the stdlib kind to implicitly import.
   ImplicitStdlibKind getImplicitStdlibKind() const {
@@ -369,6 +388,10 @@ public:
   /// Whether the Swift String Processing support library should be implicitly
   /// imported.
   bool shouldImportSwiftStringProcessing() const;
+
+  /// Whether the Swift Backtracing support library should be implicitly
+  /// imported.
+  bool shouldImportSwiftBacktracing() const;
 
   /// Performs input setup common to these tools:
   /// sil-opt, sil-func-extractor, sil-llvm-gen, and sil-nm.
@@ -427,11 +450,20 @@ public:
 /// times on a single CompilerInstance is not permitted.
 class CompilerInstance {
   CompilerInvocation Invocation;
+
+  /// CAS Instances.
+  /// This needs to be declared before SourceMgr because when using CASFS,
+  /// the file buffer provided by CAS needs to outlive the SourceMgr.
+  std::shared_ptr<llvm::cas::ObjectStore> CAS;
+  std::shared_ptr<llvm::cas::ActionCache> ResultCache;
+  llvm::Optional<llvm::cas::ObjectRef> CompileJobBaseKey;
+
   SourceManager SourceMgr;
   DiagnosticEngine Diagnostics{SourceMgr};
   std::unique_ptr<ASTContext> Context;
   std::unique_ptr<Lowering::TypeConverter> TheSILTypes;
   std::unique_ptr<DiagnosticVerifier> DiagVerifier;
+  std::unique_ptr<CachingDiagnosticsProcessor> CDP;
 
   /// A cache describing the set of inter-module dependencies that have been queried.
   /// Null if not present.
@@ -442,6 +474,13 @@ class CompilerInstance {
   /// If there is no stats output directory by the time the
   /// instance has completed its setup, this will be null.
   std::unique_ptr<UnifiedStatsReporter> Stats;
+
+  /// Virtual OutputBackend.
+  llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> OutputBackend = nullptr;
+
+  /// The verification output backend.
+  using HashBackendTy = llvm::vfs::HashingOutputBackend<llvm::BLAKE3>;
+  llvm::IntrusiveRefCntPtr<HashBackendTy> HashBackend;
 
   mutable ModuleDecl *MainModule = nullptr;
   SerializedModuleLoaderBase *DefaultSerializedLoader = nullptr;
@@ -488,6 +527,31 @@ public:
 
   llvm::vfs::FileSystem &getFileSystem() const {
     return *SourceMgr.getFileSystem();
+  }
+
+  llvm::vfs::OutputBackend &getOutputBackend() const {
+    return *OutputBackend;
+  }
+  void
+  setOutputBackend(llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> Backend) {
+    OutputBackend = std::move(Backend);
+  }
+  using HashingBackendPtrTy = llvm::IntrusiveRefCntPtr<HashBackendTy>;
+  HashingBackendPtrTy getHashingBackend() { return HashBackend; }
+
+  llvm::cas::ObjectStore &getObjectStore() const { return *CAS; }
+  llvm::cas::ActionCache &getActionCache() const { return *ResultCache; }
+  std::shared_ptr<llvm::cas::ActionCache> getSharedCacheInstance() const {
+    return ResultCache;
+  }
+  std::shared_ptr<llvm::cas::ObjectStore> getSharedCASInstance() const {
+    return CAS;
+  }
+  llvm::Optional<llvm::cas::ObjectRef> getCompilerBaseKey() const {
+    return CompileJobBaseKey;
+  }
+  CachingDiagnosticsProcessor *getCachingDiagnosticsProcessor() const {
+    return CDP.get();
   }
 
   ASTContext &getASTContext() { return *Context; }
@@ -550,6 +614,10 @@ public:
   /// i.e. if it can be found.
   bool canImportSwiftConcurrency() const;
 
+  /// Whether the Swift Concurrency Shims support Clang library can be imported
+  /// i.e. if it can be found.
+  bool canImportSwiftConcurrencyShims() const;
+
   /// Verify that if an implicit import of the `StringProcessing` module if
   /// expected, it can actually be imported. Emit a warning, otherwise.
   void verifyImplicitStringProcessingImport();
@@ -558,9 +626,24 @@ public:
   /// i.e. if it can be found.
   bool canImportSwiftStringProcessing() const;
 
+  /// Verify that if an implicit import of the `Backtracing` module if
+  /// expected, it can actually be imported. Emit a warning, otherwise.
+  void verifyImplicitBacktracingImport();
+
+  /// Whether the Swift Backtracing support library can be imported
+  /// i.e. if it can be found.
+  bool canImportSwiftBacktracing() const;
+
   /// Whether the CxxShim library can be imported
   /// i.e. if it can be found.
   bool canImportCxxShim() const;
+
+  /// Whether this compiler instance supports caching.
+  bool supportCaching() const;
+
+  /// Whether errors during interface verification can be downgrated
+  /// to warnings.
+  bool downgradeInterfaceVerificationErrors() const;
 
   /// Gets the SourceFile which is the primary input for this CompilerInstance.
   /// \returns the primary SourceFile, or nullptr if there is no primary input;
@@ -579,13 +662,17 @@ public:
   }
 
   /// Returns true if there was an error during setup.
-  bool setup(const CompilerInvocation &Invocation, std::string &Error);
+  bool setup(const CompilerInvocation &Invocation, std::string &Error,
+             ArrayRef<const char *> Args = {});
 
   const CompilerInvocation &getInvocation() const { return Invocation; }
 
-  /// If a code completion buffer has been set, returns the corresponding source
+  /// If a IDE inspection buffer has been set, returns the corresponding source
   /// file.
-  SourceFile *getCodeCompletionFile() const;
+  SourceFile *getIDEInspectionFile() const;
+
+  /// Retrieve the printing path for bridging header.
+  std::string getBridgingHeaderPath() const;
 
 private:
   /// Set up the file system by loading and validating all VFS overlay YAML
@@ -596,42 +683,48 @@ private:
   void setUpLLVMArguments();
   void setUpDiagnosticOptions();
   bool setUpModuleLoaders();
+  bool setUpPluginLoader();
   bool setUpInputs();
   bool setUpASTContextIfNeeded();
   void setupStatsReporter();
   void setupDependencyTrackerIfNeeded();
+  bool setupCASIfNeeded(ArrayRef<const char *> Args);
+  void setupOutputBackend();
+  void setupCachingDiagnosticsProcessorIfNeeded();
 
   /// \return false if successful, true on error.
   bool setupDiagnosticVerifierIfNeeded();
 
-  Optional<unsigned> setUpCodeCompletionBuffer();
+  llvm::Optional<unsigned> setUpIDEInspectionTargetBuffer();
 
   /// Find a buffer for a given input file and ensure it is recorded in
   /// SourceMgr, PartialModules, or InputSourceCodeBufferIDs as appropriate.
   /// Return the buffer ID if it is not already compiled, or None if so.
   /// Set failed on failure.
 
-  Optional<unsigned> getRecordedBufferID(const InputFile &input,
-                                         const bool shouldRecover,
-                                         bool &failed);
+  llvm::Optional<unsigned> getRecordedBufferID(const InputFile &input,
+                                               const bool shouldRecover,
+                                               bool &failed);
 
   /// Given an input file, return a buffer to use for its contents,
   /// and a buffer for the corresponding module doc file if one exists.
   /// On failure, return a null pointer for the first element of the returned
   /// pair.
-  Optional<ModuleBuffers> getInputBuffersIfPresent(const InputFile &input);
+  llvm::Optional<ModuleBuffers>
+  getInputBuffersIfPresent(const InputFile &input);
 
   /// Try to open the module doc file corresponding to the input parameter.
   /// Return None for error, nullptr if no such file exists, or the buffer if
   /// one was found.
-  Optional<std::unique_ptr<llvm::MemoryBuffer>>
+  llvm::Optional<std::unique_ptr<llvm::MemoryBuffer>>
   openModuleDoc(const InputFile &input);
 
   /// Try to open the module source info file corresponding to the input parameter.
   /// Return None for error, nullptr if no such file exists, or the buffer if
   /// one was found.
-  Optional<std::unique_ptr<llvm::MemoryBuffer>>
+  llvm::Optional<std::unique_ptr<llvm::MemoryBuffer>>
   openModuleSourceInfo(const InputFile &input);
+
 public:
   /// Parses and type-checks all input files.
   void performSema();
@@ -651,7 +744,7 @@ private:
   /// Creates a new source file for the main module.
   SourceFile *createSourceFileForMainModule(ModuleDecl *mod,
                                             SourceFileKind FileKind,
-                                            Optional<unsigned> BufferID,
+                                            llvm::Optional<unsigned> BufferID,
                                             bool isMainBuffer = false) const;
 
   /// Creates all the files to be added to the main module, appending them to

@@ -271,6 +271,17 @@ struct ValueOwnershipKind {
 
   explicit operator bool() const { return value != OwnershipKind::Any; }
 
+#ifndef __cpp_impl_three_way_comparison
+  // C++20 (more precisely P1185) introduced more overload candidates for
+  // comparison operator calls. With that in place the following definitions are
+  // redundant and actually cause compilation errors because of ambiguity.
+  // P1630 explains the rationale behind introducing this backward
+  // incompatibility.
+  //
+  // References:
+  // https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2019/p1185r2.html
+  // https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2019/p1630r1.html
+
   bool operator==(ValueOwnershipKind other) const {
     return value == other.value;
   }
@@ -280,6 +291,7 @@ struct ValueOwnershipKind {
 
   bool operator==(innerty other) const { return value == other; }
   bool operator!=(innerty other) const { return !(value == other); }
+#endif
 
   /// We merge by moving down the lattice.
   ValueOwnershipKind merge(ValueOwnershipKind rhs) const {
@@ -466,8 +478,14 @@ public:
   /// entire use list.
   inline bool hasTwoUses() const;
 
-  /// Helper struct for DowncastUserFilterRange
+  /// Helper struct for DowncastUserFilterRange and UserRange
   struct UseToUser;
+
+  using UserRange =
+      llvm::iterator_range<llvm::mapped_iterator<swift::ValueBaseUseIterator,
+                                                 swift::ValueBase::UseToUser,
+                                                 swift::SILInstruction *>>;
+  inline UserRange getUsers() const;
 
   template <typename Subclass>
   using DowncastUserFilterRange =
@@ -493,6 +511,13 @@ public:
     return const_cast<ValueBase*>(this)->getDefiningInstruction();
   }
   SILInstruction *getDefiningInstruction();
+
+  /// Return the instruction that defines this value, terminator instruction
+  /// that produces this result, or null if it is not defined by an instruction.
+  const SILInstruction *getDefiningInstructionOrTerminator() const {
+    return const_cast<ValueBase*>(this)->getDefiningInstructionOrTerminator();
+  }
+  SILInstruction *getDefiningInstructionOrTerminator();
 
   /// Return the SIL instruction that can be used to describe the first time
   /// this value is available.
@@ -549,7 +574,7 @@ public:
 
   /// Return the instruction that defines this value and the appropriate
   /// result index, or None if it is not defined by an instruction.
-  Optional<DefiningInstructionResult> getDefiningInstructionResult();
+  llvm::Optional<DefiningInstructionResult> getDefiningInstructionResult();
 
   /// Returns the ValueOwnershipKind that describes this SILValue's ownership
   /// semantics if the SILValue has ownership semantics. Returns is a value
@@ -563,16 +588,23 @@ public:
 
   bool isLexical() const;
 
+  bool isGuaranteedForwarding() const;
+
   /// Unsafely eliminate moveonly from this value's type. Returns true if the
   /// value's underlying type was move only and thus was changed. Returns false
   /// otherwise.
   ///
   /// NOTE: Please do not use this directly! It is only meant to be used by the
   /// optimizer pass: SILMoveOnlyWrappedTypeEliminator.
-  bool unsafelyEliminateMoveOnlyWrapper() {
-    if (!Type.isMoveOnlyWrapped())
+  bool unsafelyEliminateMoveOnlyWrapper(const SILFunction *fn) {
+    if (!Type.isMoveOnlyWrapped() && !Type.isBoxedMoveOnlyWrappedType(fn))
       return false;
-    Type = Type.removingMoveOnlyWrapper();
+    if (Type.isMoveOnlyWrapped()) {
+      Type = Type.removingMoveOnlyWrapper();
+    } else {
+      assert(Type.isBoxedMoveOnlyWrappedType(fn));
+      Type = Type.removingMoveOnlyWrapperToBoxedType(fn);
+    }
     return true;
   }
 
@@ -667,22 +699,9 @@ public:
     return Value->getDefiningInstruction();
   }
 
-  /// Returns the ValueOwnershipKind that describes this SILValue's ownership
-  /// semantics if the SILValue has ownership semantics. Returns is a value
-  /// without any Ownership Semantics.
-  ///
-  /// An example of a SILValue without ownership semantics is a
-  /// struct_element_addr.
-  ///
-  /// NOTE: This is implemented in ValueOwnership.cpp not SILValue.cpp.
-  ///
-  /// FIXME: remove this redundant API from SILValue.
-  [[deprecated("Please use ValueBase::getOwnershipKind()")]] ValueOwnershipKind
-  getOwnershipKind() const {
-    return Value->getOwnershipKind();
-  };
-
   /// Verify that this SILValue and its uses respects ownership invariants.
+  ///
+  /// \p DEBlocks is nullptr when OSSA lifetimes are complete.
   void verifyOwnership(DeadEndBlocks *DEBlocks) const;
 
   SWIFT_DEBUG_DUMP;
@@ -833,8 +852,6 @@ struct OperandOwnership {
     /// borrow scope.
     /// (tuple_extract, struct_extract, cast, switch)
     GuaranteedForwarding,
-    /// A GuaranteedForwarding value passed as a phi operand.
-    GuaranteedForwardingPhi,
     /// End Borrow. End the borrow scope opened directly by the operand.
     /// The operand must be a begin_borrow, begin_apply, or function argument.
     /// (end_borrow, end_apply)
@@ -927,7 +944,6 @@ inline OwnershipConstraint OperandOwnership::getOwnershipConstraint() {
     return {OwnershipKind::Owned, UseLifetimeConstraint::LifetimeEnding};
   case OperandOwnership::InteriorPointer:
   case OperandOwnership::GuaranteedForwarding:
-  case OperandOwnership::GuaranteedForwardingPhi:
     return {OwnershipKind::Guaranteed,
             UseLifetimeConstraint::NonLifetimeEnding};
   case OperandOwnership::EndBorrow:
@@ -956,7 +972,6 @@ inline bool canAcceptUnownedValue(OperandOwnership operandOwnership) {
   case OperandOwnership::ForwardingConsume:
   case OperandOwnership::InteriorPointer:
   case OperandOwnership::GuaranteedForwarding:
-  case OperandOwnership::GuaranteedForwardingPhi:
   case OperandOwnership::EndBorrow:
   case OperandOwnership::Reborrow:
     return false;
@@ -1441,6 +1456,10 @@ struct ValueBase::UseToUser {
   SILInstruction *operator()(Operand *use) { return use->getUser(); }
   SILInstruction *operator()(Operand &use) { return use.getUser(); }
 };
+
+inline ValueBase::UserRange ValueBase::getUsers() const {
+  return llvm::map_range(getUses(), ValueBase::UseToUser());
+}
 
 template <typename T>
 inline ValueBase::DowncastUserFilterRange<T> ValueBase::getUsersOfType() const {

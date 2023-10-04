@@ -32,13 +32,13 @@ using namespace swift;
 namespace {
 
 /// Get PlatformConditionKind from platform condition name.
-static
-Optional<PlatformConditionKind> getPlatformConditionKind(StringRef Name) {
-  return llvm::StringSwitch<Optional<PlatformConditionKind>>(Name)
+static llvm::Optional<PlatformConditionKind>
+getPlatformConditionKind(StringRef Name) {
+  return llvm::StringSwitch<llvm::Optional<PlatformConditionKind>>(Name)
 #define PLATFORM_CONDITION(LABEL, IDENTIFIER) \
     .Case(IDENTIFIER, PlatformConditionKind::LABEL)
 #include "swift/AST/PlatformConditionKinds.def"
-    .Default(None);
+      .Default(llvm::None);
 }
 
 /// Get platform condition name from PlatformConditionKind.
@@ -58,9 +58,10 @@ static StringRef extractExprSource(SourceManager &SM, Expr *E) {
   return SM.extractText(Range);
 }
 
-static bool isValidPrefixUnaryOperator(Optional<StringRef> UnaryOperator) {
-  return UnaryOperator != None &&
-         (UnaryOperator.getValue() == ">=" || UnaryOperator.getValue() == "<");
+static bool
+isValidPrefixUnaryOperator(llvm::Optional<StringRef> UnaryOperator) {
+  return UnaryOperator != llvm::None &&
+         (UnaryOperator.value() == ">=" || UnaryOperator.value() == "<");
 }
 
 static bool isValidVersion(const version::Version &Version,
@@ -164,13 +165,13 @@ class ValidateIfConfigCondition :
   bool HasError;
 
   /// Get the identifier string of the UnresolvedDeclRefExpr.
-  Optional<StringRef> getDeclRefStr(Expr *E, DeclRefKind Kind) {
+  llvm::Optional<StringRef> getDeclRefStr(Expr *E, DeclRefKind Kind) {
     auto UDRE = dyn_cast<UnresolvedDeclRefExpr>(E);
     if (!UDRE ||
         !UDRE->hasName() ||
         UDRE->getRefKind() != Kind ||
         UDRE->getName().isCompoundName())
-      return None;
+      return llvm::None;
 
     return UDRE->getName().getBaseIdentifier().str();
   }
@@ -180,7 +181,7 @@ class ValidateIfConfigCondition :
   bool isModulePath(Expr *E) {
     auto UDE = dyn_cast<UnresolvedDotExpr>(E);
     if (!UDE)
-      return getDeclRefStr(E, DeclRefKind::Ordinary).hasValue();
+      return getDeclRefStr(E, DeclRefKind::Ordinary).has_value();
 
     return UDE->getFunctionRefKind() == FunctionRefKind::Unapplied &&
            isModulePath(UDE->getBase());
@@ -197,11 +198,11 @@ class ValidateIfConfigCondition :
   Expr *foldSequence(Expr *LHS, ArrayRef<Expr*> &S, bool isRecurse = false) {
     assert(!S.empty() && ((S.size() & 1) == 0));
 
-    auto getNextOperator = [&]() -> Optional<StringRef> {
+    auto getNextOperator = [&]() -> llvm::Optional<StringRef> {
       assert((S.size() & 1) == 0);
       while (!S.empty()) {
         auto Name = getDeclRefStr(S[0], DeclRefKind::BinaryOperator);
-        if (Name.hasValue() && (*Name == "||" || *Name == "&&"))
+        if (Name.has_value() && (*Name == "||" || *Name == "&&"))
           return Name;
 
         auto DiagID = isa<UnresolvedDeclRefExpr>(S[0])
@@ -212,12 +213,12 @@ class ValidateIfConfigCondition :
         // Consume invalid operator and the immediate RHS.
         S = S.slice(2);
       }
-      return None;
+      return llvm::None;
     };
 
     // Extract out the first operator name.
     auto OpName = getNextOperator();
-    if (!OpName.hasValue())
+    if (!OpName.has_value())
       // If failed, it's not a sequence anymore.
       return LHS;
     Expr *Op = S[0];
@@ -230,7 +231,7 @@ class ValidateIfConfigCondition :
     while (true) {
       // Pull out the next binary operator.
       auto NextOpName = getNextOperator();
-      bool IsEnd = !NextOpName.hasValue();
+      bool IsEnd = !NextOpName.has_value();
       if (!IsEnd && *OpName == "||" && *NextOpName == "&&") {
         RHS = foldSequence(RHS, S, /*isRecurse*/true);
         continue;
@@ -261,7 +262,7 @@ public:
 
   // Explicit configuration flag.
   Expr *visitUnresolvedDeclRefExpr(UnresolvedDeclRefExpr *E) {
-    if (!getDeclRefStr(E, DeclRefKind::Ordinary).hasValue())
+    if (!getDeclRefStr(E, DeclRefKind::Ordinary).has_value())
       return diagnoseUnsupportedExpr(E);
     return E;
   }
@@ -289,7 +290,7 @@ public:
   // Platform conditions.
   Expr *visitCallExpr(CallExpr *E) {
     auto KindName = getDeclRefStr(E->getFn(), DeclRefKind::Ordinary);
-    if (!KindName.hasValue()) {
+    if (!KindName.has_value()) {
       D.diagnose(E->getLoc(), diag::unsupported_platform_condition_expression);
       return nullptr;
     }
@@ -314,7 +315,7 @@ public:
 
         auto Val = VersionParser::parseCompilerVersionString(SLE->getValue(),
                                                              SLE->getLoc(), &D);
-        if (!Val.hasValue())
+        if (!Val.has_value())
           return nullptr;
         return E;
       }
@@ -326,8 +327,9 @@ public:
     if (*KindName == "swift" || *KindName == "compiler" ||
         *KindName == "_compiler_version") {
       auto PUE = dyn_cast<PrefixUnaryExpr>(Arg);
-      Optional<StringRef> PrefixName =
-          PUE ? getDeclRefStr(PUE->getFn(), DeclRefKind::PrefixOperator) : None;
+      llvm::Optional<StringRef> PrefixName =
+          PUE ? getDeclRefStr(PUE->getFn(), DeclRefKind::PrefixOperator)
+              : llvm::None;
       if (!isValidPrefixUnaryOperator(PrefixName)) {
         D.diagnose(
             Arg->getLoc(), diag::unsupported_platform_condition_argument,
@@ -337,7 +339,7 @@ public:
       auto versionString = extractExprSource(Ctx.SourceMgr, PUE->getOperand());
       auto Val = VersionParser::parseVersionString(
           versionString, PUE->getOperand()->getStartLoc(), &D);
-      if (!Val.hasValue())
+      if (!Val.has_value())
         return nullptr;
       return E;
     }
@@ -378,15 +380,15 @@ public:
       return E;
     }
 
-    // ( 'os' | 'arch' | '_endian' | '_runtime' ) '(' identifier ')''
+    // ( 'os' | 'arch' | '_endian' | '_pointerBitWidth' | '_runtime' | '_atomicBitWidth' ) '(' identifier ')''
     auto Kind = getPlatformConditionKind(*KindName);
-    if (!Kind.hasValue()) {
+    if (!Kind.has_value()) {
       D.diagnose(E->getLoc(), diag::unsupported_platform_condition_expression);
       return nullptr;
     }
 
     auto ArgStr = getDeclRefStr(Arg, DeclRefKind::Ordinary);
-    if (!ArgStr.hasValue()) {
+    if (!ArgStr.has_value()) {
       D.diagnose(E->getLoc(), diag::unsupported_platform_condition_argument,
                  "identifier");
       return nullptr;
@@ -412,12 +414,16 @@ public:
         DiagName = "architecture"; break;
       case PlatformConditionKind::Endianness:
         DiagName = "endianness"; break;
+      case PlatformConditionKind::PointerBitWidth:
+        DiagName = "pointer bit width"; break;
       case PlatformConditionKind::CanImport:
         DiagName = "import conditional"; break;
       case PlatformConditionKind::TargetEnvironment:
         DiagName = "target environment"; break;
       case PlatformConditionKind::PtrAuth:
         DiagName = "pointer authentication scheme"; break;
+      case PlatformConditionKind::AtomicBitWidth:
+        DiagName = "atomic bit width"; break;
       case PlatformConditionKind::Runtime:
         llvm_unreachable("handled above");
       }
@@ -456,7 +462,7 @@ public:
   // Prefix '!'. Other prefix operators are rejected.
   Expr *visitPrefixUnaryExpr(PrefixUnaryExpr *E) {
     auto OpName = getDeclRefStr(E->getFn(), DeclRefKind::PrefixOperator);
-    if (!OpName.hasValue() || *OpName != "!") {
+    if (!OpName.has_value() || *OpName != "!") {
       D.diagnose(E->getLoc(),
                  diag::unsupported_conditional_compilation_unary_expression);
       return nullptr;
@@ -553,6 +559,11 @@ public:
 
     // Check whether this is any one of the known compiler features.
     const auto &langOpts = Ctx.LangOpts;
+#if SWIFT_BUILD_SWIFT_SYNTAX
+    const bool hasSwiftSwiftParser = true;
+#else
+    const bool hasSwiftSwiftParser = false;
+#endif
     bool isKnownFeature = llvm::StringSwitch<bool>(Name)
 #define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option) \
         .Case("$" #FeatureName, Option)
@@ -573,7 +584,7 @@ public:
       auto Str = cast<StringLiteralExpr>(Arg)->getValue();
       auto Val =
           VersionParser::parseCompilerVersionString(Str, SourceLoc(), nullptr)
-              .getValue();
+              .value();
       auto thisVersion = version::getCurrentCompilerVersion();
       return thisVersion >= Val;
     } else if ((KindName == "swift") || (KindName == "compiler") ||
@@ -582,7 +593,7 @@ public:
       auto PrefixName = getDeclRefStr(PUE->getFn());
       auto Str = extractExprSource(Ctx.SourceMgr, PUE->getOperand());
       auto Val = VersionParser::parseVersionString(Str, SourceLoc(), nullptr)
-                     .getValue();
+                     .value();
       version::Version thisVersion;
       if (KindName == "swift") {
         thisVersion = Ctx.LangOpts.EffectiveLanguageVersion;
@@ -614,7 +625,7 @@ public:
     }
 
     auto Val = getDeclRefStr(Arg);
-    auto Kind = getPlatformConditionKind(KindName).getValue();
+    auto Kind = getPlatformConditionKind(KindName).value();
     return Ctx.LangOpts.checkPlatformCondition(Kind, Val);
   }
 
@@ -780,21 +791,23 @@ Result Parser::parseIfConfigRaw(
       *this, Tok.getLoc(), Parser::StructureMarkerKind::IfConfig);
 
   // Find the region containing code completion token.
-  SourceLoc codeCompletionClauseLoc;
-  if (SourceMgr.hasCodeCompletionBuffer() &&
-      SourceMgr.getCodeCompletionBufferID() == L->getBufferID() &&
+  SourceLoc ideInspectionClauseLoc;
+  if (SourceMgr.hasIDEInspectionTargetBuffer() &&
+      SourceMgr.getIDEInspectionTargetBufferID() == L->getBufferID() &&
       SourceMgr.isBeforeInBuffer(Tok.getLoc(),
-                                 SourceMgr.getCodeCompletionLoc())) {
-    llvm::SaveAndRestore<Optional<StableHasher>> H(CurrentTokenHash, None);
+                                 SourceMgr.getIDEInspectionTargetLoc())) {
+    llvm::SaveAndRestore<llvm::Optional<StableHasher>> H(CurrentTokenHash,
+                                                         llvm::None);
     BacktrackingScope backtrack(*this);
     do {
       auto startLoc = Tok.getLoc();
       consumeToken();
       skipUntilConditionalBlockClose();
       auto endLoc = PreviousLoc;
-      if (SourceMgr.rangeContainsTokenLoc(SourceRange(startLoc, endLoc),
-                                          SourceMgr.getCodeCompletionLoc())){
-        codeCompletionClauseLoc = startLoc;
+      if (SourceMgr.rangeContainsTokenLoc(
+              SourceRange(startLoc, endLoc),
+              SourceMgr.getIDEInspectionTargetLoc())) {
+        ideInspectionClauseLoc = startLoc;
         break;
       }
     } while (Tok.isNot(tok::pound_endif, tok::eof));
@@ -807,7 +820,7 @@ Result Parser::parseIfConfigRaw(
       !InInactiveClauseEnvironment &&
       // If this directive contains code completion location, 'isActive' is
       // determined solely by which block has the completion token.
-      !codeCompletionClauseLoc.isValid();
+      !ideInspectionClauseLoc.isValid();
 
   bool foundActive = false;
   bool isVersionCondition = false;
@@ -850,8 +863,8 @@ Result Parser::parseIfConfigRaw(
     }
 
     // Treat the region containing code completion token as "active".
-    if (codeCompletionClauseLoc.isValid() && !foundActive)
-      isActive = (ClauseLoc == codeCompletionClauseLoc);
+    if (ideInspectionClauseLoc.isValid() && !foundActive)
+      isActive = (ClauseLoc == ideInspectionClauseLoc);
 
     foundActive |= isActive;
 
@@ -871,9 +884,9 @@ Result Parser::parseIfConfigRaw(
     llvm::SaveAndRestore<bool> S(InInactiveClauseEnvironment,
                                  InInactiveClauseEnvironment || !isActive);
     // Disable updating the interface hash inside inactive blocks.
-    Optional<llvm::SaveAndRestore<Optional<StableHasher>>> T;
+    llvm::Optional<llvm::SaveAndRestore<llvm::Optional<StableHasher>>> T;
     if (!isActive)
-      T.emplace(CurrentTokenHash, None);
+      T.emplace(CurrentTokenHash, llvm::None);
 
     if (isActive || !isVersionCondition) {
       parseElements(

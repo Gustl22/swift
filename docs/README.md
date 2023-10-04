@@ -136,6 +136,9 @@ documentation, please create a thread on the Swift forums under the
     operations on [currency](/docs/Lexicon.md#currency-type) data types and 
     optimizes accordingly.
     Includes a thorough discussion of the `@_semantics` attribute.
+- Runtime specifics:
+  - [Backtracing.rst](/docs/Backtracing.rst):
+    Describes Swift's backtracing and crash catching support.
 
 ### SourceKit subsystems
 
@@ -215,7 +218,7 @@ documentation, please create a thread on the Swift forums under the
 
 ### Coding
 
-- [AccessControlInStdlib.rst](/docs/AccessControlInStdlib.rst):
+- [AccessControlInStdlib.md](/docs/AccessControlInStdlib.md):
   Describes the policy for access control modifiers and related naming
   conventions in the stdlib.
   <!-- NOTE: Outdated -->
@@ -275,7 +278,7 @@ You can see the status of different proposals at
 - [CallingConvention.rst](/docs/ABI/CallingConvention.rst):
   This whitepaper discusses the Swift calling convention (high-level semantics;
   ownership transfer; physical representation; function signature lowering).
-- [ErrorHandlingRationale.rst](/docs/ErrorHandlingRationale.rst):
+- [ErrorHandlingRationale.md](/docs/ErrorHandlingRationale.md):
   Surveys error-handling in a variety of languages, and describes the rationale
   behind the design of error handling in Swift.
 - [WeakReferences.md](/docs/WeakReferences.md):
@@ -290,10 +293,10 @@ documentation, primarily [The Swift Programming Language][] (TSPL).
 They are preserved mostly for historical interest.
 
 - [AccessControl.md](/docs/AccessControl.md)
-- [Arrays.rst](/docs/Arrays.rst)
+- [Arrays.md](/docs/Arrays.md)
   <!-- Has additional notes on bridging that may be of general interest? -->
-- [Generics.rst](/docs/Generics.rst)
-- [ErrorHandling.rst](/docs/ErrorHandling.rst)
+- [Generics.rst](/docs/archive/Generics.rst)
+- [ErrorHandling.md](/docs/ErrorHandling.md)
 - [StringDesign.rst](/docs/StringDesign.rst)
 - [TextFormatting.rst](/docs/TextFormatting.rst)
 
@@ -340,6 +343,9 @@ provide greater clarity to contributors wanting to add new documentation.
   Swift entities.
   TODO: Not clear if this is intended to be language documentation
   (for Swift developers), an explanation or a reference guide.
+- [Modules.md](/docs/Modules.md): was written for Swift pre-1.0, but is still
+  relevant and covers behavior that's underspecified in either TSPL or the
+  language reference.
 - [OptimizerCountersAnalysis.md](/docs/OptimizerCountersAnalysis.md):
   TODO: Consider breaking up into a how-to guide
   on dumping and analyzing the counters
@@ -353,7 +359,7 @@ provide greater clarity to contributors wanting to add new documentation.
 
 ### Archive
 
-- [FailableInitializers.rst](/docs/FailableInitializers.rst):
+- [FailableInitializers.md](/docs/FailableInitializers.md):
   Superseded by documentation in [The Swift Programming Language][].
 - [InitializerProblems.rst](/docs/InitializerProblems.rst):
   Describes some complexities around initialization in Swift.
@@ -362,7 +368,6 @@ provide greater clarity to contributors wanting to add new documentation.
   `@_hasMissingDesignatedInitializers`. Some of this is covered in
   [TSPL's initialization section][] but that doesn't include newly added
   attributes.
-- [Modules.rst](/docs/Modules.rst): for Swift pre-1.0.
 - [Swift3Compatibility.md](/docs/Swift3Compatibility.md):
   Discusses the Swift 3 -> Swift 4 migration.
 - [StoredAndComputedVariables.rst](/docs/StoredAndComputedVariables.rst): for Swift pre-1.0.

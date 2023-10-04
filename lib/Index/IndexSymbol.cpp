@@ -243,6 +243,7 @@ SymbolInfo index::getSymbolInfoForDecl(const Decl *D) {
     case DeclKind::TopLevelCode:
     case DeclKind::IfConfig:
     case DeclKind::PoundDiagnostic:
+    case DeclKind::Missing:
     case DeclKind::MissingMember:
     case DeclKind::Module:
     case DeclKind::OpaqueType:
@@ -274,6 +275,7 @@ SymbolSubKind index::getSubKindForAccessor(AccessorKind AK) {
     return SymbolSubKind::SwiftAccessorMutableAddressor;
   case AccessorKind::Read:      return SymbolSubKind::SwiftAccessorRead;
   case AccessorKind::Modify:    return SymbolSubKind::SwiftAccessorModify;
+  case AccessorKind::Init:      return SymbolSubKind::SwiftAccessorInit;
   }
 
   llvm_unreachable("Unhandled AccessorKind in switch.");

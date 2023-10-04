@@ -88,6 +88,7 @@ UniversalLinkageInfo::UniversalLinkageInfo(const llvm::Triple &triple,
                                            bool forcePublicDecls,
                                            bool isStaticLibrary)
     : IsELFObject(triple.isOSBinFormatELF()),
+      IsMSVCEnvironment(triple.isWindowsMSVCEnvironment()),
       UseDLLStorage(useDllStorage(triple)), Internalize(isStaticLibrary),
       HasMultipleIGMs(hasMultipleIGMs), ForcePublicDecls(forcePublicDecls) {}
 
@@ -742,16 +743,17 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
   case Kind::OpaqueTypeDescriptor: {
     auto *opaqueType = cast<OpaqueTypeDecl>(getDecl());
 
-    // The opaque result type descriptor with availability conditions
-    // has to be emitted into a client module when associated with
+    // With conditionally available substitutions, the opaque result type
+    // descriptor has to be emitted into a client module when associated with
     // `@_alwaysEmitIntoClient` declaration which means it's linkage
     // has to be "shared".
-    if (opaqueType->hasConditionallyAvailableSubstitutions()) {
-      if (auto *srcDecl = opaqueType->getNamingDecl()) {
-        if (srcDecl->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>())
-          return SILLinkage::Shared;
-      }
-    }
+    //
+    // If we don't have conditionally available substitutions, we won't emit
+    // the descriptor at all, but still make sure we report "shared" linkage
+    // so that TBD files don't include a bogus symbol.
+    auto *srcDecl = opaqueType->getNamingDecl();
+    if (srcDecl->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>())
+      return SILLinkage::Shared;
 
     return getSILLinkage(getDeclLinkage(opaqueType), forDefinition);
   }
@@ -797,15 +799,15 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
 
   case Kind::ProtocolWitnessTableLazyAccessFunction:
   case Kind::ProtocolWitnessTableLazyCacheVariable: {
-    auto ty = getType();
-    ValueDecl *nominal = nullptr;
-    if (auto *otat = ty->getAs<OpaqueTypeArchetypeType>()) {
-      nominal = otat->getDecl();
+    TypeDecl *typeDecl = nullptr;
+    if (auto *otat = getType()->getAs<OpaqueTypeArchetypeType>()) {
+      typeDecl = otat->getDecl();
     } else {
-      nominal = ty->getAnyNominal();
+      typeDecl = getProtocolConformance()->getDeclContext()
+          ->getSelfNominalTypeDecl();
     }
-    assert(nominal);
-    if (getDeclLinkage(nominal) == FormalLinkage::Private ||
+    assert(typeDecl);
+    if (getDeclLinkage(typeDecl) == FormalLinkage::Private ||
         getLinkageAsConformance() == SILLinkage::Private) {
       return SILLinkage::Private;
     } else {
@@ -875,9 +877,10 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
   case Kind::KnownAsyncFunctionPointer:
     return SILLinkage::PublicExternal;
   case Kind::PartialApplyForwarder:
+    return SILLinkage::Private;
   case Kind::DistributedAccessor:
   case Kind::AccessibleFunctionRecord:
-    return SILLinkage::Private;
+    return SILLinkage::Shared;
   case Kind::ExtendedExistentialTypeShape:
     return (isExtendedExistentialTypeShapeShared()
               ? SILLinkage::Shared : SILLinkage::Private);
@@ -1065,9 +1068,11 @@ llvm::Type *LinkEntity::getDefaultDeclarationType(IRGenModule &IGM) const {
   case Kind::MethodDescriptorDerivative:
     return IGM.MethodDescriptorStructTy;
   case Kind::DynamicallyReplaceableFunctionKey:
+  case Kind::DynamicallyReplaceableFunctionKeyAST:
   case Kind::OpaqueTypeDescriptorAccessorKey:
     return IGM.DynamicReplacementKeyTy;
   case Kind::DynamicallyReplaceableFunctionVariable:
+  case Kind::DynamicallyReplaceableFunctionVariableAST:
   case Kind::OpaqueTypeDescriptorAccessorVar:
     return IGM.DynamicReplacementLinkEntryTy;
   case Kind::ObjCMetadataUpdateFunction:
@@ -1158,7 +1163,9 @@ Alignment LinkEntity::getAlignment(IRGenModule &IGM) const {
   case Kind::SwiftMetaclassStub:
   case Kind::CanonicalSpecializedGenericSwiftMetaclassStub:
   case Kind::DynamicallyReplaceableFunctionVariable:
+  case Kind::DynamicallyReplaceableFunctionVariableAST:
   case Kind::DynamicallyReplaceableFunctionKey:
+  case Kind::DynamicallyReplaceableFunctionKeyAST:
   case Kind::OpaqueTypeDescriptorAccessorKey:
   case Kind::OpaqueTypeDescriptorAccessorVar:
   case Kind::ObjCResilientClassStub:
@@ -1438,8 +1445,7 @@ DeclContext *LinkEntity::getDeclContextForEmission() const {
 
   case Kind::DistributedAccessor:
   case Kind::AccessibleFunctionRecord: {
-    auto *funcDC = getSILFunction()->getDeclContext();
-    return funcDC->getParentModule();
+    return getSILFunction()->getParentModule();
   }
   }
   llvm_unreachable("invalid decl kind");

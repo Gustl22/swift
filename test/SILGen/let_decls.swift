@@ -41,7 +41,7 @@ func test2() {
 // The closure just returns its value, which it captured directly.
 
 // CHECK: sil private [ossa] @$s9let_decls5test2yyFSiyXEfU_ : $@convention(thin) (Int) -> Int
-// CHECK: bb0(%0 : $Int):
+// CHECK: bb0(%0 : @closureCapture $Int):
 // CHECK:  return %0 : $Int
 
 // Verify that we can close over let decls of tuple type.
@@ -68,10 +68,10 @@ func test3() {
   // CHECK-NEXT: [[STR:%[0-9]+]] = apply [[GETFN]]()
   let o = getAString()
 
-  // CHECK-NEXT: [[STR_BORROW:%.*]] = begin_borrow [lexical] [[STR]]
   // CHECK-NEXT: debug_value
   // CHECK-NOT: destroy_value
 
+  // CHECK-NEXT: [[STR_BORROW:%.*]] = begin_borrow [[STR]]
   // CHECK: [[USEFN:%[0-9]+]] = function_ref{{.*}}useAString
   // CHECK-NEXT: [[USE:%[0-9]+]] = apply [[USEFN]]([[STR_BORROW]])
   useAString(o)
@@ -367,8 +367,10 @@ func member_ref_abstraction_change(_ x: GenericFunctionStruct<Int, Int>) -> (Int
 }
 
 // CHECK-LABEL: sil hidden [ossa] @{{.*}}call_auto_closure
-// CHECK: bb0([[CLOSURE:%.*]] : $@noescape @callee_guaranteed () -> Bool):
-// CHECK:   apply [[CLOSURE]]() : $@noescape @callee_guaranteed () -> Bool
+// CHECK: bb0([[CLOSURE:%.*]] : @guaranteed $@noescape @callee_guaranteed () -> Bool):
+// CHECK:   [[CLOSUREC:%.*]] = copy_value [[CLOSURE]]
+// CHECK:   [[CLOSUREB:%.*]] = begin_borrow [[CLOSUREC]]
+// CHECK:   apply [[CLOSUREB]]() : $@noescape @callee_guaranteed () -> Bool
 // CHECK: } // end sil function '{{.*}}call_auto_closure{{.*}}'
 func call_auto_closure(x: @autoclosure () -> Bool) -> Bool {
   return x()  // Calls of autoclosures should be marked transparent.
@@ -507,7 +509,7 @@ struct LetDeclInStruct {
 func test_unassigned_let_constant() {
   let string : String
 }
-// CHECK: [[S:%[0-9]+]] = alloc_stack [lexical] $String, let, name "string"
+// CHECK: [[S:%[0-9]+]] = alloc_stack $String, let, name "string"
 // CHECK-NEXT:  [[MUI:%[0-9]+]] = mark_uninitialized [var] [[S]] : $*String
 // CHECK-NEXT:  destroy_addr [[MUI]] : $*String
 // CHECK-NEXT:  dealloc_stack [[S]] : $*String

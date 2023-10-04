@@ -57,7 +57,6 @@ _swift_complete()
       -keep-will-throw-call \
       -looprotate-single-block-loop \
       -looprotate-size-limit \
-      -lslocation-dump-use-new-projection \
       -max-local-apply-recur-depth \
       -max-partial-store-count \
       -optimize-opaque-address-lowering \
@@ -91,7 +90,6 @@ _swift_complete()
       -sil-loop-region-view-cfg-only-function \
       -sil-loop-region-view-cfg-only-functions \
       -sil-lower-agg-instrs-expand-all \
-      -sil-mandatory-combine-enable-canon-and-simple-dce \
       -sil-merge-stack-slots \
       -sil-opt-pass-count \
       -sil-opt-remark-ignore-always-infer \

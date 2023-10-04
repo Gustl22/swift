@@ -36,6 +36,7 @@
 #include "swift/IRGen/ValueWitness.h"
 #include "swift/SIL/RuntimeEffect.h"
 #include "swift/SIL/SILFunction.h"
+#include "swift/SIL/SILModule.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
@@ -96,7 +97,7 @@ namespace swift {
   class BraceStmt;
   class CanType;
   class GeneratedModule;
-  struct GenericRequirement;
+  class GenericRequirement;
   class LinkLibrary;
   class SILFunction;
   class IRGenOptions;
@@ -104,6 +105,7 @@ namespace swift {
   class ProtocolConformance;
   class ProtocolCompositionType;
   class RootProtocolConformance;
+  class SILCoverageMap;
   struct SILDeclRef;
   class SILDefaultWitnessTable;
   class SILDifferentiabilityWitness;
@@ -325,6 +327,10 @@ private:
   /// The queue of lazy witness tables to emit.
   llvm::SmallVector<SILWitnessTable *, 4> LazyWitnessTables;
 
+  llvm::SmallVector<CanType, 4> LazySpecializedClassMetadata;
+
+  llvm::SmallPtrSet<TypeBase *, 4> LazilyEmittedSpecializedClassMetadata;
+
   llvm::SmallVector<ClassDecl *, 4> ClassesForEagerInitialization;
 
   llvm::SmallVector<ClassDecl *, 4> ObjCActorsNeedingSuperclassSwizzle;
@@ -350,11 +356,7 @@ public:
   void addGenModule(SourceFile *SF, IRGenModule *IGM);
   
   /// Get an IRGenModule for a source file.
-  IRGenModule *getGenModule(SourceFile *SF) {
-    IRGenModule *IGM = GenModules[SF];
-    assert(IGM);
-    return IGM;
-  }
+  IRGenModule *getGenModule(SourceFile *SF);
 
   SourceFile *getSourceFile(IRGenModule *module) {
     for (auto pair : GenModules) {
@@ -458,6 +460,7 @@ public:
   }
 
   void noteLazyReemissionOfNominalTypeDescriptor(NominalTypeDecl *decl) {
+    assert(decl->isAvailableDuringLowering());
     LazilyReemittedTypeContextDescriptors.insert(decl);
   }
 
@@ -467,10 +470,13 @@ public:
   }
 
   void noteUseOfMetadataAccessor(NominalTypeDecl *decl) {
+    assert(decl->isAvailableDuringLowering());
     if (LazyMetadataAccessors.count(decl) == 0) {
       LazyMetadataAccessors.insert(decl);
     }
   }
+
+  void noteUseOfSpecializedClassMetadata(CanType classType);
 
   void noteUseOfTypeMetadata(NominalTypeDecl *type) {
     noteUseOfTypeGlobals(type, true, RequireMetadata);
@@ -578,6 +584,10 @@ public:
 
 /// Describes the role of a mangled type reference string.
 enum class MangledTypeRefRole {
+  /// The mangled type reference is used for field metadata, which is used
+  /// by both in-process and out-of-process reflection, so still requires
+  /// referenced types' metadata to be fully emitted.
+  FieldMetadata,
   /// The mangled type reference is used for normal metadata.
   Metadata,
   /// The mangled type reference is used for reflection metadata.
@@ -698,7 +708,9 @@ public:
   llvm::StructType *FullBoxMetadataStructTy; /// %swift.full_boxmetadata = type { ... }
   llvm::PointerType *FullBoxMetadataPtrTy;/// %swift.full_boxmetadata*
   llvm::StructType *FullTypeMetadataStructTy; /// %swift.full_type = type { ... }
+  llvm::StructType *FullExistentialTypeMetadataStructTy; /// %swift.full_existential_type = type { ... }
   llvm::PointerType *FullTypeMetadataPtrTy;/// %swift.full_type*
+  llvm::StructType *FullForeignTypeMetadataStructTy; /// %swift.full_foreign_type = type { ... }
   llvm::StructType *ProtocolDescriptorStructTy; /// %swift.protocol = type { ... }
   llvm::PointerType *ProtocolDescriptorPtrTy; /// %swift.protocol*
   llvm::StructType *ProtocolRequirementStructTy; /// %swift.protocol_requirement
@@ -956,9 +968,17 @@ private:
   // emitted.
   llvm::DenseMap<llvm::GlobalVariable*, llvm::CallInst*> AsyncCoroIDsForPadding;
 
+  /// The personality function used for foreign exception handling in this
+  /// module.
+  llvm::Function *foreignExceptionHandlingPersonalityFunc = nullptr;
+
+public:
+  /// The set of emitted foreign function thunks that trap on exception in the
+  /// underlying call that the thunk dispatches.
+  llvm::SmallPtrSet<llvm::Function *, 4>
+      emittedForeignFunctionThunksWithExceptionTraps;
 
 //--- Types -----------------------------------------------------------------
-public:
   const ProtocolInfo &getProtocolInfo(ProtocolDecl *D, ProtocolInfoKind kind);
 
   // Not strictly a type operation, but similar.
@@ -1005,7 +1025,8 @@ public:
   clang::CanQual<clang::Type> getClangType(SILParameterInfo param,
                                            CanSILFunctionType funcTy);
 
-  const TypeLayoutEntry &getTypeLayoutEntry(SILType T);
+  const TypeLayoutEntry
+  &getTypeLayoutEntry(SILType T, bool useStructLayouts);
 
   const clang::ASTContext &getClangASTContext() {
     assert(ClangASTContext &&
@@ -1233,8 +1254,12 @@ private:
   SmallVector<ProtocolDecl *, 4> SwiftProtocols;
   /// List of protocol conformances to generate descriptors for.
   std::vector<ConformanceDescription> ProtocolConformances;
-  /// List of types to generate runtime-resolvable metadata records for.
+  /// List of types to generate runtime-resolvable metadata records for that
+  /// are consumable for any Swift runtime.
   SmallVector<GenericTypeDecl *, 4> RuntimeResolvableTypes;
+  /// List of types to generate runtime-resolvable metadata records for that
+  /// are consumable for any Swift runtime aware of noncopyable types.
+  SmallVector<GenericTypeDecl *, 4> RuntimeResolvableTypes2;
   /// List of ExtensionDecls corresponding to the generated
   /// categories.
   SmallVector<ExtensionDecl*, 4> ObjCCategoryDecls;
@@ -1400,7 +1425,7 @@ private:
   llvm::Constant *ObjCEmptyCachePtr = nullptr;
   llvm::Constant *ObjCEmptyVTablePtr = nullptr;
   llvm::Constant *ObjCISAMaskPtr = nullptr;
-  Optional<llvm::InlineAsm*> ObjCRetainAutoreleasedReturnValueMarker;
+  llvm::Optional<llvm::InlineAsm *> ObjCRetainAutoreleasedReturnValueMarker;
   llvm::DenseMap<Identifier, ClassDecl*> SwiftRootClasses;
   llvm::AttributeList AllocAttrs;
 
@@ -1414,13 +1439,13 @@ private:                                                                       \
   llvm::Constant *Id##Fn = nullptr;
 #include "swift/Runtime/RuntimeFunctions.def"
 
-  Optional<FunctionPointer> FixedClassInitializationFn;
+  llvm::Optional<FunctionPointer> FixedClassInitializationFn;
 
   llvm::Constant *FixLifetimeFn = nullptr;
 
-  mutable Optional<SpareBitVector> HeapPointerSpareBits;
-  
-//--- Generic ---------------------------------------------------------------
+  mutable llvm::Optional<SpareBitVector> HeapPointerSpareBits;
+
+  //--- Generic ---------------------------------------------------------------
 public:
   llvm::Constant *getFixLifetimeFn();
 
@@ -1481,22 +1506,23 @@ public:
   void maybeEmitOpaqueTypeDecl(OpaqueTypeDecl *D);
 
   void emitSILGlobalVariable(SILGlobalVariable *gv);
-  void emitCoverageMapping();
+  void emitCoverageMaps(ArrayRef<const SILCoverageMap *> Mappings);
   void emitSILFunction(SILFunction *f);
   void emitSILWitnessTable(SILWitnessTable *wt);
   void emitSILProperty(SILProperty *prop);
   void emitSILDifferentiabilityWitness(SILDifferentiabilityWitness *dw);
-  void emitSILStaticInitializers();
   llvm::Constant *emitFixedTypeLayout(CanType t, const FixedTypeInfo &ti);
   void emitProtocolConformance(const ConformanceDescription &record);
   void emitNestedTypeDecls(DeclRange members);
   void emitClangDecl(const clang::Decl *decl);
+
   void finalizeClangCodeGen();
   void finishEmitAfterTopLevel();
 
   Signature getSignature(CanSILFunctionType fnType);
   Signature getSignature(CanSILFunctionType fnType,
-                         FunctionPointerKind kind);
+                         FunctionPointerKind kind,
+                         bool forStaticCall = false);
   llvm::FunctionType *getFunctionType(CanSILFunctionType type,
                                       llvm::AttributeList &attrs,
                                       ForeignFunctionInfo *foreignInfo=nullptr);
@@ -1547,10 +1573,9 @@ public:
   llvm::Constant *
   getAddrOfEffectiveValueWitnessTable(CanType concreteType,
                                       ConstantInit init = ConstantInit());
-  Optional<llvm::Function*> getAddrOfIVarInitDestroy(ClassDecl *cd,
-                                                     bool isDestroyer,
-                                                     bool isForeign,
-                                                     ForDefinition_t forDefinition);
+  llvm::Optional<llvm::Function *>
+  getAddrOfIVarInitDestroy(ClassDecl *cd, bool isDestroyer, bool isForeign,
+                           ForDefinition_t forDefinition);
 
   void setVCallVisibility(llvm::GlobalVariable *var,
                           llvm::GlobalObject::VCallVisibility visibility,
@@ -1571,6 +1596,9 @@ public:
                                       llvm::Constant *dependsOn);
   void appendLLVMUsedConditionalEntry(llvm::GlobalVariable *var,
                                       const ProtocolConformance *conformance);
+
+  void setColocateMetadataSection(llvm::Function *f);
+  void setColocateTypeDescriptorSection(llvm::GlobalVariable *v);
 
   llvm::Constant *
   getAddrOfTypeMetadata(CanType concreteType,
@@ -1691,6 +1719,9 @@ public:
   Address getAddrOfSILGlobalVariable(SILGlobalVariable *var,
                                      const TypeInfo &ti,
                                      ForDefinition_t forDefinition);
+  llvm::Constant *getGlobalInitValue(SILGlobalVariable *var,
+                                     llvm::Type *storageType,
+                                     Alignment alignment);
   llvm::Function *getAddrOfWitnessTableLazyAccessFunction(
                                                const NormalProtocolConformance *C,
                                                CanType conformingType,
@@ -1725,6 +1756,8 @@ public:
                                      ForDefinition_t forDefinition);
 
   void emitDistributedTargetAccessor(SILFunction *method);
+
+  llvm::Constant *getAddrOfAccessibleFunctionRecord(SILFunction *accessibleFn);
 
   /// Retrieve the generic signature for the current generic context, or null if no
   /// generic environment is active.
@@ -1792,6 +1825,13 @@ public:
   /// the SIL function is correctly lowered even if the lowering passes do not
   /// run on the SIL module that owns this function.
   void lowerSILFunction(SILFunction *f);
+
+  llvm::Function *getForeignExceptionHandlingPersonalityFunc();
+
+  bool isForeignExceptionHandlingEnabled() const;
+
+  /// Returns true if the given Clang function does not throw exceptions.
+  bool isCxxNoThrow(clang::FunctionDecl *fd, bool defaultNoThrow = false);
 
 private:
   llvm::Constant *

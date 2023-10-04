@@ -67,6 +67,9 @@ llvm::cl::opt<bool> VerifyFunctionsAfterSpecialization(
         "Verify functions after they are specialized "
         "'PrettyStackTraceFunction'-ing the original function if we fail."));
 
+llvm::cl::opt<bool> DumpFunctionsAfterSpecialization(
+    "sil-generic-dump-functions-after-specialization", llvm::cl::init(false));
+
 static bool OptimizeGenericSubstitutions = false;
 
 /// Max depth of a type which can be processed by the generic
@@ -250,60 +253,6 @@ public:
       return false;
     }
     return false;
-  }
-};
-
-class TypeReplacements {
-private:
-  Optional<SILType> resultType;
-  llvm::MapVector<unsigned, CanType> indirectResultTypes;
-  llvm::MapVector<unsigned, CanType> paramTypeReplacements;
-  llvm::MapVector<unsigned, CanType> yieldTypeReplacements;
-
-public:
-  Optional<SILType> getResultType() const { return resultType; }
-
-  void setResultType(SILType type) { resultType = type; }
-
-  bool hasResultType() const { return resultType.hasValue(); }
-
-  const llvm::MapVector<unsigned, CanType> &getIndirectResultTypes() const {
-    return indirectResultTypes;
-  }
-
-  void addIndirectResultType(unsigned index, CanType type) {
-    indirectResultTypes.insert(std::make_pair(index, type));
-  }
-
-  bool hasIndirectResultTypes() const { return !indirectResultTypes.empty(); }
-
-  const llvm::MapVector<unsigned, CanType> &getParamTypeReplacements() const {
-    return paramTypeReplacements;
-  }
-
-  void addParameterTypeReplacement(unsigned index, CanType type) {
-    paramTypeReplacements.insert(std::make_pair(index, type));
-  }
-
-  bool hasParamTypeReplacements() const {
-    return !paramTypeReplacements.empty();
-  }
-
-  const llvm::MapVector<unsigned, CanType> &getYieldTypeReplacements() const {
-    return yieldTypeReplacements;
-  }
-
-  void addYieldTypeReplacement(unsigned index, CanType type) {
-    yieldTypeReplacements.insert(std::make_pair(index, type));
-  }
-
-  bool hasYieldTypeReplacements() const {
-    return !yieldTypeReplacements.empty();
-  }
-
-  bool hasTypeReplacements() const {
-    return hasResultType() || hasParamTypeReplacements() ||
-           hasIndirectResultTypes() || hasYieldTypeReplacements();
   }
 };
 
@@ -893,9 +842,11 @@ void ReabstractionInfo::createSubstitutedAndSpecializedTypes() {
         hasConvertedResilientParams = true;
       }
       break;
-    case ParameterConvention::Indirect_In_Constant:
     case ParameterConvention::Indirect_Inout:
     case ParameterConvention::Indirect_InoutAliasable:
+    case ParameterConvention::Pack_Inout:
+    case ParameterConvention::Pack_Owned:
+    case ParameterConvention::Pack_Guaranteed:
       break;
       
     case ParameterConvention::Direct_Owned:
@@ -992,6 +943,35 @@ ReabstractionInfo::createSubstitutedType(SILFunction *OrigF,
   return NewFnTy;
 }
 
+CanSILFunctionType ReabstractionInfo::createThunkType(PartialApplyInst *forPAI) const {
+  if (!hasDroppedMetatypeArgs())
+    return SubstitutedType;
+
+  llvm::SmallVector<SILParameterInfo, 8> newParams;
+  auto params = SubstitutedType->getParameters();
+  unsigned firstAppliedParamIdx = params.size() - forPAI->getArguments().size();
+
+  for (unsigned paramIdx = 0; paramIdx < params.size(); ++paramIdx) {
+    if (paramIdx >= firstAppliedParamIdx && isDroppedMetatypeArg(param2ArgIndex(paramIdx)))
+      continue;
+    newParams.push_back(params[paramIdx]);
+  }
+
+  auto newFnTy = SILFunctionType::get(
+      SubstitutedType->getInvocationGenericSignature(),
+      SubstitutedType->getExtInfo(), SubstitutedType->getCoroutineKind(),
+      SubstitutedType->getCalleeConvention(), newParams,
+      SubstitutedType->getYields(), SubstitutedType->getResults(),
+      SubstitutedType->getOptionalErrorResult(),
+      SubstitutedType->getPatternSubstitutions(), SubstitutionMap(),
+      SubstitutedType->getASTContext(),
+      SubstitutedType->getWitnessMethodConformanceOrInvalid());
+
+  // This is an interface type. It should not have any archetypes.
+  assert(!newFnTy->hasArchetype());
+  return newFnTy;
+}
+
 /// Convert the substituted function type into a specialized function type based
 /// on the ReabstractionInfo.
 CanSILFunctionType ReabstractionInfo::
@@ -1020,12 +1000,16 @@ createSpecializedType(CanSILFunctionType SubstFTy, SILModule &M) const {
     SpecializedResults.push_back(RI);
   }
   unsigned idx = 0;
+  bool removedSelfParam = false;
   for (SILParameterInfo PI : SubstFTy->getParameters()) {
     unsigned paramIdx = idx++;
     PI = PI.getUnsubstituted(M, SubstFTy, context);
 
-    if (isDroppedMetatypeArg(param2ArgIndex(paramIdx)))
+    if (isDroppedMetatypeArg(param2ArgIndex(paramIdx))) {
+      if (SubstFTy->hasSelfParam() && paramIdx == SubstFTy->getParameters().size() - 1)
+        removedSelfParam = true;
       continue;
+    }
 
     bool isTrivial = TrivialArgs.test(param2ArgIndex(paramIdx));
     if (!isParamConverted(paramIdx)) {
@@ -1056,12 +1040,21 @@ createSpecializedType(CanSILFunctionType SubstFTy, SILModule &M) const {
   auto Signature = SubstFTy->isPolymorphic()
                      ? SubstFTy->getInvocationGenericSignature()
                      : CanGenericSignature();
+
+  SILFunctionType::ExtInfo extInfo = SubstFTy->getExtInfo();
+  ProtocolConformanceRef conf = SubstFTy->getWitnessMethodConformanceOrInvalid();
+  if (extInfo.hasSelfParam() && removedSelfParam) {
+    extInfo = extInfo.withRepresentation(SILFunctionTypeRepresentation::Thin);
+    conf = ProtocolConformanceRef();
+    assert(!extInfo.hasSelfParam());
+  }
+
   return SILFunctionType::get(
-      Signature, SubstFTy->getExtInfo(),
+      Signature, extInfo,
       SubstFTy->getCoroutineKind(), SubstFTy->getCalleeConvention(),
       SpecializedParams, SpecializedYields, SpecializedResults,
       SubstFTy->getOptionalErrorResult(), SubstitutionMap(), SubstitutionMap(),
-      M.getASTContext(), SubstFTy->getWitnessMethodConformanceOrInvalid());
+      M.getASTContext(), conf);
 }
 
 /// Create a new generic signature from an existing one by adding
@@ -2113,6 +2106,13 @@ GenericFuncSpecializer::tryCreateSpecialization(bool forcePrespecialization) {
     SpecializedF->verify();
   }
 
+  if (DumpFunctionsAfterSpecialization) {
+    llvm::dbgs() << llvm::Twine("Generic function: ") + GenericFunc->getName() +
+                        ". Specialized Function: " + SpecializedF->getName();
+    GenericFunc->dump();
+    SpecializedF->dump();
+  }
+
   return SpecializedF;
 }
 
@@ -2266,9 +2266,17 @@ prepareCallArguments(ApplySite AI, SILBuilder &Builder,
 
     // An argument is converted from indirect to direct. Instead of the
     // address we pass the loaded value.
-    auto argConv = substConv.getSILArgumentConvention(ArgIdx);
+    SILArgumentConvention argConv(SILArgumentConvention::Direct_Unowned);
+    if (auto pai = dyn_cast<PartialApplyInst>(AI)) {
+      // On-stack partial applications borrow their captures, whereas heap
+      // partial applications take ownership.
+      argConv = pai->isOnStack() ? SILArgumentConvention::Direct_Guaranteed
+                                 : SILArgumentConvention::Direct_Owned;
+    } else {
+      argConv = substConv.getSILArgumentConvention(ArgIdx);
+    }
     SILValue Val;
-    if (!argConv.isGuaranteedConvention() || isa<PartialApplyInst>(AI)) {
+    if (!argConv.isGuaranteedConvention()) {
       Val = Builder.emitLoadValueOperation(Loc, InputValue,
                                            LoadOwnershipQualifier::Take);
     } else {
@@ -2300,10 +2308,10 @@ cleanupCallArguments(SILBuilder &builder, SILLocation loc,
 
 /// Create a new apply based on an old one, but with a different
 /// function being applied.
-static ApplySite
-replaceWithSpecializedCallee(ApplySite applySite, SILValue callee,
+ApplySite
+swift::replaceWithSpecializedCallee(ApplySite applySite, SILValue callee,
                              const ReabstractionInfo &reInfo,
-                             const TypeReplacements &typeReplacements = {}) {
+                             const TypeReplacements &typeReplacements) {
   SILBuilderWithScope builder(applySite.getInstruction());
   SILLocation loc = applySite.getLoc();
   SmallVector<SILValue, 4> arguments;
@@ -2430,15 +2438,19 @@ replaceWithSpecializedCallee(ApplySite applySite, SILValue callee,
   }
   case ApplySiteKind::PartialApplyInst: {
     auto *pai = cast<PartialApplyInst>(applySite);
+    // Let go of borrows introduced for stack closures.
+    if (pai->isOnStack() && pai->getFunction()->hasOwnership()) {
+      pai->visitOnStackLifetimeEnds([&](Operand *op) -> bool {
+        SILBuilderWithScope argBuilder(op->getUser()->getNextInstruction());
+        cleanupCallArguments(argBuilder, loc, arguments, argsNeedingEndBorrow);
+        return true;
+      });
+    }
     auto *newPAI = builder.createPartialApply(
         loc, callee, subs, arguments,
         pai->getType().getAs<SILFunctionType>()->getCalleeConvention(),
         pai->isOnStack());
-    // When we have a partial apply, we should always perform a load [take].
     pai->replaceAllUsesWith(newPAI);
-    assert(llvm::none_of(arguments,
-                         [](SILValue v) { return isa<LoadBorrowInst>(v); }) &&
-           "Partial apply consumes all of its parameters?!");
     return newPAI;
   }
   }
@@ -2496,7 +2508,8 @@ public:
     if (!ReInfo.isPartialSpecialization()) {
       Mangle::GenericSpecializationMangler Mangler(OrigF, ReInfo.isSerialized());
       ThunkName = Mangler.mangleNotReabstracted(
-          ReInfo.getCalleeParamSubstitutionMap());
+          ReInfo.getCalleeParamSubstitutionMap(),
+          ReInfo.hasDroppedMetatypeArgs());
     } else {
       Mangle::PartialSpecializationMangler Mangler(
           OrigF, ReInfo.getSpecializedType(), ReInfo.isSerialized(),
@@ -2511,16 +2524,18 @@ public:
 protected:
   FullApplySite createReabstractionThunkApply(SILBuilder &Builder);
   SILArgument *convertReabstractionThunkArguments(
-      SILBuilder &Builder, SmallVectorImpl<unsigned> &ArgsNeedingEndBorrows);
+      SILBuilder &Builder, SmallVectorImpl<unsigned> &ArgsNeedingEndBorrows,
+      CanSILFunctionType thunkType);
 };
 
 } // anonymous namespace
 
 SILFunction *ReabstractionThunkGenerator::createThunk() {
+  CanSILFunctionType thunkType = ReInfo.createThunkType(OrigPAI);
   SILFunction *Thunk = FunctionBuilder.getOrCreateSharedFunction(
-      Loc, ThunkName, ReInfo.getSubstitutedType(), IsBare, IsTransparent,
+      Loc, ThunkName, thunkType, IsBare, IsTransparent,
       ReInfo.isSerialized(), ProfileCounter(), IsThunk, IsNotDynamic,
-      IsNotDistributed);
+      IsNotDistributed, IsNotRuntimeAccessible);
   // Re-use an existing thunk.
   if (!Thunk->empty())
     return Thunk;
@@ -2546,10 +2561,7 @@ SILFunction *ReabstractionThunkGenerator::createThunk() {
     for (auto SpecArg : SpecializedFunc->getArguments()) {
       auto *NewArg = EntryBB->createFunctionArgument(SpecArg->getType(),
                                                      SpecArg->getDecl());
-      NewArg->setNoImplicitCopy(
-          cast<SILFunctionArgument>(SpecArg)->isNoImplicitCopy());
-      NewArg->setLifetimeAnnotation(
-          cast<SILFunctionArgument>(SpecArg)->getLifetimeAnnotation());
+      NewArg->copyFlags(cast<SILFunctionArgument>(SpecArg));
       Arguments.push_back(NewArg);
     }
     FullApplySite ApplySite = createReabstractionThunkApply(Builder);
@@ -2562,7 +2574,7 @@ SILFunction *ReabstractionThunkGenerator::createThunk() {
   // Handle lowered addresses.
   SmallVector<unsigned, 4> ArgsThatNeedEndBorrow;
   SILArgument *ReturnValueAddr =
-      convertReabstractionThunkArguments(Builder, ArgsThatNeedEndBorrow);
+      convertReabstractionThunkArguments(Builder, ArgsThatNeedEndBorrow, thunkType);
 
   FullApplySite ApplySite = createReabstractionThunkApply(Builder);
 
@@ -2618,6 +2630,18 @@ FullApplySite ReabstractionThunkGenerator::createReabstractionThunkApply(
   return FullApplySite(TAI);
 }
 
+static SILFunctionArgument *addFunctionArgument(SILFunction *function,
+                                                SILType argType,
+                                                SILArgument *copyAttributesFrom) {
+  SILBasicBlock *entryBB = function->getEntryBlock();
+  auto *src = cast<SILFunctionArgument>(copyAttributesFrom);
+  auto *arg = entryBB->createFunctionArgument(argType, src->getDecl());
+  arg->setNoImplicitCopy(src->isNoImplicitCopy());
+  arg->setLifetimeAnnotation(src->getLifetimeAnnotation());
+  arg->setClosureCapture(src->isClosureCapture());
+  return arg;
+}
+
 /// Create SIL arguments for a reabstraction thunk with lowered addresses. This
 /// may involve replacing indirect arguments with loads and stores. Return the
 /// SILArgument for the address of an indirect result, or nullptr.
@@ -2625,41 +2649,31 @@ FullApplySite ReabstractionThunkGenerator::createReabstractionThunkApply(
 /// FIXME: Remove this if we don't need to create reabstraction thunks after
 /// address lowering.
 SILArgument *ReabstractionThunkGenerator::convertReabstractionThunkArguments(
-    SILBuilder &Builder, SmallVectorImpl<unsigned> &ArgsThatNeedEndBorrow) {
+    SILBuilder &Builder, SmallVectorImpl<unsigned> &ArgsThatNeedEndBorrow,
+    CanSILFunctionType thunkType
+) {
   SILFunction *Thunk = &Builder.getFunction();
   CanSILFunctionType SpecType = SpecializedFunc->getLoweredFunctionType();
-  CanSILFunctionType SubstType = ReInfo.getSubstitutedType();
   auto specConv = SpecializedFunc->getConventions();
   (void)specConv;
-  SILFunctionConventions substConv(SubstType, M);
+  SILFunctionConventions substConv(thunkType, M);
 
   assert(specConv.useLoweredAddresses());
 
   // ReInfo.NumIndirectResults corresponds to SubstTy's formal indirect
   // results. SpecTy may have fewer formal indirect results.
-  assert(SubstType->getNumIndirectFormalResults()
+  assert(thunkType->getNumIndirectFormalResults()
          >= SpecType->getNumIndirectFormalResults());
 
-  SILBasicBlock *EntryBB = Thunk->getEntryBlock();
   SILArgument *ReturnValueAddr = nullptr;
   auto SpecArgIter = SpecializedFunc->getArguments().begin();
-  auto cloneSpecializedArgument = [&]() {
-    // No change to the argument.
-    SILArgument *SpecArg = *SpecArgIter++;
-    auto *NewArg =
-        EntryBB->createFunctionArgument(SpecArg->getType(), SpecArg->getDecl());
-    NewArg->setNoImplicitCopy(
-        cast<SILFunctionArgument>(SpecArg)->isNoImplicitCopy());
-    NewArg->setLifetimeAnnotation(
-        cast<SILFunctionArgument>(SpecArg)->getLifetimeAnnotation());
-    Arguments.push_back(NewArg);
-  };
+
   // ReInfo.NumIndirectResults corresponds to SubstTy's formal indirect
   // results. SpecTy may have fewer formal indirect results.
-  assert(SubstType->getNumIndirectFormalResults()
+  assert(thunkType->getNumIndirectFormalResults()
          >= SpecType->getNumIndirectFormalResults());
   unsigned resultIdx = 0;
-  for (auto substRI : SubstType->getIndirectFormalResults()) {
+  for (auto substRI : thunkType->getIndirectFormalResults()) {
     if (ReInfo.isFormalResultConverted(resultIdx++)) {
       // Convert an originally indirect to direct specialized result.
       // Store the result later.
@@ -2669,34 +2683,35 @@ SILArgument *ReabstractionThunkGenerator::convertReabstractionThunkArguments(
           substConv.getSILType(substRI, Builder.getTypeExpansionContext()));
       assert(ResultTy.isAddress());
       assert(!ReturnValueAddr);
-      ReturnValueAddr = EntryBB->createFunctionArgument(ResultTy);
+      ReturnValueAddr = Thunk->getEntryBlock()->createFunctionArgument(ResultTy);
       continue;
     }
     // If the specialized result is already indirect, simply clone the indirect
     // result argument.
-    assert((*SpecArgIter)->getType().isAddress());
-    cloneSpecializedArgument();
+    SILArgument *specArg = *SpecArgIter++;
+    assert(specArg->getType().isAddress());
+    Arguments.push_back(addFunctionArgument(Thunk, specArg->getType(), specArg));
   }
   assert(SpecArgIter
          == SpecializedFunc->getArgumentsWithoutIndirectResults().begin());
-  unsigned numParams = SpecType->getNumParameters();
-  assert(numParams == SubstType->getNumParameters());
-  for (unsigned paramIdx = 0; paramIdx < numParams; ++paramIdx) {
-    if (ReInfo.isParamConverted(paramIdx)) {
+  unsigned numParams = OrigF->getLoweredFunctionType()->getNumParameters();
+  for (unsigned origParamIdx = 0, specArgIdx = 0; origParamIdx < numParams; ++origParamIdx) {
+    unsigned origArgIdx = ReInfo.param2ArgIndex(origParamIdx);
+    if (ReInfo.isDroppedMetatypeArg(origArgIdx)) {
+      assert(origArgIdx >= ApplySite(OrigPAI).getCalleeArgIndexOfFirstAppliedArg() &&
+             "cannot drop metatype argument of not applied argument");
+      continue;
+    }
+    SILArgument *specArg = *SpecArgIter++;
+    if (ReInfo.isParamConverted(origParamIdx)) {
       // Convert an originally indirect to direct specialized parameter.
-      assert(!specConv.isSILIndirect(SpecType->getParameters()[paramIdx]));
+      assert(!specConv.isSILIndirect(SpecType->getParameters()[specArgIdx]));
       // Instead of passing the address, pass the loaded value.
       SILType ParamTy = SpecializedFunc->mapTypeIntoContext(
-          substConv.getSILType(SubstType->getParameters()[paramIdx],
+          substConv.getSILType(thunkType->getParameters()[specArgIdx],
                                Builder.getTypeExpansionContext()));
       assert(ParamTy.isAddress());
-      SILArgument *SpecArg = *SpecArgIter++;
-      SILFunctionArgument *NewArg =
-          EntryBB->createFunctionArgument(ParamTy, SpecArg->getDecl());
-      NewArg->setNoImplicitCopy(
-          cast<SILFunctionArgument>(SpecArg)->isNoImplicitCopy());
-      NewArg->setLifetimeAnnotation(
-          cast<SILFunctionArgument>(SpecArg)->getLifetimeAnnotation());
+      SILFunctionArgument *NewArg = addFunctionArgument(Thunk, ParamTy, specArg);
       if (!NewArg->getArgumentConvention().isGuaranteedConvention()) {
         SILValue argVal = Builder.emitLoadValueOperation(
             Loc, NewArg, LoadOwnershipQualifier::Take);
@@ -2707,10 +2722,11 @@ SILArgument *ReabstractionThunkGenerator::convertReabstractionThunkArguments(
           ArgsThatNeedEndBorrow.push_back(Arguments.size());
         Arguments.push_back(argVal);
       }
-      continue;
+    } else {
+      // Simply clone unconverted direct or indirect parameters.
+      Arguments.push_back(addFunctionArgument(Thunk, specArg->getType(), specArg));
     }
-    // Simply clone unconverted direct or indirect parameters.
-    cloneSpecializedArgument();
+    ++specArgIdx;
   }
   assert(SpecArgIter == SpecializedFunc->getArguments().end());
   return ReturnValueAddr;
@@ -2737,7 +2753,7 @@ static bool createPrespecialized(StringRef UnspecializedName,
   ReabstractionInfo ReInfo(M.getSwiftModule(), M.isWholeModule(), ApplySite(),
                            UnspecFunc, Apply.getSubstitutionMap(),
                            IsNotSerialized,
-                           /*ConvertIndirectToDirect=*/true);
+                           /*ConvertIndirectToDirect= */true, /*dropMetatypeArgs=*/ false);
 
   if (!ReInfo.canBeSpecialized())
     return false;
@@ -2881,8 +2897,9 @@ bool usePrespecialized(
 
         if (!erased || !layout || !layout->isClass()) {
           newSubs.push_back(entry.value());
-        } else if (!entry.value()->isAnyClassReferenceType()) {
-          // non-reference type can't be applied
+        } else if (!entry.value()->isAnyClassReferenceType() ||
+                   entry.value()->isAnyExistentialType()) {
+          // non-reference or existential type can't be applied
           break;
         } else if (!specializedSig->getRequiredProtocols(genericParam)
                         .empty()) {
@@ -2908,7 +2925,7 @@ bool usePrespecialized(
           funcBuilder.getModule().getSwiftModule(),
           funcBuilder.getModule().isWholeModule(), apply, refF, newSubstMap,
           apply.getFunction()->isSerialized() ? IsSerialized : IsNotSerialized,
-          /*ConvertIndirectToDirect=*/true, /*dropMetatypeArgs*/true, nullptr);
+          /*ConvertIndirectToDirect=*/ true, /*dropMetatypeArgs=*/ false, nullptr);
 
       if (layoutReInfo.getSpecializedType() == reInfo.getSpecializedType()) {
         layoutMatches.push_back(
@@ -2968,6 +2985,57 @@ bool usePrespecialized(
   return false;
 }
 
+static bool isUsedAsDynamicSelf(SILArgument *arg) {
+  for (Operand *use : arg->getUses()) {
+    if (use->isTypeDependent())
+      return true;
+  }
+  return false;
+}
+
+static bool canDropMetatypeArgs(ApplySite apply, SILFunction *callee) {
+  if (!callee->isDefinition())
+    return false;
+
+  auto calleeArgs = callee->getArguments();
+  unsigned firstAppliedArgIdx = apply.getCalleeArgIndexOfFirstAppliedArg();
+  for (unsigned calleeArgIdx = 0; calleeArgIdx < calleeArgs.size(); ++calleeArgIdx) {
+    SILArgument *calleeArg = calleeArgs[calleeArgIdx];
+    auto mt = calleeArg->getType().getAs<MetatypeType>();
+    if (!mt)
+      continue;
+
+    if (isUsedAsDynamicSelf(calleeArg))
+      return false;
+
+    if (calleeArg->getType().getASTType()->hasDynamicSelfType())
+      return false;
+
+    // We don't drop metatype arguments of not applied arguments (in case of `partial_apply`).
+    if (firstAppliedArgIdx > calleeArgIdx)
+      return false;
+
+    if (mt->hasRepresentation() && mt->getRepresentation() == MetatypeRepresentation::Thin)
+      continue;
+
+    // If the passed thick metatype value is not a `metatype` instruction
+    // we don't know the real metatype at runtime. It's not necessarily the
+    // same as the declared metatype. It could e.g. be an upcast of a class
+    // metatype.
+    SILValue callerArg = apply.getArguments()[calleeArgIdx - firstAppliedArgIdx];
+    if (isa<MetatypeInst>(callerArg))
+      continue;
+
+    // But: if the metatype is not used in the callee we don't have to care
+    // what metatype value is passed. We can just remove it.
+    if (callee->isDefinition() && onlyHaveDebugUses(calleeArg))
+      continue;
+
+    return false;
+  }
+  return true;
+}
+
 void swift::trySpecializeApplyOfGeneric(
     SILOptFunctionBuilder &FuncBuilder,
     ApplySite Apply, DeadInstructionSet &DeadApplies,
@@ -3016,7 +3084,7 @@ void swift::trySpecializeApplyOfGeneric(
                            FuncBuilder.getModule().isWholeModule(), Apply, RefF,
                            Apply.getSubstitutionMap(), Serialized,
                            /*ConvertIndirectToDirect=*/ true,
-                           /*dropMetatypeArgs=*/ isMandatory,
+                           /*dropMetatypeArgs=*/ canDropMetatypeArgs(Apply, RefF),
                            &ORE);
   if (!ReInfo.canBeSpecialized())
     return;
@@ -3103,6 +3171,12 @@ void swift::trySpecializeApplyOfGeneric(
                             << SpecializedF->getLoweredFunctionType() << "\n");
     NewFunctions.push_back(SpecializedF.getFunction());
   }
+  if (replacePartialApplyWithoutReabstraction &&
+      SpecializedF.getFunction()->isExternalDeclaration()) {
+    // Cannot create a tunk without having the body of the function.
+    return;
+  }
+
   if (F->isSerialized() && !SpecializedF->hasValidLinkageForFragileInline()) {
     // If the specialized function already exists as a "IsNotSerialized" function,
     // but now it's called from a "IsSerialized" function, we need to mark it as
@@ -3167,16 +3241,19 @@ void swift::trySpecializeApplyOfGeneric(
     auto *FRI = Builder.createFunctionRef(PAI->getLoc(), Thunk);
     SmallVector<SILValue, 4> Arguments;
     for (auto &Op : PAI->getArgumentOperands()) {
+      unsigned calleeArgIdx = ApplySite(PAI).getCalleeArgIndex(Op);
+      if (ReInfo.isDroppedMetatypeArg(calleeArgIdx))
+        continue;
       Arguments.push_back(Op.get());
     }
     auto Subs = ReInfo.getCallerParamSubstitutionMap();
     auto FnTy = Thunk->getLoweredFunctionType();
     Subs = SubstitutionMap::get(FnTy->getSubstGenericSignature(), Subs);
-    auto *NewPAI = Builder.createPartialApply(
-        PAI->getLoc(), FRI, Subs, Arguments,
-        PAI->getType().getAs<SILFunctionType>()->getCalleeConvention(),
-        PAI->isOnStack());
-    PAI->replaceAllUsesWith(NewPAI);
+    SingleValueInstruction *newPAI = Builder.createPartialApply(
+      PAI->getLoc(), FRI, Subs, Arguments,
+      PAI->getType().getAs<SILFunctionType>()->getCalleeConvention(),
+      PAI->isOnStack());
+    PAI->replaceAllUsesWith(newPAI);
     DeadApplies.insert(PAI);
     return;
   }

@@ -11,9 +11,19 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Sema/CompletionContextFinder.h"
+#include "swift/Parse/Lexer.h"
+#include "swift/Sema/SyntacticElementTarget.h"
 
 using namespace swift;
+using namespace constraints;
 using Fallback = CompletionContextFinder::Fallback;
+
+CompletionContextFinder::CompletionContextFinder(
+    SyntacticElementTarget target, DeclContext *DC)
+    : InitialExpr(target.getAsExpr()), InitialDC(DC) {
+  assert(DC);
+  target.walk(*this);
+}
 
 ASTWalker::PreWalkResult<Expr *>
 CompletionContextFinder::walkToExprPre(Expr *E) {
@@ -28,7 +38,8 @@ CompletionContextFinder::walkToExprPre(Expr *E) {
     Contexts.push_back({ContextKind::StringInterpolation, E});
   }
 
-  if (isa<ApplyExpr>(E) || isa<SequenceExpr>(E)) {
+  if (isa<ApplyExpr>(E) || isa<SequenceExpr>(E) ||
+      isa<SingleValueStmtExpr>(E)) {
     Contexts.push_back({ContextKind::FallbackExpression, E});
   }
 
@@ -63,7 +74,8 @@ CompletionContextFinder::walkToExprPre(Expr *E) {
 ASTWalker::PostWalkResult<Expr *>
 CompletionContextFinder::walkToExprPost(Expr *E) {
   if (isa<ClosureExpr>(E) || isa<InterpolatedStringLiteralExpr>(E) ||
-      isa<ApplyExpr>(E) || isa<SequenceExpr>(E) || isa<ErrorExpr>(E)) {
+      isa<ApplyExpr>(E) || isa<SequenceExpr>(E) || isa<ErrorExpr>(E) ||
+      isa<SingleValueStmtExpr>(E)) {
     assert(Contexts.back().E == E);
     Contexts.pop_back();
   }
@@ -85,14 +97,15 @@ size_t CompletionContextFinder::getKeyPathCompletionComponentIndex() const {
   return ComponentIndex;
 }
 
-Optional<Fallback> CompletionContextFinder::getFallbackCompletionExpr() const {
+llvm::Optional<Fallback>
+CompletionContextFinder::getFallbackCompletionExpr() const {
   if (!hasCompletionExpr()) {
     // Creating a fallback expression only makes sense if we are completing in
     // an expression, not when we're completing in a key path.
-    return None;
+    return llvm::None;
   }
 
-  Optional<Fallback> fallback;
+  llvm::Optional<Fallback> fallback;
   bool separatePrecheck = false;
   DeclContext *fallbackDC = InitialDC;
 
@@ -117,7 +130,7 @@ Optional<Fallback> CompletionContextFinder::getFallbackCompletionExpr() const {
       fallbackDC = cast<AbstractClosureExpr>(context.E);
       LLVM_FALLTHROUGH;
     case ContextKind::ErrorExpression:;
-      fallback = None;
+      fallback = llvm::None;
       separatePrecheck = true;
       continue;
     }
@@ -128,5 +141,13 @@ Optional<Fallback> CompletionContextFinder::getFallbackCompletionExpr() const {
 
   if (getCompletionExpr() != InitialExpr)
     return Fallback{getCompletionExpr(), fallbackDC, separatePrecheck};
-  return None;
+  return llvm::None;
+}
+
+bool swift::containsIDEInspectionTarget(SourceRange range,
+                                        const SourceManager &SourceMgr) {
+  if (range.isInvalid())
+    return false;
+  auto charRange = Lexer::getCharSourceRangeFromSourceRange(SourceMgr, range);
+  return SourceMgr.rangeContainsIDEInspectionTarget(charRange);
 }

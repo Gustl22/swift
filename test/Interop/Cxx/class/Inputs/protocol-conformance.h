@@ -12,6 +12,7 @@ struct DoesNotConformToProtocol {
 struct DummyStruct {};
 
 struct __attribute__((swift_attr("import_unsafe"))) NonTrivial {
+  NonTrivial(const NonTrivial &other) {}
   ~NonTrivial() {}
   NonTrivial(DummyStruct) {}
   NonTrivial() {}
@@ -54,5 +55,17 @@ struct HasOperatorEqualEqual {
     return value == other.value;
   }
 };
+
+template <typename T>
+struct HasOperatorPlusEqual {
+  T value;
+
+  HasOperatorPlusEqual &operator+=(int x) {
+    value += x;
+    return *this;
+  }
+};
+
+using HasOperatorPlusEqualInt = HasOperatorPlusEqual<int>;
 
 #endif // TEST_INTEROP_CXX_CLASS_INPUTS_PROTOCOL_CONFORMANCE_H

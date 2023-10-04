@@ -217,7 +217,7 @@ private:
   /// This avoids dangling instruction pointers within the run of a pass and in
   /// analysis caches. Note that the analysis invalidation mechanism ensures
   /// that analysis caches are invalidated before flushDeletedInsts().
-  llvm::iplist<SILInstruction> scheduledForDeletion;
+  std::vector<SILInstruction*> scheduledForDeletion;
 
   /// The swift Module associated with this SILModule.
   ModuleDecl *TheSwiftModule;
@@ -242,6 +242,9 @@ private:
 
   /// Lookup table for SIL vtables from class decls.
   llvm::DenseMap<const ClassDecl *, SILVTable *> VTableMap;
+
+  /// Lookup table for specialized SIL vtables from types.
+  llvm::DenseMap<SILType, SILVTable *> SpecializedVTableMap;
 
   /// The list of SILVTables in the module.
   std::vector<SILVTable*> vtables;
@@ -345,22 +348,22 @@ private:
   /// projections, shared between all functions in the module.
   std::unique_ptr<IndexTrieNode> indexTrieRoot;
 
-  /// A mapping from root opened archetypes to the instructions which define
+  /// A mapping from root local archetypes to the instructions which define
   /// them.
   ///
-  /// The value is either a SingleValueInstruction or a PlaceholderValue, in case
-  /// an opened archetype definition is looked up during parsing or
-  /// deserializing SIL, where opened archetypes can be forward referenced.
+  /// The value is either a SingleValueInstruction or a PlaceholderValue,
+  /// in case a local archetype definition is looked up during parsing or
+  /// deserializing SIL, where local archetypes can be forward referenced.
   ///
   /// In theory we wouldn't need to have the SILFunction in the key, because
-  /// opened archetypes \em should be unique across the module. But currently
-  /// in some rare cases SILGen re-uses the same opened archetype for multiple
+  /// local archetypes \em should be unique across the module. But currently
+  /// in some rare cases SILGen re-uses the same local archetype for multiple
   /// functions.
-  using OpenedArchetypeKey = std::pair<OpenedArchetypeType *, SILFunction *>;
-  llvm::DenseMap<OpenedArchetypeKey, SILValue> RootOpenedArchetypeDefs;
+  using LocalArchetypeKey = std::pair<LocalArchetypeType *, SILFunction *>;
+  llvm::DenseMap<LocalArchetypeKey, SILValue> RootLocalArchetypeDefs;
 
-  /// The number of PlaceholderValues in RootOpenedArchetypeDefs.
-  int numUnresolvedOpenedArchetypes = 0;
+  /// The number of PlaceholderValues in RootLocalArchetypeDefs.
+  int numUnresolvedLocalArchetypes = 0;
 
   /// The options passed into this SILModule.
   const SILOptions &Options;
@@ -395,9 +398,7 @@ private:
   /// Action to be executed for serializing the SILModule.
   ActionCallback SerializeSILAction;
 
-#ifndef NDEBUG
   BasicBlockNameMapType basicBlockNames;
-#endif
 
   SILModule(llvm::PointerUnion<FileUnit *, ModuleDecl *> context,
             Lowering::TypeConverter &TC, const SILOptions &Options,
@@ -444,31 +445,31 @@ public:
     regDeserializationNotificationHandlerForAllFuncOME = true;
   }
 
-  /// Returns the instruction which defines the given root opened archetype,
+  /// Returns the instruction which defines the given root local archetype,
   /// e.g. an open_existential_addr.
   ///
-  /// In case the opened archetype is not defined yet (e.g. during parsing or
+  /// In case the local archetype is not defined yet (e.g. during parsing or
   /// deserialization), a PlaceholderValue is returned. This should not be the
   /// case outside of parsing or deserialization.
-  SILValue getRootOpenedArchetypeDef(CanOpenedArchetypeType archetype,
-                                     SILFunction *inFunction);
+  SILValue getRootLocalArchetypeDef(CanLocalArchetypeType archetype,
+                                    SILFunction *inFunction);
 
-  /// Returns the instruction which defines the given root opened archetype,
+  /// Returns the instruction which defines the given root local archetype,
   /// e.g. an open_existential_addr.
   ///
-  /// In contrast to getOpenedArchetypeDef, it is required that all opened
+  /// In contrast to getLocalArchetypeDef, it is required that all local
   /// archetypes are resolved.
   SingleValueInstruction *
-  getRootOpenedArchetypeDefInst(CanOpenedArchetypeType archetype,
-                                SILFunction *inFunction) {
+  getRootLocalArchetypeDefInst(CanLocalArchetypeType archetype,
+                               SILFunction *inFunction) {
     return cast<SingleValueInstruction>(
-        getRootOpenedArchetypeDef(archetype, inFunction));
+        getRootLocalArchetypeDef(archetype, inFunction));
   }
 
-  /// Returns true if there are unresolved opened archetypes in the module.
+  /// Returns true if there are unresolved local archetypes in the module.
   ///
   /// This should only be the case during parsing or deserialization.
-  bool hasUnresolvedOpenedArchetypeDefinitions();
+  bool hasUnresolvedLocalArchetypeDefinitions();
 
   /// Get a unique index for a struct or class field in layout order.
   ///
@@ -514,15 +515,15 @@ public:
     basicBlockNames[block] = name.str();
 #endif
   }
-  Optional<StringRef> getBasicBlockName(const SILBasicBlock *block) {
+  llvm::Optional<StringRef> getBasicBlockName(const SILBasicBlock *block) {
 #ifndef NDEBUG
     auto Known = basicBlockNames.find(block);
     if (Known == basicBlockNames.end())
-      return None;
+      return llvm::None;
 
     return StringRef(Known->second);
 #else
-    return None;
+    return llvm::None;
 #endif
   }
 
@@ -591,9 +592,8 @@ public:
 
   const SILOptions &getOptions() const { return Options; }
   const IRGenOptions *getIRGenOptionsOrNull() const {
-    // We don't want to serialize target specific SIL.
-    assert(isSerialized() &&
-           "Target specific options must not be used before serialization");
+    // This exposes target specific information, therefore serialized SIL
+    // is also target specific.
     return irgenOptions;
   }
 
@@ -740,6 +740,12 @@ public:
     return isPossiblyUsedExternally(getDeclSILLinkage(decl), isWholeModule());
   }
 
+  /// Promote the linkage of every entity in this SIL module so that they are
+  /// externally visible. This is used to promote the linkage of private
+  /// entities that are compiled on-demand for lazy immediate mode, as each is
+  /// emitted into its own `SILModule`.
+  void promoteLinkages();
+
   PropertyListType &getPropertyList() { return properties; }
   const PropertyListType &getPropertyList() const { return properties; }
 
@@ -773,9 +779,8 @@ public:
   ///
   /// If \p linkage is provided, the deserialized function is required to have
   /// that linkage. Returns null, if this is not the case.
-  SILFunction *loadFunction(StringRef name,
-                            LinkingMode LinkMode,
-                            Optional<SILLinkage> linkage = None);
+  SILFunction *loadFunction(StringRef name, LinkingMode LinkMode,
+                            llvm::Optional<SILLinkage> linkage = llvm::None);
 
   /// Update the linkage of the SILFunction with the linkage of the serialized
   /// function.
@@ -824,6 +829,9 @@ public:
 
   /// Look up the VTable mapped to the given ClassDecl. Returns null on failure.
   SILVTable *lookUpVTable(const ClassDecl *C, bool deserializeLazily = true);
+
+  /// Look up a specialized VTable
+  SILVTable *lookUpSpecializedVTable(SILType classTy);
 
   /// Attempt to lookup the function corresponding to \p Member in the class
   /// hierarchy of \p Class.
@@ -874,7 +882,12 @@ public:
   /// True if SIL conventions force address-only to be passed by address.
   bool useLoweredAddresses() const { return loweredAddresses; }
 
-  void setLoweredAddresses(bool val) { loweredAddresses = val; }
+  void setLoweredAddresses(bool val) {
+    loweredAddresses = val;
+    if (val) {
+      Types.setLoweredAddresses();
+    }
+  }
 
   llvm::IndexedInstrProfReader *getPGOReader() const { return PGOReader.get(); }
 
@@ -897,9 +910,23 @@ public:
   /// fetched in the given module?
   bool isTypeMetadataForLayoutAccessible(SILType type);
 
+  void verify(bool isCompleteOSSA = true,
+              bool checkLinearLifetime = true) const;
+
   /// Run the SIL verifier to make sure that all Functions follow
   /// invariants.
-  void verify() const;
+  void verify(SILPassManager *passManager,
+              bool isCompleteOSSA = true,
+              bool checkLinearLifetime = true) const;
+
+  /// Run the SIL verifier without assuming OSSA lifetimes end at dead end
+  /// blocks.
+  void verifyIncompleteOSSA() const {
+    verify(/*isCompleteOSSA=*/false);
+  }
+
+  /// Check linear OSSA lifetimes, assuming complete OSSA.
+  void verifyOwnership() const;
 
   /// Check if there are any leaking instructions.
   ///
@@ -1064,7 +1091,6 @@ namespace Lowering {
 /// Objective-C runtime, i.e., +alloc and -dealloc.
 LLVM_LIBRARY_VISIBILITY bool usesObjCAllocator(ClassDecl *theClass);
 } // namespace Lowering
-
 } // namespace swift
 
 #endif

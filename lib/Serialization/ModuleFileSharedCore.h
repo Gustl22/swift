@@ -24,6 +24,10 @@ namespace llvm {
 }
 
 namespace swift {
+enum class ModuleLoadingBehavior;
+}
+
+namespace swift {
 
 /// Serialized core data of a module. The difference with `ModuleFile` is that
 /// `ModuleFileSharedCore` provides immutable data and is independent of a
@@ -66,6 +70,10 @@ class ModuleFileSharedCore {
   /// Empty if this module didn't come from an interface file.
   StringRef ModuleInterfacePath;
 
+  /// The module interface path if this module is adjacent to such an interface
+  /// or it was itself compiled from an interface. Empty otherwise.
+  StringRef CorrespondingInterfacePath;
+
   /// The Swift compatibility version in use when this module was built.
   version::Version CompatibilityVersion;
 
@@ -82,11 +90,20 @@ class ModuleFileSharedCore {
   /// The module ABI name.
   StringRef ModuleABIName;
 
+  /// The name of the package this module belongs to.
+  StringRef ModulePackageName;
+
+  /// Module name to use when referenced in clients module interfaces.
+  StringRef ModuleExportAsName;
+
   /// \c true if this module has incremental dependency information.
   bool HasIncrementalInfo = false;
 
   /// \c true if this module was compiled with -enable-ossa-modules.
   bool RequiresOSSAModules;
+
+  /// An array of module names that are allowed to import this one.
+  ArrayRef<StringRef> AllowableClientNames;
 
 public:
   /// Represents another module that has been imported as a dependency.
@@ -97,7 +114,7 @@ public:
 
   private:
     using ImportFilterKind = ModuleDecl::ImportFilterKind;
-    const unsigned RawImportControl : 2;
+    const unsigned RawImportControl : 3;
     const unsigned IsHeader : 1;
     const unsigned IsScoped : 1;
 
@@ -137,6 +154,12 @@ public:
     bool isImplementationOnly() const {
       return getImportControl() == ImportFilterKind::ImplementationOnly;
     }
+    bool isInternalOrBelow() const {
+      return getImportControl() == ImportFilterKind::InternalOrBelow;
+    }
+    bool isPackageOnly() const {
+      return getImportControl() == ImportFilterKind::PackageOnly;
+    }
 
     bool isHeader() const { return IsHeader; }
     bool isScoped() const { return IsScoped; }
@@ -148,16 +171,11 @@ private:
   /// All modules this module depends on.
   SmallVector<Dependency, 8> Dependencies;
 
-  struct SearchPath {
-    std::string Path;
-    bool IsFramework;
-    bool IsSystem;
-  };
   /// Search paths this module may provide.
   ///
   /// This is not intended for use by frameworks, but may show up in debug
   /// modules.
-  std::vector<SearchPath> SearchPaths;
+  std::vector<serialization::SearchPath> SearchPaths;
 
   /// Info for the (lone) imported header for this module.
   struct {
@@ -205,6 +223,9 @@ private:
 
   /// Protocol conformances referenced by this module.
   ArrayRef<RawBitOffset> Conformances;
+
+  /// Pack conformances referenced by this module.
+  ArrayRef<RawBitOffset> PackConformances;
 
   /// SILLayouts referenced by this module.
   ArrayRef<RawBitOffset> SILLayouts;
@@ -341,6 +362,9 @@ private:
     /// Whether this module was built with -experimental-hermetic-seal-at-link.
     unsigned HasHermeticSealAtLink : 1;
 
+    /// Whether this module was built with embedded Swift.
+    unsigned IsEmbeddedSwiftModule : 1;
+
     /// Whether this module file is compiled with '-enable-testing'.
     unsigned IsTestable : 1;
 
@@ -360,8 +384,11 @@ private:
     /// \c true if this module was built with complete checking for concurrency.
     unsigned IsConcurrencyChecked: 1;
 
+    /// Whether this module is built with C++ interoperability enabled.
+    unsigned HasCxxInteroperability : 1;
+
     // Explicitly pad out to the next word boundary.
-    unsigned : 4;
+    unsigned : 3;
   } Bits = {};
   static_assert(sizeof(ModuleBits) <= 8, "The bit set should be small");
 
@@ -512,12 +539,12 @@ public:
   /// \returns Whether the module was successfully loaded, or what went wrong
   ///          if it was not.
   static serialization::ValidationInfo
-  load(StringRef moduleInterfacePath,
+  load(StringRef moduleInterfacePath, StringRef moduleInterfaceSourcePath,
        std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer,
        std::unique_ptr<llvm::MemoryBuffer> moduleDocInputBuffer,
        std::unique_ptr<llvm::MemoryBuffer> moduleSourceInfoInputBuffer,
-       bool isFramework, bool requiresOSSAModules,
-       StringRef requiredSDK, PathObfuscator &pathRecoverer,
+       bool isFramework, bool requiresOSSAModules, StringRef requiredSDK,
+       PathObfuscator &pathRecoverer,
        std::shared_ptr<const ModuleFileSharedCore> &theModule) {
     serialization::ValidationInfo info;
     auto *core = new ModuleFileSharedCore(
@@ -528,6 +555,11 @@ public:
       ArrayRef<char> path;
       core->allocateBuffer(path, moduleInterfacePath);
       core->ModuleInterfacePath = StringRef(path.data(), path.size());
+    }
+    if (!moduleInterfaceSourcePath.empty()) {
+      ArrayRef<char> path;
+      core->allocateBuffer(path, moduleInterfaceSourcePath);
+      core->CorrespondingInterfacePath = StringRef(path.data(), path.size());
     }
     theModule.reset(core);
     return info;
@@ -542,6 +574,20 @@ public:
   /// The name of the module.
   StringRef getName() const {
     return Name;
+  }
+
+  StringRef getModulePackageName() const {
+    return ModulePackageName;
+  }
+
+  /// Is the module built with testing enabled?
+  bool isTestable() const {
+     return Bits.IsTestable;
+   }
+
+  /// Whether the module is resilient. ('-enable-library-evolution')
+  ResilienceStrategy getResilienceStrategy() const {
+    return ResilienceStrategy(Bits.ResilienceStrategy);
   }
 
   /// Returns the list of modules this module depends on.
@@ -561,6 +607,28 @@ public:
   bool hasSourceInfo() const;
 
   bool isConcurrencyChecked() const { return Bits.IsConcurrencyChecked; }
+
+  /// How should \p dependency be loaded for a transitive import via \c this?
+  ///
+  /// If \p debuggerMode, more transitive dependencies should try to be loaded
+  /// as they can be useful in debugging.
+  ///
+  /// If \p isPartialModule, transitive dependencies should be loaded as we're
+  /// in merge-module mode.
+  ///
+  /// If \p packageName is set, transitive package dependencies are loaded if
+  /// loaded from the same package.
+  ///
+  /// If \p forTestable, get the desired loading behavior for a @testable
+  /// import. Reports non-public dependencies as required for a testable
+  /// client so it can access internal details, which in turn can reference
+  /// those non-public dependencies.
+  ModuleLoadingBehavior
+  getTransitiveLoadingBehavior(const Dependency &dependency,
+                               bool debuggerMode,
+                               bool isPartialModule,
+                               StringRef packageName,
+                               bool forTestable) const;
 };
 
 template <typename T, typename RawData>

@@ -319,10 +319,8 @@ CanSILFunctionType BridgedProperty::getOutlinedFunctionType(SILModule &M) {
   auto ExtInfo = SILFunctionType::ExtInfo::getThin();
   auto FunctionType = SILFunctionType::get(
       nullptr, ExtInfo, SILCoroutineKind::None,
-      ParameterConvention::Direct_Unowned, Parameters, /*yields*/ {},
-      Results, None,
-      SubstitutionMap(), SubstitutionMap(),
-      M.getASTContext());
+      ParameterConvention::Direct_Unowned, Parameters, /*yields*/ {}, Results,
+      llvm::None, SubstitutionMap(), SubstitutionMap(), M.getASTContext());
   return FunctionType;
 }
 
@@ -343,7 +341,8 @@ BridgedProperty::outline(SILModule &M) {
 
   auto *Fun = FuncBuilder.getOrCreateFunction(
       ObjCMethod->getLoc(), name, SILLinkage::Shared, FunctionType, IsNotBare,
-      IsNotTransparent, IsSerialized, IsNotDynamic, IsNotDistributed);
+      IsNotTransparent, IsSerialized, IsNotDynamic, IsNotDistributed,
+      IsNotRuntimeAccessible);
   bool NeedsDefinition = Fun->empty();
 
   if (Release) {
@@ -1073,7 +1072,8 @@ ObjCMethodCall::outline(SILModule &M) {
 
   auto *Fun = FuncBuilder.getOrCreateFunction(
       ObjCMethod->getLoc(), name, SILLinkage::Shared, FunctionType, IsNotBare,
-      IsNotTransparent, IsSerialized, IsNotDynamic, IsNotDistributed);
+      IsNotTransparent, IsSerialized, IsNotDynamic, IsNotDistributed,
+      IsNotRuntimeAccessible);
   bool NeedsDefinition = Fun->empty();
 
   // Call the outlined function.
@@ -1289,10 +1289,8 @@ CanSILFunctionType ObjCMethodCall::getOutlinedFunctionType(SILModule &M) {
   }
   auto FunctionType = SILFunctionType::get(
       nullptr, ExtInfo, SILCoroutineKind::None,
-      ParameterConvention::Direct_Unowned, Parameters, {},
-      Results, None,
-      SubstitutionMap(), SubstitutionMap(),
-      M.getASTContext());
+      ParameterConvention::Direct_Unowned, Parameters, {}, Results, llvm::None,
+      SubstitutionMap(), SubstitutionMap(), M.getASTContext());
   return FunctionType;
 }
 

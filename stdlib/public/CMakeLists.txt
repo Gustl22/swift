@@ -36,6 +36,9 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
   list(APPEND SWIFT_RUNTIME_CORE_CXX_FLAGS "-xc++")
 endif()
 
+# Use the new diagnostic formatter.
+list(APPEND SWIFT_RUNTIME_SWIFT_COMPILE_FLAGS "-diagnostic-style" "swift")
+
 # We should avoid non-literals in format strings, or appropriately mark
 # functions.
 check_cxx_compiler_flag("-Wformat-nonliteral -Werror=format-nonliteral" CXX_SUPPORTS_FORMAT_NONLITERAL_WARNING)
@@ -62,9 +65,19 @@ endif()
 
 add_subdirectory(SwiftShims/swift/shims)
 add_subdirectory(CommandLineSupport)
+if(SWIFT_ENABLE_EXPERIMENTAL_CXX_INTEROP)
+  add_subdirectory(Cxx)
+else()
+  # SwiftCompilerSources rely on C++ interop, specifically on being able to
+  # import the C++ standard library into Swift. On Linux, this is only possible
+  # when using the modulemap that Swift provides for libstdc++. Make sure we
+  # include the libstdc++ modulemap into the build even when not building
+  # C++ interop modules.
+  add_subdirectory(Cxx/libstdcxx)
+endif()
 add_subdirectory(Threading)
 
-# This static library is shared across swiftCore and swiftReflection
+# This static library is shared across swiftCore and swiftRemoteInspection
 if(SWIFT_BUILD_STDLIB OR SWIFT_BUILD_REMOTE_MIRROR)
   # TODO: due to the use of `add_swift_target_library` rather than `add_library`
   # we cannot use `target_sources` and thus must resort to list manipulations to
@@ -146,16 +159,23 @@ if(SWIFT_BUILD_STDLIB)
     add_subdirectory(StringProcessing)
     add_subdirectory(RegexBuilder)
   endif()
+
+  if(SWIFT_ENABLE_EXPERIMENTAL_OBSERVATION)
+    add_subdirectory(Observation)
+  endif()
+
+  if(SWIFT_ENABLE_BACKTRACING)
+    add_subdirectory(Backtracing)
+  endif()
 endif()
 
-if(SWIFT_BUILD_STDLIB OR SWIFT_BUILD_REMOTE_MIRROR)
-  add_subdirectory(Reflection)
+if(SWIFT_BUILD_REMOTE_MIRROR)
+  add_subdirectory(RemoteInspection)
   add_subdirectory(SwiftRemoteMirror)
 endif()
 
 if(SWIFT_BUILD_SDK_OVERLAY OR SWIFT_BUILD_TEST_SUPPORT_MODULES)
   add_subdirectory(Platform)
-  add_subdirectory(Cxx)
 endif()
 
 if(SWIFT_BUILD_SDK_OVERLAY)
@@ -166,3 +186,8 @@ if(SWIFT_BUILD_SDK_OVERLAY)
     add_subdirectory(Windows)
   endif()
 endif()
+
+if(SWIFT_BUILD_LIBEXEC)
+add_subdirectory(libexec)
+endif()
+

@@ -39,7 +39,7 @@ SILInstruction *SILCombiner::optimizeBuiltinCompareEq(BuiltinInst *BI,
       // cmp_eq %X, -1 -> xor (cmp_eq %X, 0), -1
       if (!NegateResult) {
         if (auto *ILOp = dyn_cast<IntegerLiteralInst>(BI->getArguments()[1]))
-          if (ILOp->getValue().isAllOnesValue()) {
+          if (ILOp->getValue().isAllOnes()) {
             auto X = BI->getArguments()[0];
             SILValue One(ILOp);
             SILValue Zero(
@@ -118,10 +118,8 @@ SILCombiner::optimizeBuiltinCOWBufferForReadingOSSA(BuiltinInst *bi) {
     if (auto operand = BorrowingOperand(use)) {
       if (operand.isReborrow())
         return nullptr;
-      operand.visitBorrowIntroducingUserResults([&](BorrowedValue bv) {
-        accumulatedBorrowedValues.push_back(bv);
-        return true;
-      });
+      auto bv = operand.getBorrowIntroducingUserResult();
+      accumulatedBorrowedValues.push_back(bv);
       continue;
     }
 
@@ -579,12 +577,12 @@ SILInstruction *optimizeBitOp(BuiltinInst *BI,
 
 /// Returns a 64-bit integer constant if \p op is an integer_literal instruction
 /// with a value which fits into 64 bits.
-static Optional<uint64_t> getIntConst(SILValue op) {
+static llvm::Optional<uint64_t> getIntConst(SILValue op) {
   if (auto *ILI = dyn_cast<IntegerLiteralInst>(op)) {
     if (ILI->getValue().getActiveBits() <= 64)
       return ILI->getValue().getZExtValue();
   }
-  return None;
+  return llvm::None;
 }
 
 /// Optimize the bit extract of a string object. Example in SIL pseudo-code,
@@ -603,7 +601,7 @@ SILInstruction *SILCombiner::optimizeStringObject(BuiltinInst *BI) {
   if (!AndOp)
     return nullptr;
 
-  uint64_t andBits = AndOp.getValue();
+  uint64_t andBits = AndOp.value();
 
   // TODO: It's bad that we have to hardcode the payload bit mask here.
   // Instead we should introduce builtins (or instructions) to extract the
@@ -636,7 +634,7 @@ SILInstruction *SILCombiner::optimizeStringObject(BuiltinInst *BI) {
             // Note that it is a requirement that the or'd bits of the left
             // operand are initially zero.
             if (auto opVal = getIntConst(B->getArguments()[1])) {
-              setBits |= opVal.getValue();
+              setBits |= opVal.value();
             } else {
               return nullptr;
             }
@@ -733,14 +731,14 @@ SILInstruction *SILCombiner::visitBuiltinInst(BuiltinInst *I) {
 
     return optimizeBitOp(I,
       [](APInt &left, const APInt &right) { left &= right; }    /* combine */,
-      [](const APInt &i) -> bool { return i.isAllOnesValue(); } /* isNeutral */,
+      [](const APInt &i) -> bool { return i.isAllOnes(); }      /* isNeutral */,
       [](const APInt &i) -> bool { return i.isMinValue(); }     /* isZero */,
       Builder, this);
   case BuiltinValueKind::Or:
     return optimizeBitOp(I,
       [](APInt &left, const APInt &right) { left |= right; }    /* combine */,
       [](const APInt &i) -> bool { return i.isMinValue(); }     /* isNeutral */,
-      [](const APInt &i) -> bool { return i.isAllOnesValue(); } /* isZero */,
+      [](const APInt &i) -> bool { return i.isAllOnes(); }      /* isZero */,
       Builder, this);
   case BuiltinValueKind::Xor:
     return optimizeBitOp(I,

@@ -57,11 +57,11 @@ public:
              .getTypeExpansionContext()
              .shouldLookThroughOpaqueTypeArchetypes())
       return ty;
-    // Remap types containing opaque result types in the current context.
-    return getBuilder()
-        .getTypeLowering(SILType::getPrimitiveObjectType(ty))
-        .getLoweredType()
-        .getASTType();
+
+    return substOpaqueTypesWithUnderlyingTypes(
+        ty,
+        TypeExpansionContext(getBuilder().getFunction()),
+        /*allowLoweredTypes=*/false);
   }
 
   ProtocolConformanceRef remapConformance(Type ty,
@@ -88,10 +88,7 @@ void MapOpaqueArchetypes::replace() {
     SILType mappedType = remapType(origArg->getType());
     auto *NewArg = clonedEntryBlock->createFunctionArgument(
         mappedType, origArg->getDecl(), true);
-    NewArg->setNoImplicitCopy(
-        cast<SILFunctionArgument>(origArg)->isNoImplicitCopy());
-    NewArg->setLifetimeAnnotation(
-        cast<SILFunctionArgument>(origArg)->getLifetimeAnnotation());
+    NewArg->copyFlags(cast<SILFunctionArgument>(origArg));
     entryArgs.push_back(NewArg);
   }
 
@@ -151,6 +148,8 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   // Check substitution maps.
   switch (inst.getKind()) {
   case SILInstructionKind::AllocStackInst:
+  case SILInstructionKind::AllocPackInst:
+  case SILInstructionKind::AllocPackMetadataInst:
   case SILInstructionKind::AllocRefInst:
   case SILInstructionKind::AllocRefDynamicInst:
   case SILInstructionKind::AllocBoxInst:
@@ -206,16 +205,16 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::CopyValueInst:
   case SILInstructionKind::ExplicitCopyValueInst:
   case SILInstructionKind::MoveValueInst:
-  case SILInstructionKind::MarkMustCheckInst:
+  case SILInstructionKind::DropDeinitInst:
+  case SILInstructionKind::MarkUnresolvedNonCopyableValueInst:
+  case SILInstructionKind::MarkUnresolvedReferenceBindingInst:
   case SILInstructionKind::CopyableToMoveOnlyWrapperValueInst:
   case SILInstructionKind::MoveOnlyWrapperToCopyableValueInst:
-#define UNCHECKED_REF_STORAGE(Name, ...)                                       \
-  case SILInstructionKind::StrongCopy##Name##ValueInst:
-#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)            \
+  case SILInstructionKind::UnownedCopyValueInst:
+  case SILInstructionKind::WeakCopyValueInst:
+#define REF_STORAGE(Name, ...)                                                 \
   case SILInstructionKind::StrongCopy##Name##ValueInst:
 #include "swift/AST/ReferenceStorage.def"
-#undef UNCHECKED_REF_STORAGE
-#undef ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE
   case SILInstructionKind::UncheckedOwnershipConversionInst:
   case SILInstructionKind::IsUniqueInst:
   case SILInstructionKind::IsEscapingClosureInst:
@@ -224,6 +223,9 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::BeginBorrowInst:
   case SILInstructionKind::StoreBorrowInst:
   case SILInstructionKind::BeginAccessInst:
+  case SILInstructionKind::MoveOnlyWrapperToCopyableAddrInst:
+  case SILInstructionKind::MoveOnlyWrapperToCopyableBoxInst:
+  case SILInstructionKind::CopyableToMoveOnlyWrapperAddrInst:
 #define NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, name, ...)       \
   case SILInstructionKind::Load##Name##Inst:
 #include "swift/AST/ReferenceStorage.def"
@@ -239,6 +241,7 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::ObjectInst:
   case SILInstructionKind::TupleInst:
   case SILInstructionKind::TupleExtractInst:
+  case SILInstructionKind::TuplePackExtractInst:
   case SILInstructionKind::TupleElementAddrInst:
   case SILInstructionKind::StructInst:
   case SILInstructionKind::StructExtractInst:
@@ -251,7 +254,6 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::UncheckedTakeEnumDataAddrInst:
   case SILInstructionKind::SelectEnumInst:
   case SILInstructionKind::SelectEnumAddrInst:
-  case SILInstructionKind::SelectValueInst:
   case SILInstructionKind::InitExistentialAddrInst:
   case SILInstructionKind::InitExistentialValueInst:
   case SILInstructionKind::OpenExistentialAddrInst:
@@ -280,6 +282,8 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::CheckedCastAddrBranchInst:
   case SILInstructionKind::DeallocStackInst:
   case SILInstructionKind::DeallocStackRefInst:
+  case SILInstructionKind::DeallocPackInst:
+  case SILInstructionKind::DeallocPackMetadataInst:
   case SILInstructionKind::DeallocRefInst:
   case SILInstructionKind::DeallocPartialRefInst:
   case SILInstructionKind::DeallocBoxInst:
@@ -299,7 +303,8 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::RetainValueAddrInst:
   case SILInstructionKind::ReleaseValueInst:
   case SILInstructionKind::ReleaseValueAddrInst:
-  case SILInstructionKind::SetDeallocatingInst:
+  case SILInstructionKind::BeginDeallocRefInst:
+  case SILInstructionKind::EndInitLetRefInst:
   case SILInstructionKind::AutoreleaseValueInst:
   case SILInstructionKind::BindMemoryInst:
   case SILInstructionKind::RebindMemoryInst:
@@ -312,8 +317,10 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::StoreInst:
   case SILInstructionKind::AssignInst:
   case SILInstructionKind::AssignByWrapperInst:
+  case SILInstructionKind::AssignOrInitInst:
   case SILInstructionKind::MarkFunctionEscapeInst:
   case SILInstructionKind::DebugValueInst:
+  case SILInstructionKind::DebugStepInst:
   case SILInstructionKind::TestSpecificationInst:
 #define NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)             \
   case SILInstructionKind::Store##Name##Inst:
@@ -348,8 +355,38 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::HopToExecutorInst:
   case SILInstructionKind::ExtractExecutorInst:
   case SILInstructionKind::HasSymbolInst:
+  case SILInstructionKind::PackElementGetInst:
+  case SILInstructionKind::PackElementSetInst:
+  case SILInstructionKind::TuplePackElementAddrInst:
     // Handle by operand and result check.
     break;
+
+  case SILInstructionKind::PackLengthInst:
+    // We reduce the pack shape, so it would very odd if this pack had
+    // opaque archetypes in it, but there's no harm in doing it right.
+    return opaqueArchetypeWouldChange(context,
+              cast<PackLengthInst>(&inst)->getPackType());
+
+  case SILInstructionKind::DynamicPackIndexInst:
+  case SILInstructionKind::PackPackIndexInst:
+  case SILInstructionKind::ScalarPackIndexInst:
+    return opaqueArchetypeWouldChange(context,
+              cast<AnyPackIndexInst>(&inst)->getIndexedPackType());
+
+  case SILInstructionKind::OpenPackElementInst: {
+    auto open = cast<OpenPackElementInst>(&inst);
+    bool wouldChange = false;
+    open->getOpenedGenericEnvironment()
+        ->forEachPackElementBinding([&](ElementArchetypeType *elementType,
+                                        PackType *packSubstitution) {
+      if (!wouldChange) {
+        if (opaqueArchetypeWouldChange(context,
+                                       packSubstitution->getCanonicalType()))
+          wouldChange = true;
+      }
+    });
+    return wouldChange;
+  }
 
   case SILInstructionKind::ApplyInst:
   case SILInstructionKind::PartialApplyInst:
@@ -440,6 +477,10 @@ class SerializeSILPass : public SILModuleTransform {
 
     for (auto &VT : M.getVTables()) {
       VT->setSerialized(IsNotSerialized);
+    }
+
+    for (auto &Deinit : M.getMoveOnlyDeinits()) {
+      Deinit->setSerialized(IsNotSerialized);
     }
   }
 

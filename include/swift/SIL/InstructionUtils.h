@@ -13,6 +13,7 @@
 #ifndef SWIFT_SIL_INSTRUCTIONUTILS_H
 #define SWIFT_SIL_INSTRUCTIONUTILS_H
 
+#include "swift/SIL/InstWrappers.h"
 #include "swift/SIL/RuntimeEffect.h"
 #include "swift/SIL/SILInstruction.h"
 
@@ -39,6 +40,12 @@ SILValue stripCastsWithoutMarkDependence(SILValue V);
 /// Return the underlying SILValue after looking through all copy_value and
 /// begin_borrow instructions.
 SILValue lookThroughOwnershipInsts(SILValue v);
+
+/// Reverse of lookThroughOwnershipInsts.
+///
+/// Return true if \p visitor returned true for all uses.
+bool visitNonOwnershipUses(SILValue value,
+                           function_ref<bool(Operand *)> visitor);
 
 /// Return the underlying SILValue after looking through all copy_value
 /// instructions.
@@ -88,8 +95,8 @@ SILValue stripBorrow(SILValue V);
 //===----------------------------------------------------------------------===//
 
 /// Return a non-null SingleValueInstruction if the given instruction merely
-/// copies the value of its first operand, possibly changing its type or
-/// ownership state, but otherwise having no effect.
+/// copies or moves the value of its first operand, possibly changing its type
+/// or ownership state, but otherwise having no effect.
 ///
 /// The returned instruction may have additional "incidental" operands;
 /// mark_dependence for example.
@@ -138,6 +145,10 @@ SILValue isPartialApplyOfReabstractionThunk(PartialApplyInst *PAI);
 /// Returns true if \p PAI is only used by an assign_by_wrapper instruction as
 /// init or set function.
 bool onlyUsedByAssignByWrapper(PartialApplyInst *PAI);
+
+/// Returns true if \p PAI is only used by an \c assign_or_init
+/// instruction as init or set function.
+bool onlyUsedByAssignOrInit(PartialApplyInst *PAI);
 
 /// Returns the runtime effects of \p inst.
 ///
@@ -194,7 +205,6 @@ private:
 /// polymorphic builtin or does not have any available overload for these types,
 /// return SILValue().
 SILValue getStaticOverloadForSpecializedPolymorphicBuiltin(BuiltinInst *bi);
-
 } // end namespace swift
 
 #endif

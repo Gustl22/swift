@@ -58,23 +58,29 @@ void swift::registerIDERequestFunctions(Evaluator &evaluator) {
 class CursorInfoResolver : public SourceEntityWalker {
   SourceFile &SrcFile;
   SourceLoc LocToResolve;
-  ResolvedCursorInfo CursorInfo;
+  ResolvedCursorInfoPtr CursorInfo;
   Type ContainerType;
   Expr *OutermostCursorExpr;
   llvm::SmallVector<Expr*, 8> ExprStack;
   /// If a decl shadows another decl using shorthand syntax (`[foo]` or
   /// `if let foo {`), this maps the re-declared variable to the one that is
-  /// being shadowed.
+  /// being shadowed. Ordered from innermost to outermost shadows.
+  ///
   /// The transitive closure of shorthand shadowed decls should be reported as
   /// additional results in cursor info.
   llvm::DenseMap<ValueDecl *, ValueDecl *> ShorthandShadowedDecls;
 
 public:
-  explicit CursorInfoResolver(SourceFile &SrcFile) :
-    SrcFile(SrcFile), CursorInfo(&SrcFile), OutermostCursorExpr(nullptr) {}
-  ResolvedCursorInfo resolve(SourceLoc Loc);
+  explicit CursorInfoResolver(SourceFile &SrcFile)
+      : SrcFile(SrcFile), CursorInfo(new ResolvedCursorInfo(&SrcFile)),
+        OutermostCursorExpr(nullptr) {}
+  ResolvedCursorInfoPtr resolve(SourceLoc Loc);
   SourceManager &getSourceMgr() const;
 private:
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
+
   bool walkToExprPre(Expr *E) override;
   bool walkToExprPost(Expr *E) override;
   bool walkToDeclPre(Decl *D, CharSourceRange Range) override;
@@ -91,9 +97,10 @@ private:
   bool visitModuleReference(ModuleEntity Mod, CharSourceRange Range) override;
   bool rangeContainsLoc(SourceRange Range) const;
   bool rangeContainsLoc(CharSourceRange Range) const;
-  bool isDone() const { return CursorInfo.isValid(); }
+  bool isDone() const { return CursorInfo->isValid(); }
   bool tryResolve(ValueDecl *D, TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef,
-                  SourceLoc Loc, bool IsRef, Type Ty = Type());
+                  SourceLoc Loc, bool IsRef, Type Ty = Type(),
+                  llvm::Optional<ReferenceMetaData> Data = llvm::None);
   bool tryResolve(ModuleEntity Mod, SourceLoc Loc);
   bool tryResolve(Stmt *St);
   bool visitSubscriptReference(ValueDecl *D, CharSourceRange Range,
@@ -106,13 +113,30 @@ SourceManager &CursorInfoResolver::getSourceMgr() const
   return SrcFile.getASTContext().SourceMgr;
 }
 
+static bool locationMatches(SourceLoc currentLoc, SourceLoc toResolveLoc,
+                            SourceManager &SM) {
+  if (currentLoc == toResolveLoc)
+    return true;
+
+  if (currentLoc.getAdvancedLoc(-1) != toResolveLoc)
+    return false;
+
+  // Check if the location to resolve is a '@' or '#' and accept if so (to
+  // allow clients to send either the name location or the start of the
+  // attribute/expansion).
+  unsigned bufferID = SM.findBufferContainingLoc(toResolveLoc);
+  StringRef initialChar = SM.extractText({toResolveLoc, 1}, bufferID);
+  return initialChar == "@" || initialChar == "#";
+}
+
 bool CursorInfoResolver::tryResolve(ValueDecl *D, TypeDecl *CtorTyRef,
                                     ExtensionDecl *ExtTyRef, SourceLoc Loc,
-                                    bool IsRef, Type Ty) {
+                                    bool IsRef, Type Ty,
+                                    llvm::Optional<ReferenceMetaData> Data) {
   if (!D->hasName())
     return false;
 
-  if (Loc != LocToResolve)
+  if (!locationMatches(Loc, LocToResolve, getSourceMgr()))
     return false;
 
   if (auto *VD = dyn_cast<VarDecl>(D)) {
@@ -125,20 +149,33 @@ bool CursorInfoResolver::tryResolve(ValueDecl *D, TypeDecl *CtorTyRef,
     }
   }
 
+  SmallVector<NominalTypeDecl *> ReceiverTypes;
+  bool IsDynamic = false;
+  llvm::Optional<std::pair<const CustomAttr *, Decl *>> CustomAttrRef =
+      llvm::None;
   if (Expr *BaseE = getBase(ExprStack)) {
     if (isDynamicRef(BaseE, D)) {
-      CursorInfo.IsDynamic = true;
-      ide::getReceiverType(BaseE, CursorInfo.ReceiverTypes);
+      IsDynamic = true;
+      ide::getReceiverType(BaseE, ReceiverTypes);
     }
   }
 
-  CursorInfo.setValueRef(D, CtorTyRef, ExtTyRef, IsRef, Ty, ContainerType);
+  if (Data)
+    CustomAttrRef = Data->CustomAttrRef;
+
+  CursorInfo = new ResolvedValueRefCursorInfo(
+      CursorInfo->getSourceFile(), CursorInfo->getLoc(), D, CtorTyRef, ExtTyRef,
+      IsRef, Ty, ContainerType, CustomAttrRef,
+      /*IsKeywordArgument=*/false, IsDynamic, ReceiverTypes,
+      /*ShorthandShadowedDecls=*/{});
+
   return true;
 }
 
 bool CursorInfoResolver::tryResolve(ModuleEntity Mod, SourceLoc Loc) {
   if (Loc == LocToResolve) {
-    CursorInfo.setModuleRef(Mod);
+    CursorInfo = new ResolvedModuleRefCursorInfo(CursorInfo->getSourceFile(),
+                                                 CursorInfo->getLoc(), Mod);
     return true;
   }
   return false;
@@ -147,13 +184,15 @@ bool CursorInfoResolver::tryResolve(ModuleEntity Mod, SourceLoc Loc) {
 bool CursorInfoResolver::tryResolve(Stmt *St) {
   if (auto *LST = dyn_cast<LabeledStmt>(St)) {
     if (LST->getStartLoc() == LocToResolve) {
-      CursorInfo.setTrailingStmt(St);
+      CursorInfo = new ResolvedStmtStartCursorInfo(CursorInfo->getSourceFile(),
+                                                   CursorInfo->getLoc(), St);
       return true;
     }
   }
   if (auto *CS = dyn_cast<CaseStmt>(St)) {
     if (CS->getStartLoc() == LocToResolve) {
-      CursorInfo.setTrailingStmt(St);
+      CursorInfo = new ResolvedStmtStartCursorInfo(CursorInfo->getSourceFile(),
+                                                   CursorInfo->getLoc(), St);
       return true;
     }
   }
@@ -168,27 +207,35 @@ bool CursorInfoResolver::visitSubscriptReference(ValueDecl *D,
   return visitDeclReference(D, Range, nullptr, nullptr, Type(), Data);
 }
 
-ResolvedCursorInfo CursorInfoResolver::resolve(SourceLoc Loc) {
+ResolvedCursorInfoPtr CursorInfoResolver::resolve(SourceLoc Loc) {
   assert(Loc.isValid());
   LocToResolve = Loc;
-  CursorInfo.Loc = Loc;
+  CursorInfo->setLoc(Loc);
 
   walk(SrcFile);
 
-  if (!CursorInfo.IsRef) {
-    // If we have a definition, add any decls that it potentially shadows
-    auto ShorthandShadowedDecl = ShorthandShadowedDecls[CursorInfo.ValueD];
+  if (auto ValueRefInfo = dyn_cast<ResolvedValueRefCursorInfo>(CursorInfo)) {
+    SmallVector<ValueDecl *> ShadowedDecls;
+    auto ShorthandShadowedDecl =
+        ShorthandShadowedDecls[ValueRefInfo->getValueD()];
     while (ShorthandShadowedDecl) {
-      CursorInfo.ShorthandShadowedDecls.push_back(ShorthandShadowedDecl);
+      ShadowedDecls.push_back(ShorthandShadowedDecl);
       ShorthandShadowedDecl = ShorthandShadowedDecls[ShorthandShadowedDecl];
     }
+    ValueRefInfo->setShorthandShadowedDecls(ShadowedDecls);
   }
 
   return CursorInfo;
 }
 
 bool CursorInfoResolver::walkToDeclPre(Decl *D, CharSourceRange Range) {
-  if (!rangeContainsLoc(D->getSourceRangeIncludingAttrs()))
+  // Get char based source range for this declaration.
+  SourceRange SR = D->getSourceRangeIncludingAttrs();
+  auto &Context = D->getASTContext();
+  CharSourceRange CharSR =
+      Lexer::getCharSourceRangeFromSourceRange(Context.SourceMgr, SR);
+
+  if (!rangeContainsLoc(CharSR))
     return false;
 
   if (isa<ExtensionDecl>(D))
@@ -253,7 +300,7 @@ bool CursorInfoResolver::visitDeclReference(ValueDecl *D,
     return false;
   if (Data.isImplicit || !Range.isValid())
     return true;
-  return !tryResolve(D, CtorTyRef, ExtTyRef, Range.getStart(), /*IsRef=*/true, T);
+  return !tryResolve(D, CtorTyRef, ExtTyRef, Range.getStart(), /*IsRef=*/true, T, Data);
 }
 
 static bool isCursorOn(Expr *E, SourceLoc Loc) {
@@ -307,7 +354,8 @@ bool CursorInfoResolver::walkToExprPost(Expr *E) {
     return false;
 
   if (OutermostCursorExpr && isCursorOn(E, LocToResolve)) {
-    CursorInfo.setTrailingExpr(OutermostCursorExpr);
+    CursorInfo = new ResolvedExprStartCursorInfo(
+        CursorInfo->getSourceFile(), CursorInfo->getLoc(), OutermostCursorExpr);
     return false;
   }
 
@@ -328,8 +376,9 @@ bool CursorInfoResolver::visitCallArgName(Identifier Name,
     return true;
 
   bool Found = tryResolve(D, nullptr, nullptr, Range.getStart(), /*IsRef=*/true);
-  if (Found)
-    CursorInfo.IsKeywordArgument = true;
+  if (Found) {
+    cast<ResolvedValueRefCursorInfo>(CursorInfo)->setIsKeywordArgument(true);
+  }
   return !Found;
 }
 
@@ -357,10 +406,10 @@ bool CursorInfoResolver::rangeContainsLoc(CharSourceRange Range) const {
   return Range.contains(LocToResolve);
 }
 
-ide::ResolvedCursorInfo
+ide::ResolvedCursorInfoPtr
 CursorInfoRequest::evaluate(Evaluator &eval, CursorInfoOwner CI) const {
   if (!CI.isValid())
-    return ResolvedCursorInfo();
+    return new ResolvedCursorInfo();
   CursorInfoResolver Resolver(*CI.File);
   return Resolver.resolve(CI.Loc);
 }
@@ -379,13 +428,13 @@ void swift::simple_display(llvm::raw_ostream &out, const CursorInfoOwner &owner)
 }
 
 void swift::ide::simple_display(llvm::raw_ostream &out,
-                                const ide::ResolvedCursorInfo &info) {
-  if (info.isInvalid())
+                                ide::ResolvedCursorInfoPtr info) {
+  if (info->isInvalid())
     return;
   out << "Resolved cursor info at ";
-  auto &SM = info.SF->getASTContext().SourceMgr;
-  out << SM.getIdentifierForBuffer(*info.SF->getBufferID());
-  auto LC = SM.getLineAndColumnInBuffer(info.Loc);
+  auto &SM = info->getSourceFile()->getASTContext().SourceMgr;
+  out << SM.getIdentifierForBuffer(*info->getSourceFile()->getBufferID());
+  auto LC = SM.getLineAndColumnInBuffer(info->getLoc());
   out << ":" << LC.first << ":" << LC.second;
 }
 
@@ -507,7 +556,7 @@ private:
   SourceLoc Start;
   SourceLoc End;
 
-  Optional<ResolvedRangeInfo> Result;
+  llvm::Optional<ResolvedRangeInfo> Result;
   std::vector<ContextInfo> ContextStack;
   ContextInfo &getCurrentDC() {
     assert(!ContextStack.empty());
@@ -651,7 +700,7 @@ private:
   }
 
 public:
-  bool hasResult() { return Result.hasValue(); }
+  bool hasResult() { return Result.has_value(); }
 
   void enter(ASTNode Node) {
     bool ContainedInRange;
@@ -985,8 +1034,8 @@ public:
   }
 
   ResolvedRangeInfo getResult() {
-    if (Result.hasValue())
-      return Result.getValue();
+    if (Result.has_value())
+      return Result.value();
     return ResolvedRangeInfo(TokensInRange);
   }
 
@@ -1010,7 +1059,7 @@ public:
 
     // Down-grade LValue type to RValue type if it's read-only.
     if (auto Access = Data.AccKind) {
-      switch (Access.getValue()) {
+      switch (Access.value()) {
         case AccessKind::Read:
           Ty = Ty->getRValueType();
           break;
@@ -1145,7 +1194,7 @@ void swift::simple_display(llvm::raw_ostream &out,
 RangeInfoOwner::RangeInfoOwner(SourceFile *File, unsigned Offset,
                                unsigned Length): File(File) {
   SourceManager &SM = File->getASTContext().SourceMgr;
-  unsigned BufferId = File->getBufferID().getValue();
+  unsigned BufferId = File->getBufferID().value();
   StartLoc = SM.getLocForOffset(BufferId, Offset);
   EndLoc = SM.getLocForOffset(BufferId, Offset + Length);
 }

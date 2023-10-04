@@ -3,6 +3,9 @@ add_swift_host_library(swiftFrontend STATIC
   ArgsToFrontendInputsConverter.cpp
   ArgsToFrontendOptionsConverter.cpp
   ArgsToFrontendOutputsConverter.cpp
+  CachedDiagnostics.cpp
+  CachingUtils.cpp
+  CompileJobCacheKey.cpp
   CompilerInvocation.cpp
   DependencyVerifier.cpp
   DiagnosticVerifier.cpp
@@ -33,3 +36,10 @@ target_link_libraries(swiftFrontend PRIVATE
   swiftSymbolGraphGen)
 
 set_swift_llvm_is_available(swiftFrontend)
+
+if (SWIFT_BUILD_SWIFT_SYNTAX)
+  target_compile_definitions(swiftFrontend
+    PRIVATE
+    SWIFT_BUILD_SWIFT_SYNTAX
+    )
+endif()

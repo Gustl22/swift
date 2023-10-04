@@ -16,6 +16,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/PluginLoader.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/Basic/Defer.h"
@@ -189,7 +190,17 @@ void retypeCheckFunctionBody(AbstractFunctionDecl *func,
   SourceRange newRange{rangeStartLoc, rangeEndLoc};
 
   // Reset the body range of the function decl, and re-typecheck it.
-  origSM.setReplacedRange(func->getOriginalBodySourceRange(), newRange);
+  origSM.setGeneratedSourceInfo(
+      sliceBufferID,
+      GeneratedSourceInfo{
+        GeneratedSourceInfo::ReplacedFunctionBody,
+        Lexer::getCharSourceRangeFromSourceRange(
+          origSM, func->getOriginalBodySourceRange()),
+        Lexer::getCharSourceRangeFromSourceRange(origSM, newRange),
+        func,
+        nullptr
+      }
+  );
   func->setBodyToBeReparsed(newRange);
   (void)func->getTypecheckedBody();
 }
@@ -207,9 +218,9 @@ bool CompileInstance::performCachedSemaIfPossible(DiagnosticConsumer *DiagC) {
   auto FS = SM.getFileSystem();
 
   if (shouldCheckDependencies()) {
-    if (areAnyDependentFilesInvalidated(*CI, *FS, /*excludeBufferID=*/None,
-                                        DependencyCheckedTimestamp,
-                                        InMemoryDependencyHash)) {
+    if (areAnyDependentFilesInvalidated(
+            *CI, *FS, /*excludeBufferID=*/llvm::None,
+            DependencyCheckedTimestamp, InMemoryDependencyHash)) {
       return true;
     }
     DependencyCheckedTimestamp = std::chrono::system_clock::now();
@@ -251,10 +262,14 @@ bool CompileInstance::setupCI(
                DiagnosticDocumentationPath.c_str()});
   args.append(origArgs.begin(), origArgs.end());
 
+  SmallString<256> driverPath(SwiftExecutablePath);
+  llvm::sys::path::remove_filename(driverPath);
+  llvm::sys::path::append(driverPath, "swiftc");
+
   CompilerInvocation invocation;
   bool invocationCreationFailed =
       driver::getSingleFrontendInvocationFromDriverArguments(
-          args, Diags,
+          driverPath, args, Diags,
           [&](ArrayRef<const char *> FrontendArgs) {
             return invocation.parseArgs(FrontendArgs, Diags);
           },
@@ -289,6 +304,7 @@ bool CompileInstance::setupCI(
     assert(Diags.hadAnyError());
     return false;
   }
+  CI->getASTContext().getPluginLoader().setRegistry(Plugins.get());
 
   return true;
 }
@@ -329,7 +345,7 @@ bool CompileInstance::performSema(
   CachedArgHash = ArgsHash;
   CachedReuseCount = 0;
   InMemoryDependencyHash.clear();
-  cacheDependencyHashIfNeeded(*CI, /*excludeBufferID=*/None,
+  cacheDependencyHashIfNeeded(*CI, /*excludeBufferID=*/llvm::None,
                               InMemoryDependencyHash);
 
   // Perform!

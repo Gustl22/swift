@@ -148,6 +148,9 @@ struct Obligation {
   public:
     Key() = delete;
 
+  private:
+    Key(StringRef Name, Expectation::Kind Kind) : Name(Name), Kind(Kind) {}
+
   public:
     static Key forNegative(StringRef name) {
       return Key{name, Expectation::Kind::Negative};
@@ -326,7 +329,7 @@ bool DependencyVerifier::parseExpectations(
     return true;
   }
 
-  const auto BufferID = MaybeBufferID.getValue();
+  const auto BufferID = MaybeBufferID.value();
   const CharSourceRange EntireRange = SM.getRangeForBuffer(BufferID);
   const StringRef InputFile = SM.extractText(EntireRange);
 

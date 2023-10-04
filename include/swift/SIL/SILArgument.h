@@ -28,19 +28,6 @@ class SILPhiArgument;
 class SILUndef;
 class TermInst;
 
-// Map an argument index onto a SILArgumentConvention.
-inline SILArgumentConvention
-SILFunctionConventions::getSILArgumentConvention(unsigned index) const {
-  assert(index <= getNumSILArguments());
-  if (index < getNumIndirectSILResults()) {
-    assert(silConv.loweredAddresses);
-    return SILArgumentConvention::Indirect_Out;
-  } else {
-    auto param = funcTy->getParameters()[index - getNumIndirectSILResults()];
-    return SILArgumentConvention(param.getConvention());
-  }
-}
-
 struct SILArgumentKind {
   enum innerty : std::underlying_type<ValueKind>::type {
 #define ARGUMENT(ID, PARENT) ID = unsigned(SILNodeKind::ID),
@@ -53,14 +40,14 @@ struct SILArgumentKind {
   SILArgumentKind(innerty value) : value(value) {}
   operator innerty() const { return value; }
 
-  static Optional<SILArgumentKind> fromValueKind(ValueKind kind) {
+  static llvm::Optional<SILArgumentKind> fromValueKind(ValueKind kind) {
     switch (kind) {
 #define ARGUMENT(ID, PARENT)                                                   \
   case ValueKind::ID:                                                          \
     return SILArgumentKind(ID);
 #include "swift/SIL/SILNodes.def"
     default:
-      return None;
+      return llvm::None;
     }
   }
 };
@@ -75,16 +62,21 @@ class SILArgument : public ValueBase {
 protected:
   SILArgument(ValueKind subClassKind, SILBasicBlock *inputParentBlock,
               SILType type, ValueOwnershipKind ownershipKind,
-              const ValueDecl *inputDecl = nullptr);
+              const ValueDecl *inputDecl = nullptr, bool reborrow = false,
+              bool pointerEscape = false);
 
   // A special constructor, only intended for use in
   // SILBasicBlock::replacePHIArg and replaceFunctionArg.
   explicit SILArgument(ValueKind subClassKind, SILType type,
                        ValueOwnershipKind ownershipKind,
-                       const ValueDecl *inputDecl = nullptr)
-      : ValueBase(subClassKind, type),
-        parentBlock(nullptr), decl(inputDecl) {
+                       const ValueDecl *inputDecl = nullptr,
+                       bool reborrow = false, bool pointerEscape = false)
+      : ValueBase(subClassKind, type), parentBlock(nullptr), decl(inputDecl) {
     sharedUInt8().SILArgument.valueOwnershipKind = uint8_t(ownershipKind);
+    // When the optimizer creates reborrows, reborrow flag needs to be set by
+    // calling setReborrow.
+    sharedUInt8().SILArgument.reborrow = false;
+    sharedUInt8().SILArgument.pointerEscape = false;
   }
 
 public:
@@ -95,8 +87,39 @@ public:
     return ValueOwnershipKind(sharedUInt8().SILArgument.valueOwnershipKind);
   }
 
+  bool isScoped() const {
+    auto ownershipKind = getOwnershipKind();
+    if (ownershipKind == OwnershipKind::Owned) {
+      return true;
+    }
+    if (ownershipKind != OwnershipKind::Guaranteed) {
+      return false;
+    }
+    return isReborrow();
+  }
+
+  bool isReborrow() const {
+    return ValueOwnershipKind(sharedUInt8().SILArgument.reborrow);
+  }
+
+  bool isGuaranteedForwarding() const {
+    return getOwnershipKind() == OwnershipKind::Guaranteed && !isReborrow();
+  }
+
+  bool hasPointerEscape() const {
+    return ValueOwnershipKind(sharedUInt8().SILArgument.pointerEscape);
+  }
+
   void setOwnershipKind(ValueOwnershipKind newKind) {
     sharedUInt8().SILArgument.valueOwnershipKind = uint8_t(newKind);
+  }
+
+  void setReborrow(bool isReborrow) {
+    sharedUInt8().SILArgument.reborrow = isReborrow;
+  }
+
+  void setHasPointerEscape(bool hasPointerEscape) {
+    sharedUInt8().SILArgument.pointerEscape = hasPointerEscape;
   }
 
   SILBasicBlock *getParent() const { return parentBlock; }
@@ -126,7 +149,7 @@ public:
   unsigned getIndex() const;
 
   /// Return non-null if \p value is a phi.
-  static SILPhiArgument *isPhi(SILValue value);
+  static SILPhiArgument *asPhi(SILValue value);
 
   /// Return non-null if \p value is a terminator result.
   static SILPhiArgument *isTerminatorResult(SILValue value);
@@ -145,10 +168,15 @@ public:
   /// If this argument is a phi, populate `OutArray` with the incoming phi
   /// values for each predecessor BB. If this argument is not a phi, return
   /// false.
+  ///
+  /// If this block has no predecessors, returnedPhiValues will be empty.
   bool getIncomingPhiValues(SmallVectorImpl<SILValue> &returnedPhiValues) const;
 
   /// If this argument is a phi, populate `OutArray` with each predecessor block
   /// and its incoming phi value. If this argument is not a phi, return false.
+  ///
+  /// If this block has no predecessors, returnedPredAndPhiValuePairs will be
+  /// empty.
   bool
   getIncomingPhiValues(SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
                            &returnedPredAndPhiValuePairs) const;
@@ -173,7 +201,7 @@ public:
   /// Note: this peeks through any projections or cast implied by the
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
-  bool getSingleTerminatorOperands(
+  [[nodiscard]] bool getSingleTerminatorOperands(
       SmallVectorImpl<SILValue> &returnedSingleTermOperands) const;
 
   /// Returns true if we were able to find single terminator operand values for
@@ -183,17 +211,9 @@ public:
   /// Note: this peeks through any projections or cast implied by the
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
-  bool getSingleTerminatorOperands(
+  [[nodiscard]] bool getSingleTerminatorOperands(
       SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
           &returnedSingleTermOperands) const;
-
-  /// If this SILArgument's parent block has a single predecessor whose
-  /// terminator has a single operand, return the incoming operand of the
-  /// predecessor's terminator. Returns SILValue() otherwise.  Note that for
-  /// some predecessor terminators the incoming value is not exactly the
-  /// argument value. E.g. the incoming value for a switch_enum payload argument
-  /// is the enum itself (the operand of the switch_enum).
-  SILValue getSingleTerminatorOperand() const;
 
   /// If this SILArgument's parent block has a single predecessor whose
   /// terminator has a single operand, return that terminator.
@@ -202,6 +222,13 @@ public:
   /// Return the terminator instruction for which this argument is a result,
   /// otherwise return nullptr.
   TermInst *getTerminatorForResult() const;
+
+  /// If this terminator result forwards an operand, then return it.
+  ///
+  /// Precondition: this->isTerminatorResult()
+  ///
+  /// TODO: Move this and other APIs into a TerminatorResult abstraction.
+  Operand *forwardedTerminatorResultOperand() const;
 
   /// Return the SILArgumentKind of this argument.
   SILArgumentKind getKind() const {
@@ -214,28 +241,32 @@ protected:
   }
 };
 
-inline SILArgument *castToArgument(SwiftObject argument) {
-  return static_cast<SILArgument *>(argument);
-}
-
 class SILPhiArgument : public SILArgument {
   friend class SILBasicBlock;
 
   SILPhiArgument(SILBasicBlock *parentBlock, SILType type,
                  ValueOwnershipKind ownershipKind,
-                 const ValueDecl *decl = nullptr)
+                 const ValueDecl *decl = nullptr, bool isReborrow = false,
+                 bool hasPointerEscape = false)
       : SILArgument(ValueKind::SILPhiArgument, parentBlock, type, ownershipKind,
-                    decl) {}
+                    decl, isReborrow, hasPointerEscape) {}
+
   // A special constructor, only intended for use in
   // SILBasicBlock::replacePHIArg.
   explicit SILPhiArgument(SILType type, ValueOwnershipKind ownershipKind,
-                          const ValueDecl *decl = nullptr)
-      : SILArgument(ValueKind::SILPhiArgument, type, ownershipKind, decl) {}
+                          const ValueDecl *decl = nullptr,
+                          bool isReborrow = false,
+                          bool hasPointerEscape = false)
+      : SILArgument(ValueKind::SILPhiArgument, type, ownershipKind, decl,
+                    isReborrow, hasPointerEscape) {}
 
 public:
   /// Return true if this is block argument is a phi, as opposed to a terminator
   /// result.
   bool isPhi() const;
+
+  /// Whether any of the values incoming to this phi are lexical.
+  bool isLexical() const;
 
   /// Return true if this block argument is a terminator result.
   bool isTerminatorResult() const { return !isPhi(); }
@@ -287,7 +318,7 @@ public:
   ///
   /// Returns false when called on a non-phi and when the visitor returns false.
   bool visitTransitiveIncomingPhiOperands(
-      function_ref<bool(SILPhiArgument *, Operand *)> visitor);
+      function_ref<bool(SILPhiArgument *, Operand *)> visitor) const;
 
   /// Returns true if we were able to find a single terminator operand value for
   /// each predecessor of this arguments basic block. The found values are
@@ -296,7 +327,7 @@ public:
   /// Note: this peeks through any projections or cast implied by the
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
-  bool getSingleTerminatorOperands(
+  [[nodiscard]] bool getSingleTerminatorOperands(
       SmallVectorImpl<SILValue> &returnedSingleTermOperands) const;
 
   /// Returns true if we were able to find single terminator operand values for
@@ -306,17 +337,9 @@ public:
   /// Note: this peeks through any projections or cast implied by the
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
-  bool getSingleTerminatorOperands(
+  [[nodiscard]] bool getSingleTerminatorOperands(
       SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
           &returnedSingleTermOperands) const;
-
-  /// If this SILArgument's parent block has a single predecessor whose
-  /// terminator has a single operand, return the incoming operand of the
-  /// predecessor's terminator. Returns SILValue() otherwise.  Note that for
-  /// some predecessor terminators the incoming value is not exactly the
-  /// argument value. E.g. the incoming value for a switch_enum payload argument
-  /// is the enum itself (the operand of the switch_enum).
-  SILValue getSingleTerminatorOperand() const;
 
   /// If this SILArgument's parent block has a single predecessor whose
   /// terminator has a single operand, return that terminator.
@@ -336,18 +359,23 @@ public:
 class SILFunctionArgument : public SILArgument {
   friend class SILBasicBlock;
 
-  bool noImplicitCopy = false;
-  LifetimeAnnotation lifetimeAnnotation = LifetimeAnnotation::None;
+  USE_SHARED_UINT32;
 
   SILFunctionArgument(
       SILBasicBlock *parentBlock, SILType type,
       ValueOwnershipKind ownershipKind, const ValueDecl *decl = nullptr,
       bool isNoImplicitCopy = false,
-      LifetimeAnnotation lifetimeAnnotation = LifetimeAnnotation::None)
+      LifetimeAnnotation lifetimeAnnotation = LifetimeAnnotation::None,
+      bool isCapture = false,
+      bool isParameterPack = false)
       : SILArgument(ValueKind::SILFunctionArgument, parentBlock, type,
-                    ownershipKind, decl),
-        noImplicitCopy(isNoImplicitCopy),
-        lifetimeAnnotation(lifetimeAnnotation) {}
+                    ownershipKind, decl) {
+    sharedUInt32().SILFunctionArgument.noImplicitCopy = isNoImplicitCopy;
+    sharedUInt32().SILFunctionArgument.lifetimeAnnotation = lifetimeAnnotation;
+    sharedUInt32().SILFunctionArgument.closureCapture = isCapture;
+    sharedUInt32().SILFunctionArgument.parameterPack = isParameterPack;
+  }
+
   // A special constructor, only intended for use in
   // SILBasicBlock::replaceFunctionArg.
   explicit SILFunctionArgument(SILType type, ValueOwnershipKind ownershipKind,
@@ -356,16 +384,45 @@ class SILFunctionArgument : public SILArgument {
   }
 
 public:
-  bool isNoImplicitCopy() const { return noImplicitCopy; }
+  bool isNoImplicitCopy() const {
+    return sharedUInt32().SILFunctionArgument.noImplicitCopy;
+  }
 
-  void setNoImplicitCopy(bool newValue) { noImplicitCopy = newValue; }
+  void setNoImplicitCopy(bool newValue) {
+    sharedUInt32().SILFunctionArgument.noImplicitCopy = newValue;
+  }
+
+  bool isClosureCapture() const {
+    return sharedUInt32().SILFunctionArgument.closureCapture;
+  }
+  void setClosureCapture(bool newValue) {
+    sharedUInt32().SILFunctionArgument.closureCapture = newValue;
+  }
+
+  /// Is this parameter a pack that corresponds to multiple
+  /// formal parameters?  (This could mean multiple ParamDecl*s,
+  /// or it could mean a ParamDecl* that's a pack expansion.)  Note
+  /// that not all lowered parameters of pack type are parameter packs:
+  /// they can be part of a single formal parameter of tuple type.
+  /// This flag indicates that the lowered parameter has a one-to-many
+  /// relationship with formal parameters.
+  ///
+  /// TODO: preserve the parameter pack references in SIL in a side table
+  /// instead of using a single bit.
+  bool isFormalParameterPack() const {
+    return sharedUInt32().SILFunctionArgument.parameterPack;
+  }
+  void setFormalParameterPack(bool isPack) {
+    sharedUInt32().SILFunctionArgument.parameterPack = isPack;
+  }
 
   LifetimeAnnotation getLifetimeAnnotation() const {
-    return lifetimeAnnotation;
+    return LifetimeAnnotation::Case(
+        sharedUInt32().SILFunctionArgument.lifetimeAnnotation);
   }
 
   void setLifetimeAnnotation(LifetimeAnnotation newValue) {
-    lifetimeAnnotation = newValue;
+    sharedUInt32().SILFunctionArgument.lifetimeAnnotation = newValue;
   }
 
   Lifetime getLifetime() const {
@@ -394,6 +451,17 @@ public:
     return getArgumentConvention() == convention;
   }
 
+  /// Copy all flags stored in this->sharedUInt32() into arg.
+  ///
+  /// By using this API, cloners can be sure they are updated for the addition
+  /// of further flags.
+  void copyFlags(SILFunctionArgument *arg) {
+    setNoImplicitCopy(arg->isNoImplicitCopy());
+    setLifetimeAnnotation(arg->getLifetimeAnnotation());
+    setClosureCapture(arg->isClosureCapture());
+    setFormalParameterPack(arg->isFormalParameterPack());
+  }
+
   static bool classof(const SILInstruction *) = delete;
   static bool classof(const SILUndef *) = delete;
   static bool classof(SILNodePointer node) {
@@ -406,7 +474,7 @@ public:
 //===----------------------------------------------------------------------===//
 
 /// Return non-null if \p value is a real phi argument.
-inline SILPhiArgument *SILArgument::isPhi(SILValue value) {
+inline SILPhiArgument *SILArgument::asPhi(SILValue value) {
   if (auto *arg = dyn_cast<SILPhiArgument>(value)) {
     if (arg->isPhi())
       return arg;

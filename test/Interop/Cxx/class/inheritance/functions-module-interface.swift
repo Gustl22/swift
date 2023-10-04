@@ -29,6 +29,10 @@
 // CHECK-NEXT:   @available(swift, obsoleted: 3, renamed: "swiftRenamed(input:)")
 // CHECK-NEXT:   mutating func renamed(_ i: Int32) -> Int32
 // CHECK-NEXT:   @_effects(readonly) func pure()
+// CHECK-NEXT:   @discardableResult
+// CHECK-NEXT:   func sameMethodNameSameSignature() -> Int32
+// CHECK-NEXT:   @discardableResult
+// CHECK-NEXT:   func sameMethodDifferentSignature() -> Int32
 // CHECK-NEXT: }
 
 // CHECK-NEXT: struct OtherBase {
@@ -42,6 +46,10 @@
 // CHECK-NEXT:   @discardableResult
 // CHECK-NEXT:   func inDerived() -> UnsafePointer<CChar>!
 // CHECK-NEXT:   @discardableResult
+// CHECK-NEXT:   func sameMethodNameSameSignature() -> Int32
+// CHECK-NEXT:   @discardableResult
+// CHECK-NEXT:   func sameMethodDifferentSignature(_ x: Int32) -> Int32
+// CHECK-NEXT:   @discardableResult
 // CHECK-NEXT:   mutating func mutatingInBase() -> UnsafePointer<CChar>?
 // CHECK-NEXT:   @discardableResult
 // CHECK-NEXT:   func constInBase() -> UnsafePointer<CChar>?
@@ -56,6 +64,8 @@
 // CHECK-NEXT:   @available(swift, obsoleted: 3, renamed: "swiftRenamed(input:)")
 // CHECK-NEXT:   mutating func renamed(_ i: Int32) -> Int32
 // CHECK-NEXT:   @_effects(readonly) func pure()
+// CHECK-NEXT:   @discardableResult
+// CHECK-NEXT:   func sameMethodDifferentSignature() -> Int32
 // CHECK-NEXT:   @discardableResult
 // CHECK-NEXT:   func inOtherBase() -> UnsafePointer<CChar>?
 // CHECK-NEXT: }
@@ -67,6 +77,10 @@
 // CHECK-NEXT:   @discardableResult
 // CHECK-NEXT:   func inDerived() -> UnsafePointer<CChar>?
 // CHECK-NEXT:   @discardableResult
+// CHECK-NEXT:   func sameMethodNameSameSignature() -> Int32
+// CHECK-NEXT:   @discardableResult
+// CHECK-NEXT:   func sameMethodDifferentSignature(_ x: Int32) -> Int32
+// CHECK-NEXT:   @discardableResult
 // CHECK-NEXT:   mutating func mutatingInBase() -> UnsafePointer<CChar>?
 // CHECK-NEXT:   @discardableResult
 // CHECK-NEXT:   func constInBase() -> UnsafePointer<CChar>?
@@ -82,6 +96,8 @@
 // CHECK-NEXT:   mutating func renamed(_ i: Int32) -> Int32
 // CHECK-NEXT:   @_effects(readonly) func pure()
 // CHECK-NEXT:   @discardableResult
+// CHECK-NEXT:   func sameMethodDifferentSignature() -> Int32
+// CHECK-NEXT:   @discardableResult
 // CHECK-NEXT:   func inOtherBase() -> UnsafePointer<CChar>?
 // CHECK-NEXT: }
 
@@ -91,4 +107,12 @@
 // CHECK-NEXT:   func inNonTrivial() -> UnsafePointer<CChar>?
 // CHECK-NEXT:   @discardableResult
 // CHECK-NEXT:   func inNonTrivialWithArgs(_ a: Int32, _ b: Int32) -> UnsafePointer<CChar>?
+// CHECK-NEXT: }
+
+// CHECK-NEXT: struct PrivatelyInherited {
+// CHECK-NEXT:   init()
+// CHECK-NEXT: }
+
+// CHECK-NEXT: struct ProtectedInherited {
+// CHECK-NEXT:   init()
 // CHECK-NEXT: }

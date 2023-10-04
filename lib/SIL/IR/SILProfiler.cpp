@@ -86,20 +86,37 @@ static NodeToProfile getNodeToProfile(SILDeclRef Constant) {
 /// Check whether we should profile a given SILDeclRef.
 static bool shouldProfile(SILDeclRef Constant) {
   auto Root = getNodeToProfile(Constant);
+  auto *DC = Constant.getInnermostDeclContext();
 
-  // Do not profile AST nodes with invalid source locations.
   if (auto N = Root.getAsNode()) {
+    // Do not profile AST nodes with invalid source locations.
     if (N.getStartLoc().isInvalid() || N.getEndLoc().isInvalid()) {
       LLVM_DEBUG(llvm::dbgs()
                  << "Skipping ASTNode: invalid start/end locations\n");
       return false;
     }
+
+    // Do not profile generated code. This includes macro expansions, which we
+    // otherwise consider to be "written by the user", because they wrote the
+    // macro attribute or expr. We may want to revist this in the future. We'll
+    // need to figure out how we'll be writing out the macro expansions though,
+    // such that they can be referenced by llvm-cov.
+    // Note we check `getSourceFileContainingLocation` instead of
+    // `getParentSourceFile` to make sure initializer exprs are correctly
+    // handled.
+    auto *M = DC->getParentModule();
+    if (auto *SF = M->getSourceFileContainingLocation(N.getStartLoc())) {
+      auto &SM = M->getASTContext().SourceMgr;
+      if (SM.hasGeneratedSourceInfo(*SF->getBufferID())) {
+        LLVM_DEBUG(llvm::dbgs() << "Skipping ASTNode: generated code\n");
+        return false;
+      }
+    }
   }
 
   // Do not profile AST nodes in unavailable contexts.
-  auto *DC = Constant.getInnermostDeclContext();
   if (auto *D = DC->getInnermostDeclarationDeclContext()) {
-    if (D->isSemanticallyUnavailable()) {
+    if (D->getSemanticUnavailableAttr()) {
       LLVM_DEBUG(llvm::dbgs() << "Skipping ASTNode: unavailable context\n");
       return false;
     }
@@ -213,8 +230,6 @@ shouldWalkIntoExpr(Expr *E, ASTWalker::ParentTy Parent, SILDeclRef Constant) {
     // initializer instead.
     if (!Parent.isNull() || !Constant || !Constant.getAbstractClosureExpr())
       return Action::SkipChildren(E);
-
-    assert(CE->hasBody());
   }
   return Action::Continue(E);
 }
@@ -269,6 +284,10 @@ struct MapRegionCounters : public ASTWalker {
     });
 
     ++NextCounter;
+  }
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
   }
 
   PreWalkAction walkToDeclPre(Decl *D) override {
@@ -334,7 +353,7 @@ using CounterAllocator = llvm::SpecificBumpPtrAllocator<CounterExprStorage>;
 class CounterExpr {
   enum class Kind { Leaf, Add, Sub, Zero };
   Kind K;
-  Optional<ProfileCounterRef> Counter;
+  llvm::Optional<ProfileCounterRef> Counter;
   const CounterExprStorage *Storage = nullptr;
 
   CounterExpr(Kind K) : K(K) {
@@ -491,17 +510,18 @@ class SourceMappingRegion {
 
   /// The counter for an incomplete region. Note we do not store counters
   /// for nodes, as we need to be able to fix them up after popping the regions.
-  Optional<CounterExpr> Counter;
+  llvm::Optional<CounterExpr> Counter;
 
   /// The region's starting location.
-  Optional<SourceLoc> StartLoc;
+  llvm::Optional<SourceLoc> StartLoc;
 
   /// The region's ending location.
-  Optional<SourceLoc> EndLoc;
+  llvm::Optional<SourceLoc> EndLoc;
 
 public:
-  SourceMappingRegion(ASTNode Node, Optional<CounterExpr> Counter,
-                      Optional<SourceLoc> StartLoc, Optional<SourceLoc> EndLoc)
+  SourceMappingRegion(ASTNode Node, llvm::Optional<CounterExpr> Counter,
+                      llvm::Optional<SourceLoc> StartLoc,
+                      llvm::Optional<SourceLoc> EndLoc)
       : Node(Node), Counter(std::move(Counter)), StartLoc(StartLoc),
         EndLoc(EndLoc) {
     assert((!StartLoc || StartLoc->isValid()) &&
@@ -525,7 +545,7 @@ public:
     return Iter->second;
   }
 
-  bool hasStartLoc() const { return StartLoc.hasValue(); }
+  bool hasStartLoc() const { return StartLoc.has_value(); }
 
   void setStartLoc(SourceLoc Loc) {
     assert(Loc.isValid());
@@ -537,7 +557,7 @@ public:
     return *StartLoc;
   }
 
-  bool hasEndLoc() const { return EndLoc.hasValue(); }
+  bool hasEndLoc() const { return EndLoc.has_value(); }
 
   void setEndLoc(SourceLoc Loc) {
     assert(Loc.isValid());
@@ -681,6 +701,10 @@ struct PGOMapping : public ASTWalker {
     return LazyInitializerWalking::InAccessor;
   }
 
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
+  }
+
   PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
     unsigned parent = getParentCounter();
     auto parentCount = LoadedCounts.Counts[parent];
@@ -799,7 +823,7 @@ private:
   /// A stack of active do-catch statements.
   std::vector<DoCatchStmt *> DoCatchStack;
 
-  Optional<CounterExpr> ExitCounter;
+  llvm::Optional<CounterExpr> ExitCounter;
 
   Stmt *ImplicitTopLevelBody = nullptr;
 
@@ -887,19 +911,20 @@ private:
   ///
   /// Returns the delta of the count on entering \c Node and exiting, or null if
   /// there was no change.
-  Optional<CounterExpr> setExitCount(ASTNode Node) {
+  llvm::Optional<CounterExpr> setExitCount(ASTNode Node) {
     ExitCounter = getCurrentCounter();
     if (hasCounter(Node) && getRegion().getNode() != Node)
       return CounterExpr::Sub(getCounter(Node), *ExitCounter, CounterAlloc);
-    return None;
+    return llvm::None;
   }
 
   /// Adjust the count for control flow when exiting a scope.
-  void adjustForNonLocalExits(ASTNode Scope, Optional<CounterExpr> ControlFlowAdjust) {
+  void adjustForNonLocalExits(ASTNode Scope,
+                              llvm::Optional<CounterExpr> ControlFlowAdjust) {
     if (Parent.getAsDecl())
       return;
 
-    Optional<CounterExpr> JumpsToLabel;
+    llvm::Optional<CounterExpr> JumpsToLabel;
     Stmt *ParentStmt = Parent.getAsStmt();
     if (ParentStmt) {
       if (isa<DoCatchStmt>(ParentStmt))
@@ -929,7 +954,7 @@ private:
   void pushRegion(ASTNode Node) {
     // Note we don't store counters for nodes, as we need to be able to fix
     // them up later.
-    RegionStack.emplace_back(Node, /*Counter*/ None, Node.getStartLoc(),
+    RegionStack.emplace_back(Node, /*Counter*/ llvm::None, Node.getStartLoc(),
                              getEndLoc(Node));
     LLVM_DEBUG({
       llvm::dbgs() << "Pushed region: ";
@@ -941,14 +966,14 @@ private:
   /// Replace the current region at \p Start with a new counter. If \p Start is
   /// \c None, or the counter is semantically zero, an 'incomplete' region is
   /// formed, which is not recorded unless followed by additional AST nodes.
-  void replaceCount(CounterExpr Counter, Optional<SourceLoc> Start) {
+  void replaceCount(CounterExpr Counter, llvm::Optional<SourceLoc> Start) {
     // If the counter is semantically zero, form an 'incomplete' region with
     // no starting location. This prevents forming unreachable regions unless
     // there is a following statement or expression to extend the region.
     if (Start && Counter.isSemanticallyZero())
-      Start = None;
+      Start = llvm::None;
 
-    RegionStack.emplace_back(ASTNode(), Counter, Start, None);
+    RegionStack.emplace_back(ASTNode(), Counter, Start, llvm::None);
   }
 
   /// Get the location for the end of the last token in \c Node.
@@ -1010,7 +1035,7 @@ private:
     SourceMappingRegion &Region = getRegion();
     if (!Region.hasEndLoc())
       Region.setEndLoc(getEndLoc(S));
-    replaceCount(CounterExpr::Zero(), /*Start*/ None);
+    replaceCount(CounterExpr::Zero(), /*Start*/ llvm::None);
   }
 
   Expr *getConditionNode(StmtCondition SC) {
@@ -1028,12 +1053,16 @@ public:
     return LazyInitializerWalking::InAccessor;
   }
 
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
+  }
+
   /// Generate the coverage counter mapping regions from collected
   /// source regions.
   SILCoverageMap *emitSourceRegions(
       SILModule &M, StringRef Name, StringRef PGOFuncName, uint64_t Hash,
       llvm::DenseMap<ProfileCounterRef, unsigned> &CounterIndices,
-      StringRef Filename) {
+      SourceFile *SF, StringRef Filename) {
     if (SourceRegions.empty())
       return nullptr;
 
@@ -1051,8 +1080,8 @@ public:
       Regions.emplace_back(Start.first, Start.second, End.first, End.second,
                            Counter.expand(Builder, CounterIndices));
     }
-    return SILCoverageMap::create(M, Filename, Name, PGOFuncName, Hash, Regions,
-                                  Builder.getExpressions());
+    return SILCoverageMap::create(M, SF, Filename, Name, PGOFuncName, Hash,
+                                  Regions, Builder.getExpressions());
   }
 
   PreWalkAction walkToDeclPre(Decl *D) override {
@@ -1331,13 +1360,6 @@ getEquivalentPGOLinkage(FormalLinkage Linkage) {
   llvm_unreachable("Unhandled FormalLinkage in switch.");
 }
 
-static StringRef getCurrentFileName(SILDeclRef forDecl) {
-  auto *DC = forDecl.getInnermostDeclContext();
-  if (auto *ParentFile = DC->getParentSourceFile())
-    return ParentFile->getFilename();
-  return {};
-}
-
 static void walkNode(NodeToProfile Node, ASTWalker &Walker) {
   if (auto N = Node.getAsNode()) {
     N.walk(Walker);
@@ -1350,8 +1372,11 @@ static void walkNode(NodeToProfile Node, ASTWalker &Walker) {
 
 void SILProfiler::assignRegionCounters() {
   const auto &SM = M.getASTContext().SourceMgr;
+  auto *DC = forDecl.getInnermostDeclContext();
+  auto *SF = DC->getParentSourceFile();
+  assert(SF && "Not within a SourceFile?");
 
-  CurrentFileName = getCurrentFileName(forDecl);
+  CurrentFileName = SF->getFilename();
 
   MapRegionCounters Mapper(forDecl, RegionCounterMap);
 
@@ -1387,7 +1412,7 @@ void SILProfiler::assignRegionCounters() {
     walkNode(Root, Coverage);
     CovMap =
         Coverage.emitSourceRegions(M, CurrentFuncName, PGOFuncName, PGOFuncHash,
-                                   RegionCounterMap, CurrentFileName);
+                                   RegionCounterMap, SF, CurrentFileName);
   }
 
   if (llvm::IndexedInstrProfReader *IPR = M.getPGOReader()) {
@@ -1421,13 +1446,13 @@ ProfileCounter SILProfiler::getExecutionCount(ASTNode Node) {
   return getExecutionCount(ProfileCounterRef::node(Node));
 }
 
-Optional<ASTNode> SILProfiler::getPGOParent(ASTNode Node) {
+llvm::Optional<ASTNode> SILProfiler::getPGOParent(ASTNode Node) {
   if (!Node || !M.getPGOReader() || !hasRegionCounters()) {
-    return None;
+    return llvm::None;
   }
   auto it = RegionCondToParentMap.find(Node);
   if (it == RegionCondToParentMap.end()) {
-    return None;
+    return llvm::None;
   }
   return it->getSecond();
 }

@@ -33,6 +33,7 @@ add_swift_host_library(swiftIRGen STATIC
   GenMeta.cpp
   GenObjC.cpp
   GenOpaque.cpp
+  GenPack.cpp
   GenPointerAuth.cpp
   GenPoly.cpp
   GenProto.cpp
@@ -58,6 +59,7 @@ add_swift_host_library(swiftIRGen STATIC
   MetadataLayout.cpp
   MetadataRequest.cpp
   Outlining.cpp
+  PackMetadataMarkerInserter.cpp
   StructLayout.cpp
   SwiftTargetInfo.cpp
   TBDGen.cpp

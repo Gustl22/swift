@@ -16,14 +16,14 @@ fe(.nope, .nyet) // expected-error {{type 'Int' has no member 'nope'}}
 // expected-error@-1 {{reference to member 'nyet' cannot be resolved without a contextual type}}
 
 func fg<T>(_ f: (T) -> T) -> Void {}
-fg({x in x}) // expected-error {{unable to infer type of a closure parameter 'x' in the current context}}
+fg({x in x}) // expected-error {{cannot infer type of closure parameter 'x' without a type annotation}}
 
 
 struct S {
   func f<T>(_ i: (T) -> T, _ j: Int) -> Void {}
   func f(_ d: (Double) -> Double) -> Void {}
   func test() -> Void {
-    f({x in x}, 2) // expected-error {{unable to infer type of a closure parameter 'x' in the current context}}
+    f({x in x}, 2) // expected-error {{cannot infer type of closure parameter 'x' without a type annotation}}
   }
   
   func g<T>(_ a: T, _ b: Int) -> Void {}
@@ -148,8 +148,8 @@ do {
   }
 }
 do {
-  func f1(_ u: Int) -> String {} // expected-note {{found this candidate}} expected-note {{candidate expects value of type 'Int' for parameter #1 (got 'Double')}}
-  func f1(_ u: String) -> Double {} // expected-note {{found this candidate}} expected-note {{candidate expects value of type 'String' for parameter #1 (got 'Double')}}
+  func f1(_ u: Int) -> String {} // expected-note 2 {{candidate expects value of type 'Int' for parameter #1 (got 'Double')}}
+  func f1(_ u: String) -> Double {} // expected-note 2 {{candidate expects value of type 'String' for parameter #1 (got 'Double')}}
   func f2(_ u: Int) {}
 
   f2(f1(1 as Double)) // expected-error {{no exact matches in call to local function 'f1'}}

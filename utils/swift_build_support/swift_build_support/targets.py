@@ -122,6 +122,9 @@ class DarwinPlatform(Platform):
         # The names match up with the xcrun SDK names.
         xcrun_sdk_name = self.name
 
+        if (xcrun_sdk_name == 'watchos' and arch == 'armv7k'):
+            return True
+
         sdk_path = xcrun.sdk_path(sdk=xcrun_sdk_name, toolchain=toolchain)
         if not sdk_path:
             raise RuntimeError('Cannot find SDK path for %s' % xcrun_sdk_name)
@@ -257,14 +260,15 @@ class StdlibDeploymentTarget(object):
 
     # A platform that's not tied to any particular OS, and it meant to be used
     # to build the stdlib as standalone and/or statically linked.
-    Freestanding = Platform("freestanding",
-                            archs=["i386", "x86_64", "armv7", "armv7s", "armv7k",
-                                   "arm64", "arm64e"])
-    
+    Freestanding = Platform("freestanding", archs=[
+        "i386", "x86_64",
+        "armv7", "armv7s", "armv7k", "armv7m", "armv7em",
+        "arm64", "arm64e", "arm64_32"])
+
     Alpine = Platform("alpine", sdk_name='ALPINE', archs=[
         "x86_64",
         "i686",
-        "aarch64"])                  
+        "aarch64"])
 
     Linux = Platform("linux", archs=[
         "x86_64",
@@ -276,9 +280,10 @@ class StdlibDeploymentTarget(object):
         "powerpc",
         "powerpc64",
         "powerpc64le",
+        "riscv64",
         "s390x"])
 
-    FreeBSD = Platform("freebsd", archs=["x86_64"])
+    FreeBSD = Platform("freebsd", archs=["x86_64", "arm64"])
 
     OpenBSD = OpenBSDPlatform("openbsd", archs=["amd64"])
 
@@ -363,6 +368,8 @@ class StdlibDeploymentTarget(object):
                 return StdlibDeploymentTarget.Linux.powerpc64
             elif machine == 'ppc64le':
                 return StdlibDeploymentTarget.Linux.powerpc64le
+            elif machine == 'riscv64':
+                return StdlibDeploymentTarget.Linux.riscv64
             elif machine == 's390x':
                 return StdlibDeploymentTarget.Linux.s390x
 
@@ -377,6 +384,8 @@ class StdlibDeploymentTarget(object):
         elif system == 'FreeBSD':
             if machine == 'amd64':
                 return StdlibDeploymentTarget.FreeBSD.x86_64
+            elif machine == 'arm64':
+                return StdlibDeploymentTarget.FreeBSD.arm64
 
         elif system == 'OpenBSD':
             if machine == 'amd64':

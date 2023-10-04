@@ -2,8 +2,9 @@
 add_swift_host_library(swiftIDETool STATIC
   CompileInstance.cpp
   CompilerInvocation.cpp
-  CompletionInstance.cpp
+  IDEInspectionInstance.cpp
   DependencyChecking.cpp
+  SyntacticMacroExpansion.cpp
   )
 
 target_link_libraries(swiftIDETool PRIVATE

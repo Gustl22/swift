@@ -1,93 +1,40 @@
-if (SWIFT_SWIFT_PARSER)
-  # Ensure that we do not link the _StringProcessing module. But we can
-  # only pass this flag for new-enough compilers that support it.
-  file(WRITE "${CMAKE_BINARY_DIR}/tmp/empty-check-string-processing.swift" "")
-  execute_process(
-    COMMAND
-      "${CMAKE_Swift_COMPILER}"
-      -Xfrontend -disable-implicit-string-processing-module-import
-      -c - -o /dev/null
-    INPUT_FILE
-      "${CMAKE_BINARY_DIR}/tmp/empty-check-string-processing.swift"
-    OUTPUT_QUIET ERROR_QUIET
-    RESULT_VARIABLE
-      SWIFT_SUPPORTS_DISABLE_IMPLICIT_STRING_PROCESSING_MODULE_IMPORT)
-  if (NOT SWIFT_SUPPORTS_DISABLE_IMPLICIT_STRING_PROCESSING_MODULE_IMPORT)
-    add_compile_options(
-      $<$<COMPILE_LANGUAGE:Swift>:-Xfrontend>
-      $<$<COMPILE_LANGUAGE:Swift>:-disable-implicit-string-processing-module-import>)
-  endif()
+add_pure_swift_host_library(swiftLLVMJSON STATIC EMIT_MODULE
+  Sources/LLVMJSON/LLVMJSON.swift
 
-  add_library(swiftASTGen STATIC
-    Sources/ASTGen/ASTGen.swift
-    Sources/ASTGen/Decls.swift
-    Sources/ASTGen/Exprs.swift
-    Sources/ASTGen/Generics.swift
-    Sources/ASTGen/Literals.swift
-    Sources/ASTGen/Macros.swift
-    Sources/ASTGen/Misc.swift
-    Sources/ASTGen/SourceFile.swift
-    Sources/ASTGen/Stmts.swift
-    Sources/ASTGen/Types.swift
-  )
+  DEPENDENCIES
+    swiftBasic
+)
 
-  # Set the appropriate target triple.
-  if(SWIFT_HOST_VARIANT_SDK IN_LIST SWIFT_DARWIN_PLATFORMS)
-    set(DEPLOYMENT_VERSION "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_DEPLOYMENT_VERSION}")
-  endif()
+add_pure_swift_host_library(swiftASTGen STATIC
+  Sources/ASTGen/ASTGen.swift
+  Sources/ASTGen/Bridge.swift
+  Sources/ASTGen/Decls.swift
+  Sources/ASTGen/Diagnostics.swift
+  Sources/ASTGen/DiagnosticsBridge.swift
+  Sources/ASTGen/Exprs.swift
+  Sources/ASTGen/Generics.swift
+  Sources/ASTGen/Literals.swift
+  Sources/ASTGen/Macros.swift
+  Sources/ASTGen/ParameterClause.swift
+  Sources/ASTGen/PluginHost.swift
+  Sources/ASTGen/SourceFile.swift
+  Sources/ASTGen/SourceManager.swift
+  Sources/ASTGen/SourceManager+MacroExpansionContext.swift
+  Sources/ASTGen/Stmts.swift
+  Sources/ASTGen/Types.swift
 
-  if(SWIFT_HOST_VARIANT_SDK STREQUAL ANDROID)
-    set(DEPLOYMENT_VERSION ${SWIFT_ANDROID_API_LEVEL})
-  endif()
-
-  get_target_triple(target target_variant "${SWIFT_HOST_VARIANT_SDK}" "${SWIFT_HOST_VARIANT_ARCH}"
-    MACCATALYST_BUILD_FLAVOR ""
-    DEPLOYMENT_VERSION "${DEPLOYMENT_VERSION}")
-
-    target_compile_options(swiftASTGen PRIVATE $<$<COMPILE_LANGUAGE:Swift>:-target;${target}>)
-
-  # Workaround a cmake bug, see the corresponding function in swift-syntax
-  function(force_target_link_libraries TARGET)
-    cmake_parse_arguments(ARGS "" "" "PUBLIC" ${ARGN})
-
-    foreach(DEPENDENCY ${ARGS_PUBLIC})
-      # This is a hack to workaround a cmake bug that results in multiple ninja targets producing
-      # the same file in a downstream SourceKit target. This should use `PUBLIC`, the dependency
-      # directly (rather than `TARGET_OBJECTS`), and no `add_dependencies`.
-      target_link_libraries(${TARGET} PRIVATE
-       $<TARGET_OBJECTS:${DEPENDENCY}>
-      )
-      add_dependencies(${TARGET} ${DEPENDENCY})
-
-      add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forced-${DEPENDENCY}-dep.swift
-        COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/forced-${DEPENDENCY}-dep.swift
-        DEPENDS ${DEPENDENCY}
-        )
-      target_sources(${TARGET} PRIVATE
-        ${CMAKE_CURRENT_BINARY_DIR}/forced-${DEPENDENCY}-dep.swift
-      )
-    endforeach()
-  endfunction()
-
-  # TODO: Change to target_link_libraries when cmake is fixed
-  force_target_link_libraries(swiftASTGen PUBLIC
-    SwiftSyntax::SwiftBasicFormat
-    SwiftSyntax::SwiftParser
-    SwiftSyntax::SwiftParserDiagnostics
-    SwiftSyntax::SwiftDiagnostics
-    SwiftSyntax::SwiftSyntax
-    SwiftSyntax::SwiftOperators
-    SwiftSyntax::SwiftSyntaxBuilder
-    SwiftSyntax::_SwiftSyntaxMacros
-    SwiftSyntax::SwiftCompilerSupport
-  )
-  target_link_libraries(swiftASTGen PUBLIC
+  DEPENDENCIES
     swiftAST
-    swift_CompilerPluginSupport
-  )
-
-  target_include_directories(swiftASTGen PUBLIC
-    "${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR}/swift")
-
-  set_property(GLOBAL APPEND PROPERTY SWIFT_EXPORTS swiftASTGen)
-endif()
+  SWIFT_DEPENDENCIES
+    SwiftBasicFormat
+    SwiftCompilerPluginMessageHandling
+    SwiftDiagnostics
+    SwiftOperators
+    SwiftParser
+    SwiftParserDiagnostics
+    SwiftSyntax
+    SwiftSyntaxBuilder
+    SwiftSyntaxMacros
+    SwiftSyntaxMacroExpansion
+    swiftLLVMJSON
+)

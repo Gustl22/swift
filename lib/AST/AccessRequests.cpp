@@ -61,7 +61,17 @@ AccessLevelRequest::evaluate(Evaluator &evaluator, ValueDecl *D) const {
     case AccessorKind::DidSet:
       // These are only needed to synthesize the setter.
       return AccessLevel::Private;
+    case AccessorKind::Init:
+      // These are only called from designated initializers.
+      return AccessLevel::Private;
     }
+  }
+
+  // Special case for opaque type decls, which inherit the access of their
+  // naming decls.
+  if (auto *opaqueType = dyn_cast<OpaqueTypeDecl>(D)) {
+    if (auto *namingDecl = opaqueType->getNamingDecl())
+      return namingDecl->getFormalAccess();
   }
 
   DeclContext *DC = D->getDeclContext();
@@ -115,6 +125,8 @@ AccessLevelRequest::evaluate(Evaluator &evaluator, ValueDecl *D) const {
   case DeclContextKind::SubscriptDecl:
   case DeclContextKind::EnumElementDecl:
     return AccessLevel::Private;
+  case DeclContextKind::Package:
+    return AccessLevel::Package;
   case DeclContextKind::Module:
   case DeclContextKind::FileUnit:
     return AccessLevel::Internal;
@@ -128,18 +140,18 @@ AccessLevelRequest::evaluate(Evaluator &evaluator, ValueDecl *D) const {
   case DeclContextKind::ExtensionDecl:
     return cast<ExtensionDecl>(DC)->getDefaultAccessLevel();
   case DeclContextKind::MacroDecl:
-    // Macros are always public.
-    return AccessLevel::Public;
+    // There are no declarations inside a macro.
+    return AccessLevel::Private;
   }
   llvm_unreachable("unhandled kind");
 }
 
-Optional<AccessLevel> AccessLevelRequest::getCachedResult() const {
+llvm::Optional<AccessLevel> AccessLevelRequest::getCachedResult() const {
   auto valueDecl = std::get<0>(getStorage());
   if (valueDecl->hasAccess())
     return valueDecl->TypeAndAccess.getInt().getValue();
 
-  return None;
+  return llvm::None;
 }
 
 void AccessLevelRequest::cacheResult(AccessLevel value) const {
@@ -192,12 +204,12 @@ SetterAccessLevelRequest::evaluate(Evaluator &evaluator,
   return ASD->getFormalAccess();
 }
 
-Optional<AccessLevel> SetterAccessLevelRequest::getCachedResult() const {
+llvm::Optional<AccessLevel> SetterAccessLevelRequest::getCachedResult() const {
   auto abstractStorageDecl = std::get<0>(getStorage());
   if (abstractStorageDecl->Accessors.getInt().hasValue())
     return abstractStorageDecl->Accessors.getInt().getValue();
 
-  return None;
+  return llvm::None;
 }
 
 void SetterAccessLevelRequest::cacheResult(AccessLevel value) const {
@@ -229,7 +241,7 @@ DefaultAndMaxAccessLevelRequest::evaluate(Evaluator &evaluator,
     DirectlyReferencedTypeDecls typeDecls =
       evaluateOrDefault(Ctx.evaluator, TypeDeclsFromWhereClauseRequest{ED}, {});
 
-    Optional<AccessScope> maxScope = AccessScope::getPublic();
+    llvm::Optional<AccessScope> maxScope = AccessScope::getPublic();
 
     // Try to scope the extension's access to the least public type mentioned
     // in its where clause.
@@ -246,11 +258,13 @@ DefaultAndMaxAccessLevelRequest::evaluate(Evaluator &evaluator,
       maxScope = maxScope->intersectWith(scope);
     }
 
-    if (!maxScope.hasValue()) {
+    if (!maxScope.has_value()) {
       // This is an error case and will be diagnosed elsewhere.
       maxAccess = AccessLevel::Public;
     } else if (maxScope->isPublic()) {
       maxAccess = AccessLevel::Public;
+    } else if (maxScope->isPackage()) {
+      maxAccess = AccessLevel::Package;
     } else if (isa<ModuleDecl>(maxScope->getDeclContext())) {
       maxAccess = AccessLevel::Internal;
     } else {
@@ -309,7 +323,7 @@ DefaultAndMaxAccessLevelRequest::evaluate(Evaluator &evaluator,
 // So we decode Max as the last (high) bit that is set, and Default as the first
 // (low). And add one to each, to map them back into AccessLevels.
 
-Optional<std::pair<AccessLevel,AccessLevel>>
+llvm::Optional<std::pair<AccessLevel, AccessLevel>>
 DefaultAndMaxAccessLevelRequest::getCachedResult() const {
   auto extensionDecl = std::get<0>(getStorage());
   if (extensionDecl->hasDefaultAccessLevel()) {
@@ -320,7 +334,7 @@ DefaultAndMaxAccessLevelRequest::getCachedResult() const {
     assert(Max >= Default);
     return std::make_pair(Default, Max);
   }
-  return None;
+  return llvm::None;
 }
 
 void
@@ -328,8 +342,8 @@ DefaultAndMaxAccessLevelRequest::cacheResult(
   std::pair<AccessLevel, AccessLevel> value) const {
   auto extensionDecl = std::get<0>(getStorage());
   extensionDecl->setDefaultAndMaxAccessLevelBits(value.first, value.second);
-  assert(getCachedResult().getValue().first == value.first);
-  assert(getCachedResult().getValue().second == value.second);
+  assert(getCachedResult().value().first == value.first);
+  assert(getCachedResult().value().second == value.second);
 }
 
 // Define request evaluation functions for each of the access requests.

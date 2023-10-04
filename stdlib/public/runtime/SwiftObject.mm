@@ -25,7 +25,9 @@
 #endif
 #include "llvm/ADT/StringRef.h"
 #include "swift/Basic/Lazy.h"
+#include "swift/Runtime/Bincompat.h"
 #include "swift/Runtime/Casting.h"
+#include "swift/Runtime/CustomRRABI.h"
 #include "swift/Runtime/Debug.h"
 #include "swift/Runtime/EnvironmentVariables.h"
 #include "swift/Runtime/Heap.h"
@@ -40,6 +42,7 @@
 #include "ErrorObject.h"
 #include "Private.h"
 #include "SwiftObject.h"
+#include "SwiftValue.h"
 #include "WeakReference.h"
 #if SWIFT_OBJC_INTEROP
 #include <dlfcn.h>
@@ -616,6 +619,8 @@ void *swift::swift_bridgeObjectRetain(void *object) {
 #endif
 }
 
+CUSTOM_RR_ENTRYPOINTS_DEFINE_ENTRYPOINTS(swift_bridgeObjectRetain)
+
 SWIFT_RUNTIME_EXPORT
 void *swift::swift_nonatomic_bridgeObjectRetain(void *object) {
 #if SWIFT_OBJC_INTEROP
@@ -655,6 +660,8 @@ void swift::swift_bridgeObjectRelease(void *object) {
   swift_release(static_cast<HeapObject *>(objectRef));
 #endif
 }
+
+CUSTOM_RR_ENTRYPOINTS_DEFINE_ENTRYPOINTS(swift_bridgeObjectRelease)
 
 void swift::swift_nonatomic_bridgeObjectRelease(void *object) {
 #if SWIFT_OBJC_INTEROP
@@ -1264,6 +1271,12 @@ SWIFT_RUNTIME_EXPORT
 id swift_dynamicCastObjCProtocolConditional(id object,
                                             size_t numProtocols,
                                             Protocol * const *protocols) {
+  if (!runtime::bincompat::useLegacySwiftValueUnboxingInCasting()) {
+    if (getAsSwiftValue(object) != nil) {
+      // SwiftValue wrapper never holds a class object
+      return nil;
+    }
+  }
   for (size_t i = 0; i < numProtocols; ++i) {
     if (![object conformsToProtocol:protocols[i]]) {
       return nil;
@@ -1631,7 +1644,7 @@ const HashableWitnessTable *
 swift::hashable_support::getNSStringHashableConformance() {
   return SWIFT_LAZY_CONSTANT(
     reinterpret_cast<const HashableWitnessTable *>(
-      swift_conformsToProtocol(
+      swift_conformsToProtocolCommon(
         getNSStringMetadata(),
         &HashableProtocolDescriptor
       )

@@ -14,7 +14,7 @@
 #define SWIFT_IDE_CODECOMPLETIONCONSUMER
 
 #include "swift/IDE/CodeCompletionContext.h"
-#include "swift/Parse/CodeCompletionCallbacks.h"
+#include "swift/Parse/IDEInspectionCallbacks.h"
 
 namespace swift {
 namespace ide {
@@ -22,30 +22,9 @@ namespace ide {
 struct RequestedCachedModule;
 
 /// An abstract base class for consumers of code completion results.
-/// \see \c SimpleCachingCodeCompletionConsumer.
 class CodeCompletionConsumer {
 public:
   virtual ~CodeCompletionConsumer() {}
-  virtual void
-  handleResultsAndModules(CodeCompletionContext &context,
-                          ArrayRef<RequestedCachedModule> requestedModules,
-                          const ExpectedTypeContext *TypeContext,
-                          const DeclContext *DC,
-                          bool CanCurrDeclContextHandleAsync) = 0;
-};
-
-/// A simplified code completion consumer interface that clients can use to get
-/// CodeCompletionResults with automatic caching of top-level completions from
-/// imported modules.
-struct SimpleCachingCodeCompletionConsumer : public CodeCompletionConsumer {
-
-  // Implement the CodeCompletionConsumer interface.
-  void handleResultsAndModules(CodeCompletionContext &context,
-                               ArrayRef<RequestedCachedModule> requestedModules,
-                               const ExpectedTypeContext *TypeContext,
-                               const DeclContext *DCForModules,
-                               bool CanCurrDeclContextHandleAsync) override;
-
   /// Clients should override this method to receive \p Results.
   virtual void handleResults(CodeCompletionContext &context) = 0;
 };

@@ -56,12 +56,14 @@ IDENTIFIER(Context)
 IDENTIFIER(CoreGraphics)
 IDENTIFIER(CoreMedia)
 IDENTIFIER(CGFloat)
+IDENTIFIER(Copyable)
 IDENTIFIER(CoreFoundation)
 IDENTIFIER(count)
 IDENTIFIER(CVarArg)
 IDENTIFIER(Cxx)
 IDENTIFIER(CxxStdlib)
 IDENTIFIER(Darwin)
+IDENTIFIER(dataCorrupted)
 IDENTIFIER(Distributed)
 IDENTIFIER(dealloc)
 IDENTIFIER(debugDescription)
@@ -124,6 +126,7 @@ IDENTIFIER(objectAtIndexedSubscript)
 IDENTIFIER(objectForKeyedSubscript)
 IDENTIFIER(ObjectiveC)
 IDENTIFIER_(ObjectiveCType)
+IDENTIFIER(Observation)
 IDENTIFIER(oldValue)
 IDENTIFIER(Optional)
 IDENTIFIER_(OptionalNilComparisonType)
@@ -263,6 +266,9 @@ IDENTIFIER(version)
 IDENTIFIER_(StringProcessing)
 IDENTIFIER(RegexBuilder)
 
+// Backtracing
+IDENTIFIER_(Backtracing)
+
 // Distributed actors
 IDENTIFIER(ActorID)
 IDENTIFIER(ActorSystem)
@@ -309,15 +315,6 @@ IDENTIFIER(decodeNextArgument)
 IDENTIFIER(SerializationRequirement)
 IDENTIFIER_WITH_NAME(builderSelf, "$builderSelf")
 
-// Type wrappers
-IDENTIFIER_WITH_NAME(TypeWrapperStorage, "$Storage")
-IDENTIFIER_WITH_NAME(TypeWrapperProperty, "$storage")
-IDENTIFIER(storageKeyPath)
-IDENTIFIER(propertyKeyPath)
-IDENTIFIER(wrappedSelf)
-IDENTIFIER(storageWrapper)
-IDENTIFIER_WITH_NAME(localStorageVar, "_storage")
-
 // Attribute options
 IDENTIFIER_(_always)
 IDENTIFIER_(assumed)
@@ -333,8 +330,8 @@ IDENTIFIER(unsafe)
 // The singleton instance of TupleTypeDecl in the Builtin module
 IDENTIFIER(TheTupleType)
 
-// Macros / compiler plugins
-IDENTIFIER_(CompilerPluginSupport)
+// Runtime attributes
+IDENTIFIER(attachedTo)
 
 #undef IDENTIFIER
 #undef IDENTIFIER_

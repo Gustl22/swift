@@ -114,7 +114,8 @@ deriveBodyRawRepresentable_raw(AbstractFunctionDecl *toRawDecl, void *) {
   for (auto elt : enumDecl->getAllElements()) {
     auto pat = new (C)
         EnumElementPattern(TypeExpr::createImplicit(enumType, C), SourceLoc(),
-                           DeclNameLoc(), DeclNameRef(), elt, nullptr);
+                           DeclNameLoc(), DeclNameRef(), elt, nullptr,
+                           /*DC*/ toRawDecl);
     pat->setImplicit();
 
     auto labelItem = CaseLabelItem(pat);
@@ -127,7 +128,7 @@ deriveBodyRawRepresentable_raw(AbstractFunctionDecl *toRawDecl, void *) {
 
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      labelItem, SourceLoc(), SourceLoc(), body,
-                                     /*case body var decls*/ None));
+                                     /*case body var decls*/ llvm::None));
   }
 
   auto selfRef = DerivedConformance::createSelfDeclRef(toRawDecl);
@@ -239,8 +240,9 @@ struct RuntimeVersionCheck {
 /// be available, returns true. If it will sometimes be available, adds
 /// information about the runtime check needed to ensure it is available to
 /// \c versionCheck and returns true.
-static bool checkAvailability(const EnumElementDecl* elt, ASTContext &C,
-    Optional<RuntimeVersionCheck> &versionCheck) {
+static bool
+checkAvailability(const EnumElementDecl *elt, ASTContext &C,
+                  llvm::Optional<RuntimeVersionCheck> &versionCheck) {
   auto *attr = elt->getAttrs().getPotentiallyUnavailable(C);
 
   // Is it always available?
@@ -311,7 +313,7 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
     // unavailable, skip it. If it might be unavailable at runtime, save
     // information about that check in versionCheck and keep processing this
     // element.
-    Optional<RuntimeVersionCheck> versionCheck(None);
+    llvm::Optional<RuntimeVersionCheck> versionCheck(llvm::None);
     if (!checkAvailability(elt, C, versionCheck))
       continue;
 
@@ -321,18 +323,16 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
       // In case of a string enum we are calling the _findStringSwitchCase
       // function from the library and switching on the returned Int value.
       stringExprs.push_back(litExpr);
-      litExpr = IntegerLiteralExpr::createFromUnsigned(C, Idx); 
+      litExpr = IntegerLiteralExpr::createFromUnsigned(C, Idx, SourceLoc()); 
     }
-    auto litPat = new (C) ExprPattern(litExpr, /*isResolved*/ true,
-                                      nullptr, nullptr);
-    litPat->setImplicit();
+    auto *litPat = ExprPattern::createImplicit(C, litExpr, /*DC*/ initDecl);
 
     /// Statements in the body of this case.
     SmallVector<ASTNode, 2> stmts;
 
     // If checkAvailability() discovered we need a runtime version check,
     // add it now.
-    if (versionCheck.hasValue())
+    if (versionCheck.has_value())
       stmts.push_back(ASTNode(versionCheck->createEarlyReturnStmt(C)));
 
     // Create a statement which assigns the case to self.
@@ -359,7 +359,7 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      CaseLabelItem(litPat), SourceLoc(),
                                      SourceLoc(), body,
-                                     /*case body var decls*/ None));
+                                     /*case body var decls*/ llvm::None));
     ++Idx;
   }
 
@@ -372,7 +372,7 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
   cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                    dfltLabelItem, SourceLoc(), SourceLoc(),
                                    dfltBody,
-                                   /*case body var decls*/ None));
+                                   /*case body var decls*/ llvm::None));
 
   auto rawDecl = initDecl->getParameters()->get(0);
   auto rawRef = new (C) DeclRefExpr(rawDecl, DeclNameLoc(), /*implicit*/true);
@@ -429,7 +429,7 @@ deriveRawRepresentable_init(DerivedConformance &derived) {
                             /*Failable=*/ true, /*FailabilityLoc=*/SourceLoc(),
                             /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
                             /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
-                            paramList,
+                            /*ThrownType=*/TypeLoc(), paramList,
                             /*GenericParams=*/nullptr, parentDC);
   
   initDecl->setImplicit();
@@ -460,7 +460,7 @@ bool DerivedConformance::canDeriveRawRepresentable(DeclContext *DC,
 
   rawType = DC->mapTypeIntoContext(rawType);
 
-  auto inherited = enumDecl->getInherited();
+  auto inherited = enumDecl->getInherited().getEntries();
   if (!inherited.empty() && inherited.front().wasValidated() &&
       inherited.front().isError())
     return false;

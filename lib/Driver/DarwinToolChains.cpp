@@ -24,6 +24,7 @@
 #include "swift/Driver/Compilation.h"
 #include "swift/Driver/Driver.h"
 #include "swift/Driver/Job.h"
+#include "swift/IDETool/CompilerInvocation.h"
 #include "swift/Option/Options.h"
 #include "clang/Basic/DarwinSDKInfo.h"
 #include "clang/Basic/Version.h"
@@ -123,6 +124,31 @@ std::string toolchains::Darwin::sanitizerRuntimeLibName(StringRef Sanitizer,
       .str();
 }
 
+void
+toolchains::Darwin::addPluginArguments(const ArgList &Args,
+                                       ArgStringList &Arguments) const {
+  SmallString<64> pluginPath;
+  auto programPath = getDriver().getSwiftProgramPath();
+  CompilerInvocation::computeRuntimeResourcePathFromExecutablePath(
+      programPath, /*shared=*/true, pluginPath);
+
+  auto defaultPluginPath = pluginPath;
+  llvm::sys::path::append(defaultPluginPath, "host", "plugins");
+
+  // Default plugin path.
+  Arguments.push_back("-plugin-path");
+  Arguments.push_back(Args.MakeArgString(defaultPluginPath));
+
+  // Local plugin path.
+  llvm::sys::path::remove_filename(pluginPath); // Remove "swift"
+  llvm::sys::path::remove_filename(pluginPath); // Remove "lib"
+  llvm::sys::path::append(pluginPath, "local", "lib");
+  llvm::sys::path::append(pluginPath, "swift");
+  llvm::sys::path::append(pluginPath, "host", "plugins");
+  Arguments.push_back("-plugin-path");
+  Arguments.push_back(Args.MakeArgString(pluginPath));
+}
+
 static void addLinkRuntimeLibRPath(const ArgList &Args,
                                    ArgStringList &Arguments,
                                    StringRef DarwinLibName,
@@ -216,30 +242,9 @@ static void addVersionString(const ArgList &inputArgs, ArgStringList &arguments,
                              llvm::VersionTuple version) {
   llvm::SmallString<8> buf;
   llvm::raw_svector_ostream os{buf};
-  os << version.getMajor() << '.' << version.getMinor().getValueOr(0) << '.'
-     << version.getSubminor().getValueOr(0);
+  os << version.getMajor() << '.' << version.getMinor().value_or(0) << '.'
+     << version.getSubminor().value_or(0);
   arguments.push_back(inputArgs.MakeArgString(os.str()));
-}
-
-/// Returns true if the compiler depends on features provided by the ObjC
-/// runtime that are not present on the deployment target indicated by
-/// \p triple.
-static bool wantsObjCRuntime(const llvm::Triple &triple) {
-  assert((!triple.isTvOS() || triple.isiOS()) &&
-         "tvOS is considered a kind of iOS");
-
-  // When updating the versions listed here, please record the most recent
-  // feature being depended on and when it was introduced:
-  //
-  // - Make assigning 'nil' to an NSMutableDictionary subscript delete the
-  //   entry, like it does for Swift.Dictionary, rather than trap.
-  if (triple.isiOS())
-    return triple.isOSVersionLT(9);
-  if (triple.isMacOSX())
-    return triple.isMacOSXVersionLT(10, 11);
-  if (triple.isWatchOS())
-    return false;
-  llvm_unreachable("unknown Darwin OS");
 }
 
 void
@@ -276,48 +281,6 @@ toolchains::Darwin::addLinkerInputArgs(InvocationInfo &II,
   // "-add_ast_path" linker option.
   addInputsOfType(Arguments, context.InputActions,
                   file_types::TY_SwiftModuleFile, "-add_ast_path");
-}
-
-static void findARCLiteLibPath(const toolchains::Darwin &TC,
-                               llvm::SmallVectorImpl<char> &ARCLiteLib) {
-  auto& D = TC.getDriver();
-  llvm::sys::path::append(ARCLiteLib, D.getSwiftProgramPath());
-  
-  llvm::sys::path::remove_filename(ARCLiteLib); // 'swift'
-  llvm::sys::path::remove_filename(ARCLiteLib); // 'bin'
-  llvm::sys::path::append(ARCLiteLib, "lib", "arc");
-
-  if (!llvm::sys::fs::is_directory(ARCLiteLib)) {
-    // If we don't have a 'lib/arc/' directory, find the "arclite" library
-    // relative to the Clang in the active Xcode.
-    ARCLiteLib.clear();
-    findXcodeClangLibPath("arc", ARCLiteLib);
-  }
-}
-
-void
-toolchains::Darwin::addArgsToLinkARCLite(ArgStringList &Arguments,
-                                         const JobContext &context) const {
-  if (!context.Args.hasFlag(options::OPT_link_objc_runtime,
-                            options::OPT_no_link_objc_runtime,
-                            /*Default=*/wantsObjCRuntime(getTriple())))
-    return;
-
-  llvm::SmallString<128> ARCLiteLib;
-  findARCLiteLibPath(*this, ARCLiteLib);
-
-  if (!ARCLiteLib.empty()) {
-    llvm::sys::path::append(ARCLiteLib, "libarclite_");
-    ARCLiteLib += getPlatformNameForTriple(getTriple());
-    ARCLiteLib += ".a";
-
-    Arguments.push_back("-force_load");
-    Arguments.push_back(context.Args.MakeArgString(ARCLiteLib));
-
-    // Arclite depends on CoreFoundation.
-    Arguments.push_back("-framework");
-    Arguments.push_back("CoreFoundation");
-  }
 }
 
 void toolchains::Darwin::addLTOLibArgs(ArgStringList &Arguments,
@@ -401,8 +364,8 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
   // have an older Swift runtime.
   SmallString<128> SharedResourceDirPath;
   getResourceDirPath(SharedResourceDirPath, context.Args, /*Shared=*/true);
-  Optional<llvm::VersionTuple> runtimeCompatibilityVersion;
-  
+  llvm::Optional<llvm::VersionTuple> runtimeCompatibilityVersion;
+
   if (context.Args.hasArg(options::OPT_runtime_compatibility_version)) {
     auto value = context.Args.getLastArgValue(
                                     options::OPT_runtime_compatibility_version);
@@ -414,8 +377,10 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
       runtimeCompatibilityVersion = llvm::VersionTuple(5, 5);
     } else if (value.equals("5.6")) {
       runtimeCompatibilityVersion = llvm::VersionTuple(5, 6);
+    } else if (value.equals("5.8")) {
+      runtimeCompatibilityVersion = llvm::VersionTuple(5, 8);
     } else if (value.equals("none")) {
-      runtimeCompatibilityVersion = None;
+      runtimeCompatibilityVersion = llvm::None;
     } else {
       // TODO: diagnose unknown runtime compatibility version?
     }
@@ -427,7 +392,8 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
   if (runtimeCompatibilityVersion) {
     auto addBackDeployLib = [&](llvm::VersionTuple version,
                                 BackDeployLibFilter filter,
-                                StringRef libraryName) {
+                                StringRef libraryName,
+                                bool forceLoad) {
       if (*runtimeCompatibilityVersion > version)
         return;
 
@@ -439,14 +405,16 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
       llvm::sys::path::append(BackDeployLib, "lib" + libraryName + ".a");
       
       if (llvm::sys::fs::exists(BackDeployLib)) {
-        Arguments.push_back("-force_load");
+        if (forceLoad)
+          Arguments.push_back("-force_load");
         Arguments.push_back(context.Args.MakeArgString(BackDeployLib));
       }
     };
 
-    #define BACK_DEPLOYMENT_LIB(Version, Filter, LibraryName) \
-      addBackDeployLib(                                       \
-          llvm::VersionTuple Version, BackDeployLibFilter::Filter, LibraryName);
+    #define BACK_DEPLOYMENT_LIB(Version, Filter, LibraryName, ForceLoad) \
+      addBackDeployLib(                                                  \
+          llvm::VersionTuple Version, BackDeployLibFilter::Filter,       \
+          LibraryName, ForceLoad);
     #include "swift/Frontend/BackDeploymentLibs.def"
   }
     
@@ -550,10 +518,10 @@ toolchains::Darwin::addProfileGenerationArgs(ArgStringList &Arguments,
   }
 }
 
-Optional<llvm::VersionTuple>
+llvm::Optional<llvm::VersionTuple>
 toolchains::Darwin::getTargetSDKVersion(const llvm::Triple &triple) const {
   if (!SDKInfo)
-    return None;
+    return llvm::None;
   return swift::getTargetSDKVersion(*SDKInfo, triple);
 }
 
@@ -612,7 +580,7 @@ toolchains::Darwin::addDeploymentTargetArgs(ArgStringList &Arguments,
 
         // The first deployment of arm64 for macOS is version 10.16;
         if (triple.isAArch64() && osVersion.getMajor() <= 10 &&
-            osVersion.getMinor().getValueOr(0) < 16) {
+            osVersion.getMinor().value_or(0) < 16) {
           osVersion = llvm::VersionTuple(/*Major=*/10, /*Minor=*/16);
           osVersion = canonicalizePlatformVersion(PlatformKind::macOS,
                                                   osVersion);
@@ -642,7 +610,7 @@ toolchains::Darwin::addDeploymentTargetArgs(ArgStringList &Arguments,
 
     // Compute the SDK version.
     auto sdkVersion = getTargetSDKVersion(triple)
-        .getValueOr(llvm::VersionTuple());
+        .value_or(llvm::VersionTuple());
 
     Arguments.push_back("-platform_version");
     Arguments.push_back(platformName);
@@ -675,6 +643,60 @@ void toolchains::Darwin::addCommonFrontendArgs(
       arguments.push_back(
           inputArgs.MakeArgString(variantSDKVersion->getAsString()));
     }
+  }
+}
+
+/// Add the frontend arguments needed to find external plugins in standard
+/// locations based on the base path.
+static void addExternalPluginFrontendArgs(
+    StringRef basePath, const llvm::opt::ArgList &inputArgs,
+    llvm::opt::ArgStringList &arguments) {
+  // Plugin server: $BASE/usr/bin/swift-plugin-server
+  SmallString<128> pluginServer;
+  llvm::sys::path::append(
+      pluginServer, basePath, "usr", "bin", "swift-plugin-server");
+
+  SmallString<128> pluginDir;
+  llvm::sys::path::append(pluginDir, basePath, "usr", "lib");
+  llvm::sys::path::append(pluginDir, "swift", "host", "plugins");
+  arguments.push_back("-external-plugin-path");
+  arguments.push_back(inputArgs.MakeArgString(pluginDir + "#" + pluginServer));
+
+  pluginDir.clear();
+  llvm::sys::path::append(pluginDir, basePath, "usr", "local", "lib");
+  llvm::sys::path::append(pluginDir, "swift", "host", "plugins");
+  arguments.push_back("-external-plugin-path");
+  arguments.push_back(inputArgs.MakeArgString(pluginDir + "#" + pluginServer));
+}
+
+void toolchains::Darwin::addPlatformSpecificPluginFrontendArgs(
+    const OutputInfo &OI,
+    const CommandOutput &output,
+    const llvm::opt::ArgList &inputArgs,
+    llvm::opt::ArgStringList &arguments) const {
+  // Add SDK-relative directories for plugins.
+  if (!OI.SDKPath.empty()) {
+    addExternalPluginFrontendArgs(OI.SDKPath, inputArgs, arguments);
+  }
+
+  // Add platform-relative directories for plugins.
+  if (!OI.SDKPath.empty()) {
+    SmallString<128> platformPath;
+    llvm::sys::path::append(platformPath, OI.SDKPath);
+    llvm::sys::path::remove_filename(platformPath); // specific SDK
+    llvm::sys::path::remove_filename(platformPath); // SDKs
+    llvm::sys::path::remove_filename(platformPath); // Developer
+
+    StringRef platformName = llvm::sys::path::filename(platformPath);
+    if (platformName.endswith("Simulator.platform")){
+      StringRef devicePlatformName =
+          platformName.drop_back(strlen("Simulator.platform"));
+      llvm::sys::path::remove_filename(platformPath); // Platform
+      llvm::sys::path::append(platformPath, devicePlatformName + "OS.platform");
+    }
+
+    llvm::sys::path::append(platformPath, "Developer");
+    addExternalPluginFrontendArgs(platformPath, inputArgs, arguments);
   }
 }
 
@@ -740,8 +762,6 @@ toolchains::Darwin::constructInvocation(const DynamicLinkJobAction &job,
         ".a");
   if (llvm::sys::fs::exists(CompilerRTPath))
     Arguments.push_back(context.Args.MakeArgString(CompilerRTPath));
-
-  addArgsToLinkARCLite(Arguments, context);
 
   if (job.shouldPerformLTO()) {
     addLTOLibArgs(Arguments, context);
@@ -857,23 +877,6 @@ std::string toolchains::Darwin::getGlobalDebugPathRemapping() const {
   return {};
 }
 
-static void validateLinkObjcRuntimeARCLiteLib(const toolchains::Darwin &TC,
-                                              DiagnosticEngine &diags,
-                                              const llvm::opt::ArgList &args) {
-  auto Triple = TC.getTriple();
-  if (args.hasFlag(options::OPT_link_objc_runtime,
-                   options::OPT_no_link_objc_runtime,
-                   /*Default=*/wantsObjCRuntime(Triple))) {
-    llvm::SmallString<128> ARCLiteLib;
-    findARCLiteLibPath(TC, ARCLiteLib);
-    
-    if (ARCLiteLib.empty()) {
-      diags.diagnose(SourceLoc(),
-                     diag::warn_arclite_not_found_when_link_objc_runtime);
-    }
-  }
-}
-
 static void validateDeploymentTarget(const toolchains::Darwin &TC,
                                      DiagnosticEngine &diags,
                                      const llvm::opt::ArgList &args) {
@@ -911,7 +914,7 @@ static void validateTargetVariant(const toolchains::Darwin &TC,
                                   DiagnosticEngine &diags,
                                   const llvm::opt::ArgList &args,
                                   StringRef defaultTarget) {
-  if (TC.getTargetVariant().hasValue()) {
+  if (TC.getTargetVariant().has_value()) {
     auto target = TC.getTriple();
     auto variant = *TC.getTargetVariant();
 
@@ -927,15 +930,6 @@ void
 toolchains::Darwin::validateArguments(DiagnosticEngine &diags,
                                       const llvm::opt::ArgList &args,
                                       StringRef defaultTarget) const {
-  if (!getDriver().isDummyDriverForFrontendInvocation()) {
-    // Validating arclite library path when link-objc-runtime.
-    // If the driver is just set up to retrieve the swift-frontend invocation,
-    // we don't care about link-time, so we can skip this step, which may be
-    // expensive since it might call to `xcrun` to find `clang` and `arclite`
-    // relative to `clang`.
-    validateLinkObjcRuntimeARCLiteLib(*this, diags, args);
-  }
-
   // Validating apple platforms deployment targets.
   validateDeploymentTarget(*this, diags, args);
   validateTargetVariant(*this, diags, args, defaultTarget);
@@ -943,6 +937,12 @@ toolchains::Darwin::validateArguments(DiagnosticEngine &diags,
   // Validating darwin unsupported -static-stdlib argument.
   if (args.hasArg(options::OPT_static_stdlib)) {
     diags.diagnose(SourceLoc(), diag::error_darwin_static_stdlib_not_supported);
+  }
+
+  // Validating darwin deprecated -link-objc-runtime.
+  if (args.hasArg(options::OPT_link_objc_runtime,
+		  options::OPT_no_link_objc_runtime)) {
+    diags.diagnose(SourceLoc(), diag::warn_darwin_link_objc_deprecated);
   }
 
   // If a C++ standard library is specified, it has to be libc++.

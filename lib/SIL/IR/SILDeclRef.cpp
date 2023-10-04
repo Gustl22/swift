@@ -124,16 +124,19 @@ bool swift::requiresForeignEntryPoint(ValueDecl *vd) {
 
 SILDeclRef::SILDeclRef(ValueDecl *vd, SILDeclRef::Kind kind, bool isForeign,
                        bool isDistributed, bool isKnownToBeLocal,
+                       bool isRuntimeAccessible,
                        SILDeclRef::BackDeploymentKind backDeploymentKind,
                        AutoDiffDerivativeFunctionIdentifier *derivativeId)
     : loc(vd), kind(kind), isForeign(isForeign), 
       isDistributed(isDistributed), isKnownToBeLocal(isKnownToBeLocal),
+      isRuntimeAccessible(isRuntimeAccessible),
       backDeploymentKind(backDeploymentKind), defaultArgIndex(0),
       pointer(derivativeId) {}
 
 SILDeclRef::SILDeclRef(SILDeclRef::Loc baseLoc, bool asForeign,
                        bool asDistributed, bool asDistributedKnownToBeLocal)
-    : backDeploymentKind(SILDeclRef::BackDeploymentKind::None),
+    : isRuntimeAccessible(false),
+      backDeploymentKind(SILDeclRef::BackDeploymentKind::None),
       defaultArgIndex(0),
       pointer((AutoDiffDerivativeFunctionIdentifier *)nullptr) {
   if (auto *vd = baseLoc.dyn_cast<ValueDecl*>()) {
@@ -182,16 +185,16 @@ SILDeclRef::SILDeclRef(SILDeclRef::Loc baseLoc,
   pointer = prespecializedSig.getPointer();
 }
 
-Optional<AnyFunctionRef> SILDeclRef::getAnyFunctionRef() const {
+llvm::Optional<AnyFunctionRef> SILDeclRef::getAnyFunctionRef() const {
   switch (getLocKind()) {
   case LocKind::Decl:
     if (auto *afd = getAbstractFunctionDecl())
       return AnyFunctionRef(afd);
-    return None;
+    return llvm::None;
   case LocKind::Closure:
     return AnyFunctionRef(getAbstractClosureExpr());
   case LocKind::File:
-    return None;
+    return llvm::None;
   }
   llvm_unreachable("Unhandled case in switch");
 }
@@ -216,12 +219,13 @@ ASTContext &SILDeclRef::getASTContext() const {
   return DC->getASTContext();
 }
 
-Optional<AvailabilityContext> SILDeclRef::getAvailabilityForLinkage() const {
+llvm::Optional<AvailabilityContext>
+SILDeclRef::getAvailabilityForLinkage() const {
   // Back deployment thunks and fallbacks don't have availability since they
   // are non-ABI.
   // FIXME: Generalize this check to all kinds of non-ABI functions.
   if (backDeploymentKind != SILDeclRef::BackDeploymentKind::None)
-    return None;
+    return llvm::None;
 
   return getDecl()->getAvailabilityForLinkage();
 }
@@ -600,6 +604,7 @@ SILLinkage SILDeclRef::getDefinitionLinkage() const {
       return SILLinkage::Shared;
     return SILLinkage::Hidden;
 
+  case AccessLevel::Package:
   case AccessLevel::Public:
   case AccessLevel::Open:
     switch (limit) {
@@ -715,7 +720,17 @@ bool SILDeclRef::isSetter() const {
 }
 
 AbstractFunctionDecl *SILDeclRef::getAbstractFunctionDecl() const {
-  return dyn_cast<AbstractFunctionDecl>(getDecl());
+  return dyn_cast_or_null<AbstractFunctionDecl>(getDecl());
+}
+
+bool SILDeclRef::isInitAccessor() const {
+  if (kind != Kind::Func || !hasDecl())
+    return false;
+
+  if (auto accessor = dyn_cast<AccessorDecl>(getDecl()))
+    return accessor->getAccessorKind() == AccessorKind::Init;
+
+  return false;
 }
 
 /// True if the function should be treated as transparent.
@@ -913,10 +928,20 @@ bool SILDeclRef::isNoinline() const {
 
 /// True if the function has the @inline(__always) attribute.
 bool SILDeclRef::isAlwaysInline() const {
-  if (!hasDecl())
+  swift::Decl *decl = nullptr;
+  if (hasDecl()) {
+    decl = getDecl();
+  } else if (auto *ce = getAbstractClosureExpr()) {
+    // Closures within @inline(__always) functions should be always inlined, too.
+    // Note that this is different from @inline(never), because closures inside
+    // @inline(never) _can_ be inlined within the inline-never function.
+    decl = ce->getParent()->getInnermostDeclarationDeclContext();
+    if (!decl)
+      return false;
+  } else {
     return false;
+  }
 
-  auto *decl = getDecl();
   if (auto attr = decl->getAttrs().getAttribute<InlineAttr>())
     if (attr->getKind() == InlineKind::Always)
       return true;
@@ -937,7 +962,7 @@ bool SILDeclRef::isBackDeployed() const {
 
   auto *decl = getDecl();
   if (auto afd = dyn_cast<AbstractFunctionDecl>(decl))
-    return afd->isBackDeployed();
+    return afd->isBackDeployed(getASTContext());
 
   return false;
 }
@@ -996,13 +1021,15 @@ bool SILDeclRef::isDistributedThunk() const {
 bool SILDeclRef::isBackDeploymentFallback() const {
   if (backDeploymentKind != BackDeploymentKind::Fallback)
     return false;
-  return kind == Kind::Func;
+  return kind == Kind::Func || kind == Kind::Initializer ||
+         kind == Kind::Allocator;
 }
 
 bool SILDeclRef::isBackDeploymentThunk() const {
   if (backDeploymentKind != BackDeploymentKind::Thunk)
     return false;
-  return kind == Kind::Func;
+  return kind == Kind::Func || kind == Kind::Initializer ||
+         kind == Kind::Allocator;
 }
 
 /// Use the Clang importer to mangle a Clang declaration.
@@ -1022,7 +1049,10 @@ std::string SILDeclRef::mangle(ManglingKind MKind) const {
     auto *silParameterIndices = autodiff::getLoweredParameterIndices(
         derivativeFunctionIdentifier->getParameterIndices(),
         getDecl()->getInterfaceType()->castTo<AnyFunctionType>());
-    auto *resultIndices = IndexSubset::get(getDecl()->getASTContext(), 1, {0});
+    // FIXME: is this correct in the presence of curried types?
+    auto *resultIndices = autodiff::getFunctionSemanticResultIndices(
+      asAutoDiffOriginalFunction().getAbstractFunctionDecl(),
+      derivativeFunctionIdentifier->getParameterIndices());
     AutoDiffConfig silConfig(
         silParameterIndices, resultIndices,
         derivativeFunctionIdentifier->getDerivativeGenericSignature());
@@ -1032,7 +1062,8 @@ std::string SILDeclRef::mangle(ManglingKind MKind) const {
         silConfig);
   }
 
-  // As a special case, Clang functions and globals don't get mangled at all.
+  // As a special case, Clang functions and globals don't get mangled at all
+  // - except \c objc_direct decls.
   if (hasDecl()) {
     if (auto clangDecl = getDecl()->getClangDecl()) {
       if (!isForeignToNativeThunk() && !isNativeToForeignThunk()) {
@@ -1050,7 +1081,7 @@ std::string SILDeclRef::mangle(ManglingKind MKind) const {
           }
           return namedClangDecl->getName().str();
         } else if (auto objcDecl = dyn_cast<clang::ObjCMethodDecl>(clangDecl)) {
-          if (objcDecl->isDirectMethod()) {
+          if (objcDecl->isDirectMethod() && isForeign) {
             std::string storage;
             llvm::raw_string_ostream SS(storage);
             clang::ASTContext &ctx = clangDecl->getASTContext();
@@ -1489,6 +1520,7 @@ SubclassScope SILDeclRef::getSubclassScope() const {
     // SILModule, so we don't need to do anything.
     return SubclassScope::NotApplicable;
   case AccessLevel::Internal:
+  case AccessLevel::Package:
   case AccessLevel::Public:
     // If the class is internal or public, it can only be subclassed from
     // the same AST Module, but possibly a different SILModule.

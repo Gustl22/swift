@@ -109,7 +109,9 @@
 
 namespace swift {
 
-extern llvm::Statistic NumCopiesEliminated;
+class BasicCalleeAnalysis;
+
+extern llvm::Statistic NumCopiesAndMovesEliminated;
 extern llvm::Statistic NumCopiesGenerated;
 
 /// Insert a copy on this operand. Trace and update stats.
@@ -213,23 +215,24 @@ private:
   /// copies.
   bool maximizeLifetime;
 
-  /// If true and we are processing a value of move_only type, emit a diagnostic
-  /// when-ever we need to insert a copy_value.
-  std::function<void(Operand *)> moveOnlyCopyValueNotification;
-
-  /// If true and we are processing a value of move_only type, pass back to the
-  /// caller any consuming uses that are going to be used as part of the final
-  /// lifetime boundary in case we need to emit diagnostics.
-  std::function<void(Operand *)> moveOnlyFinalConsumingUse;
-
+  // If present, will be used to ensure that the lifetime is not shortened to
+  // end inside an access scope which it previously enclosed.  (Note that ending
+  // before such an access scope is fine regardless.)
+  //
+  // For details, see extendLivenessThroughOverlappingAccess.
   NonLocalAccessBlockAnalysis *accessBlockAnalysis;
   // Lazily initialize accessBlocks only when
   // extendLivenessThroughOverlappingAccess is invoked.
   NonLocalAccessBlocks *accessBlocks = nullptr;
 
-  DominanceInfo *domTree;
+  DominanceInfo *domTree = nullptr;
+
+  BasicCalleeAnalysis *calleeAnalysis;
 
   InstructionDeleter &deleter;
+
+  /// The SILValue to canonicalize.
+  SILValue currentDef;
 
   /// Original points in the CFG where the current value's lifetime is consumed
   /// or destroyed. For guaranteed values it remains empty. A backward walk from
@@ -254,7 +257,7 @@ private:
   /// Pruned liveness for the extended live range including copies. For this
   /// purpose, only consuming instructions are considered "lifetime
   /// ending". end_borrows do not end a liverange that may include owned copies.
-  SSAPrunedLiveness liveness;
+  BitfieldRef<SSAPrunedLiveness> liveness;
 
   /// The destroys of the value.  These are not uses, but need to be recorded so
   /// that we know when the last use in a consuming block is (without having to
@@ -284,48 +287,47 @@ public:
     }
   }
 
-  void maybeNotifyMoveOnlyCopy(Operand *use) {
-    if (!moveOnlyCopyValueNotification)
-      return;
-    moveOnlyCopyValueNotification(use);
-  }
+  /// Stack-allocated liveness for a single SSA def.
+  struct LivenessState {
+    BitfieldRef<SSAPrunedLiveness>::StackState state;
 
-  void maybeNotifyFinalConsumingUse(Operand *use) {
-    if (!moveOnlyFinalConsumingUse)
-      return;
-    moveOnlyFinalConsumingUse(use);
-  }
+    LivenessState(CanonicalizeOSSALifetime &parent, SILValue def)
+        : state(parent.liveness, def->getFunction()) {
+      parent.initializeLiveness(def);
+    }
+  };
 
-  CanonicalizeOSSALifetime(
-      bool pruneDebugMode, bool maximizeLifetime,
-      NonLocalAccessBlockAnalysis *accessBlockAnalysis, DominanceInfo *domTree,
-      InstructionDeleter &deleter,
-      std::function<void(Operand *)> moveOnlyCopyValueNotification = nullptr,
-      std::function<void(Operand *)> moveOnlyFinalConsumingUse = nullptr)
+  CanonicalizeOSSALifetime(bool pruneDebugMode, bool maximizeLifetime,
+                           SILFunction *function,
+                           NonLocalAccessBlockAnalysis *accessBlockAnalysis,
+                           DominanceInfo *domTree,
+                           BasicCalleeAnalysis *calleeAnalysis,
+                           InstructionDeleter &deleter)
       : pruneDebugMode(pruneDebugMode), maximizeLifetime(maximizeLifetime),
-        moveOnlyCopyValueNotification(moveOnlyCopyValueNotification),
-        moveOnlyFinalConsumingUse(moveOnlyFinalConsumingUse),
         accessBlockAnalysis(accessBlockAnalysis), domTree(domTree),
-        deleter(deleter),
-        liveness(maximizeLifetime ? &discoveredBlocks : nullptr) {}
+        calleeAnalysis(calleeAnalysis), deleter(deleter) {}
 
-  SILValue getCurrentDef() const { return liveness.getDef(); }
+  SILValue getCurrentDef() const { return currentDef; }
 
-  void initDef(SILValue def) {
-    assert(consumingBlocks.empty() && debugValues.empty() && liveness.empty());
+  void initializeLiveness(SILValue def) {
+    assert(consumingBlocks.empty() && debugValues.empty());
     // Clear the cached analysis pointer just in case the client invalidates the
     // analysis, freeing its memory.
     accessBlocks = nullptr;
     consumes.clear();
     destroys.clear();
 
-    liveness.initializeDef(def);
+    currentDef = def;
+
+    if (maximizeLifetime || respectsDeinitBarriers()) {
+      liveness->initializeDiscoveredBlocks(&discoveredBlocks);
+    }
+    liveness->initializeDef(getCurrentDef());
   }
 
-  void clearLiveness() {
+  void clear() {
     consumingBlocks.clear();
     debugValues.clear();
-    liveness.clear();
     discoveredBlocks.clear();
   }
 
@@ -343,13 +345,69 @@ public:
   /// operands.
   bool canonicalizeValueLifetime(SILValue def);
 
+  /// Compute the liveness information for \p def. But do not do any rewriting
+  /// or computation of boundaries.
+  ///
+  /// The intention is that this is used if one wants to emit diagnostics using
+  /// the liveness information before doing any rewriting.
+  ///
+  /// Requires an active on-stack instance of LivenessState.
+  ///
+  ///     LivenessState livenessState(*this, def);
+  ///
+  bool computeLiveness();
+
+  /// Given the already computed liveness boundary for the given def, rewrite
+  /// copies of def as appropriate.
+  ///
+  /// Requires an active on-stack instance of LivenessState.
+  void rewriteLifetimes();
+
+  /// Return the pure original boundary just based off of liveness information
+  /// without maximizing or extending liveness.
+  ///
+  /// Requires an active on-stack instance of LivenessState.
+  void findOriginalBoundary(PrunedLivenessBoundary &resultingOriginalBoundary);
+
   InstModCallbacks &getCallbacks() { return deleter.getCallbacks(); }
 
+  using IsInterestingUser = PrunedLiveness::IsInterestingUser;
+
+  /// Helper method that returns the isInterestingUser status of \p user in the
+  /// passed in Liveness.
+  ///
+  /// NOTE: Only call this after calling computeLivenessBoundary or the results
+  /// will not be initialized.
+  IsInterestingUser isInterestingUser(SILInstruction *user) const {
+    return liveness->isInterestingUser(user);
+  }
+
+  using LifetimeEndingUserRange = PrunedLiveness::LifetimeEndingUserRange;
+  LifetimeEndingUserRange getLifetimeEndingUsers() const {
+    return liveness->getLifetimeEndingUsers();
+  }
+
+  using NonLifetimeEndingUserRange = PrunedLiveness::NonLifetimeEndingUserRange;
+  NonLifetimeEndingUserRange getNonLifetimeEndingUsers() const {
+    return liveness->getNonLifetimeEndingUsers();
+  }
+
+  using UserRange = PrunedLiveness::ConstUserRange;
+  UserRange getUsers() const { return liveness->getAllUsers(); }
+
 private:
+  bool respectsDeinitBarriers() const {
+    if (!currentDef->isLexical())
+      return false;
+    auto &module = currentDef->getFunction()->getModule();
+    return module.getASTContext().SILOpts.supportsLexicalLifetimes(module);
+  }
+
   void recordDebugValue(DebugValueInst *dvi) { debugValues.insert(dvi); }
 
-  void recordConsumingUse(Operand *use) {
-    consumingBlocks.insert(use->getUser()->getParent());
+  void recordConsumingUse(Operand *use) { recordConsumingUser(use->getUser()); }
+  void recordConsumingUser(SILInstruction *user) {
+    consumingBlocks.insert(user->getParent());
   }
   bool computeCanonicalLiveness();
 
@@ -357,10 +415,11 @@ private:
 
   void extendLivenessThroughOverlappingAccess();
 
-  void findOriginalBoundary(PrunedLivenessBoundary &boundary);
-
   void findExtendedBoundary(PrunedLivenessBoundary const &originalBoundary,
                             PrunedLivenessBoundary &boundary);
+
+  void findDestroysOutsideBoundary(SmallVectorImpl<SILInstruction *> &destroys);
+  void extendLivenessToDeinitBarriers();
 
   void extendUnconsumedLiveness(PrunedLivenessBoundary const &boundary);
 

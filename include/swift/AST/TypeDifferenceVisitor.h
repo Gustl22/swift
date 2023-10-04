@@ -136,9 +136,22 @@ public:
                                type2->getElementTypes());
   }
 
+  bool visitSILPackType(CanSILPackType type1, CanSILPackType type2) {
+    if (type1->isElementAddress() != type2->isElementAddress())
+      return asImpl().visitDifferentTypeStructure(type1, type2);
+    return visitComponentArray(type1, type2,
+                               type1->getElementTypes(),
+                               type2->getElementTypes());
+  }
+
   bool visitPackExpansionType(CanPackExpansionType type1,
                               CanPackExpansionType type2) {
     return asImpl().visit(type1.getPatternType(), type2.getPatternType());
+  }
+
+  bool visitPackElementType(CanPackElementType type1,
+                            CanPackElementType type2) {
+    return asImpl().visit(type1.getPackType(), type2.getPackType());
   }
 
   bool visitTupleType(CanTupleType type1, CanTupleType type2) {

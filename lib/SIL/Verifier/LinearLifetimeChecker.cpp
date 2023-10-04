@@ -47,7 +47,7 @@ struct State {
   /// If we are checking for a specific value, this is that value. This is only
   /// used for diagnostic purposes. The algorithm if this is set works on the
   /// parent block of the value.
-  Optional<SILValue> value;
+  llvm::Optional<SILValue> value;
 
   /// The insertion point where the live range begins. If the field value is not
   /// None, then:
@@ -72,11 +72,11 @@ struct State {
   /// If non-null a callback that we should pass any detected leaking blocks for
   /// our caller. The intention is that this can be used in a failing case to
   /// put in missing destroys.
-  Optional<function_ref<void(SILBasicBlock *)>> leakingBlockCallback;
+  llvm::Optional<function_ref<void(SILBasicBlock *)>> leakingBlockCallback;
 
   /// If non-null a callback that we should pass all uses that we detect are not
   /// within the linear lifetime we are checking.
-  Optional<function_ref<void(Operand *)>>
+  llvm::Optional<function_ref<void(Operand *)>>
       nonConsumingUseOutsideLifetimeCallback;
 
   /// The list of passed in consuming uses.
@@ -105,12 +105,12 @@ struct State {
   /// terminates.
   SmallSetVector<SILBasicBlock *, 8> successorBlocksThatMustBeVisited;
 
-  State(SILValue value,
-        LinearLifetimeChecker::ErrorBuilder &errorBuilder,
-        Optional<function_ref<void(SILBasicBlock *)>> leakingBlockCallback,
-        Optional<function_ref<void(Operand *)>>
-            nonConsumingUseOutsideLifetimeCallback,
-        ArrayRef<Operand *> consumingUses, ArrayRef<Operand *> nonConsumingUses)
+  State(
+      SILValue value, LinearLifetimeChecker::ErrorBuilder &errorBuilder,
+      llvm::Optional<function_ref<void(SILBasicBlock *)>> leakingBlockCallback,
+      llvm::Optional<function_ref<void(Operand *)>>
+          nonConsumingUseOutsideLifetimeCallback,
+      ArrayRef<Operand *> consumingUses, ArrayRef<Operand *> nonConsumingUses)
       : value(value), beginInst(value->getDefiningInsertionPoint()),
         errorBuilder(errorBuilder), visitedBlocks(value->getFunction()),
         leakingBlockCallback(leakingBlockCallback),
@@ -119,12 +119,13 @@ struct State {
         consumingUses(consumingUses), nonConsumingUses(nonConsumingUses),
         blocksWithConsumingUses(value->getFunction()) {}
 
-  State(SILBasicBlock *beginBlock,
-        LinearLifetimeChecker::ErrorBuilder &errorBuilder,
-        Optional<function_ref<void(SILBasicBlock *)>> leakingBlockCallback,
-        Optional<function_ref<void(Operand *)>>
-            nonConsumingUseOutsideLifetimeCallback,
-        ArrayRef<Operand *> consumingUses, ArrayRef<Operand *> nonConsumingUses)
+  State(
+      SILBasicBlock *beginBlock,
+      LinearLifetimeChecker::ErrorBuilder &errorBuilder,
+      llvm::Optional<function_ref<void(SILBasicBlock *)>> leakingBlockCallback,
+      llvm::Optional<function_ref<void(Operand *)>>
+          nonConsumingUseOutsideLifetimeCallback,
+      ArrayRef<Operand *> consumingUses, ArrayRef<Operand *> nonConsumingUses)
       : value(), beginInst(&*beginBlock->begin()), errorBuilder(errorBuilder),
         visitedBlocks(beginBlock->getParent()),
         leakingBlockCallback(leakingBlockCallback),
@@ -161,12 +162,12 @@ struct State {
   /// Once we have setup all of our consuming/non-consuming blocks and have
   /// validated that all intra-block dataflow is safe, perform the inter-block
   /// dataflow.
-  void performDataflow(DeadEndBlocks &deBlocks);
+  void performDataflow(DeadEndBlocks *deBlocks);
 
   /// After we have performed the dataflow, check the end state of our dataflow
   /// for validity. If this is a linear typed value, return true. Return false
   /// otherwise.
-  void checkDataflowEndState(DeadEndBlocks &deBlocks);
+  void checkDataflowEndState(DeadEndBlocks *deBlocks);
 
   void dumpConsumingUsers() const {
     llvm::errs() << "Consuming Users:\n";
@@ -295,7 +296,7 @@ void State::checkForSameBlockUseAfterFree(Operand *consumingUse,
   // If we do not have any consuming uses in the same block as our
   // consuming user, then we can not have a same block use-after-free.
   auto iter = blocksWithNonConsumingUses.find(userBlock);
-  if (!iter.hasValue()) {
+  if (!iter.has_value()) {
     return;
   }
 
@@ -317,7 +318,7 @@ void State::checkForSameBlockUseAfterFree(Operand *consumingUse,
     } else if (nonConsumingUse->getOperandOwnership() ==
                    OperandOwnership::Reborrow ||
                nonConsumingUse->getOperandOwnership() ==
-                   OperandOwnership::GuaranteedForwardingPhi) {
+                   OperandOwnership::GuaranteedForwarding) {
       continue;
     }
 
@@ -410,7 +411,7 @@ void State::checkPredsForDoubleConsume(SILBasicBlock *userBlock) {
 //                                  Dataflow
 //===----------------------------------------------------------------------===//
 
-void State::performDataflow(DeadEndBlocks &deBlocks) {
+void State::performDataflow(DeadEndBlocks *deBlocks) {
   LLVM_DEBUG(llvm::dbgs() << "    Beginning to check dataflow constraints\n");
   // Until the worklist is empty...
   while (!worklist.empty()) {
@@ -446,7 +447,7 @@ void State::performDataflow(DeadEndBlocks &deBlocks) {
 
       // Then check if the successor is a transitively unreachable block. In
       // such a case, we ignore it since we are going to leak along that path.
-      if (deBlocks.isDeadEnd(succBlock))
+      if (deBlocks && deBlocks->isDeadEnd(succBlock))
         continue;
 
       // Otherwise, add the successor to our SuccessorBlocksThatMustBeVisited
@@ -483,7 +484,7 @@ void State::performDataflow(DeadEndBlocks &deBlocks) {
   }
 }
 
-void State::checkDataflowEndState(DeadEndBlocks &deBlocks) {
+void State::checkDataflowEndState(DeadEndBlocks *deBlocks) {
   if (!successorBlocksThatMustBeVisited.empty()) {
     // If we are asked to store any leaking blocks, put them in the leaking
     // blocks array.
@@ -518,7 +519,7 @@ void State::checkDataflowEndState(DeadEndBlocks &deBlocks) {
   // be a use-before-def or a use-after-free.
   for (auto pair : blocksWithNonConsumingUses.getRange()) {
     auto *block = pair.first;
-    if (deBlocks.isDeadEnd(block)) {
+    if (deBlocks && deBlocks->isDeadEnd(block)) {
       continue;
     }
 
@@ -551,8 +552,8 @@ void State::checkDataflowEndState(DeadEndBlocks &deBlocks) {
 LinearLifetimeChecker::Error LinearLifetimeChecker::checkValueImpl(
     SILValue value, ArrayRef<Operand *> consumingUses,
     ArrayRef<Operand *> nonConsumingUses, ErrorBuilder &errorBuilder,
-    Optional<function_ref<void(SILBasicBlock *)>> leakingBlockCallback,
-    Optional<function_ref<void(Operand *)>>
+    llvm::Optional<function_ref<void(SILBasicBlock *)>> leakingBlockCallback,
+    llvm::Optional<function_ref<void(Operand *)>>
         nonConsumingUseOutsideLifetimeCallback) {
   // FIXME: rdar://71240363. This assert does not make sense because
   // consumingUses in some cases only contains the destroying uses. Owned values
@@ -601,7 +602,7 @@ LinearLifetimeChecker::Error LinearLifetimeChecker::checkValueImpl(
     for (auto *use : nonConsumingUses) {
       auto *useParent = use->getUser()->getParent();
       if (useParent == value->getParentBlock() ||
-          deadEndBlocks.isDeadEnd(useParent)) {
+          (deadEndBlocks && deadEndBlocks->isDeadEnd(useParent))) {
         continue;
       }
 
@@ -660,7 +661,7 @@ LinearLifetimeChecker::Error LinearLifetimeChecker::checkValue(
     SILValue value, ArrayRef<Operand *> consumingUses,
     ArrayRef<Operand *> nonConsumingUses, ErrorBuilder &errorBuilder) {
   return checkValueImpl(value, consumingUses, nonConsumingUses, errorBuilder,
-                        None, None);
+                        llvm::None, llvm::None);
 }
 
 LinearLifetimeChecker::Error LinearLifetimeChecker::checkValue(
@@ -668,7 +669,7 @@ LinearLifetimeChecker::Error LinearLifetimeChecker::checkValue(
     ArrayRef<Operand *> nonConsumingUses, ErrorBuilder &errorBuilder,
     function_ref<void(SILBasicBlock *)> leakingBlocksCallback) {
   return checkValueImpl(value, consumingUses, nonConsumingUses, errorBuilder,
-                        leakingBlocksCallback, None);
+                        leakingBlocksCallback, llvm::None);
 }
 
 bool LinearLifetimeChecker::completeConsumingUseSet(
@@ -705,13 +706,13 @@ bool LinearLifetimeChecker::usesNotContainedWithinLifetime(
       ErrorBehaviorKind::StoreNonConsumingUsesOutsideLifetime);
   ErrorBuilder errorBuilder(*value->getFunction(), errorBehavior);
 
-  using OptType = Optional<function_ref<void(Operand *)>>;
+  using OptType = llvm::Optional<function_ref<void(Operand *)>>;
 #ifndef NDEBUG
   SmallVector<Operand *, 32> uniqueUsers;
 #endif
   unsigned numFoundUses = 0;
   auto error = checkValueImpl(value, consumingUses, usesToTest, errorBuilder,
-                              None, OptType([&](Operand *use) {
+                              llvm::None, OptType([&](Operand *use) {
 #ifndef NDEBUG
                                 uniqueUsers.push_back(use);
 #endif

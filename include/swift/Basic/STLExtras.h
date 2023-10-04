@@ -14,10 +14,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SWIFT_BASIC_INTERLEAVE_H
-#define SWIFT_BASIC_INTERLEAVE_H
+#ifndef SWIFT_BASIC_STLEXTRAS_H
+#define SWIFT_BASIC_STLEXTRAS_H
 
-#include "swift/Basic/LLVM.h"
+#include "llvm/ADT/None.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Casting.h"
@@ -405,7 +405,7 @@ class OptionalTransformIterator {
       typename std::iterator_traits<Iterator>::reference;
 
   using ResultReference =
-      typename std::result_of<OptionalTransform(UnderlyingReference)>::type;
+      typename std::invoke_result<OptionalTransform, UnderlyingReference>::type;
 
 public:
   /// Used to indicate when the current iterator has already been
@@ -531,7 +531,7 @@ struct DowncastAsOptional {
     if (auto result = llvm::dyn_cast<Subclass>(value))
       return result;
 
-    return None;
+    return llvm::None;
   }
 
   template <typename Superclass>
@@ -540,7 +540,7 @@ struct DowncastAsOptional {
     if (auto result = llvm::dyn_cast<Subclass>(value))
       return result;
 
-    return None;
+    return llvm::None;
   }
 };
 
@@ -785,4 +785,4 @@ void emplace_back_all(VectorType &vector) {}
 
 } // end namespace swift
 
-#endif // SWIFT_BASIC_INTERLEAVE_H
+#endif // SWIFT_BASIC_STLEXTRAS_H

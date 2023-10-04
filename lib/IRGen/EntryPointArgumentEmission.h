@@ -18,7 +18,7 @@ class Value;
 
 namespace swift {
 
-struct GenericRequirement;
+class GenericRequirement;
 class SILArgument;
 
 namespace irgen {
@@ -45,6 +45,7 @@ class NativeCCEntryPointArgumentEmission
 public:
   virtual void mapAsyncParameters() = 0;
   virtual llvm::Value *getCallerErrorResultArgument() = 0;
+  virtual llvm::Value *getCallerTypedErrorResultArgument() = 0;
   virtual llvm::Value *getContext() = 0;
   virtual Explosion getArgumentExplosion(unsigned index, unsigned size) = 0;
   virtual llvm::Value *getSelfWitnessTable() = 0;

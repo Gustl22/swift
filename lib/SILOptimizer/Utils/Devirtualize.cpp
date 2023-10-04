@@ -156,6 +156,7 @@ static bool isKnownFinalClass(ClassDecl *cd, SILModule &module,
   case AccessLevel::Open:
     return false;
   case AccessLevel::Public:
+  case AccessLevel::Package:
   case AccessLevel::Internal:
     if (!module.isWholeModule())
       return false;
@@ -177,6 +178,7 @@ static bool isKnownFinalClass(ClassDecl *cd, SILModule &module,
       case AccessLevel::Open:
         return false;
       case AccessLevel::Public:
+      case AccessLevel::Package:
       case AccessLevel::Internal:
         if (!module.isWholeModule())
           return false;
@@ -557,7 +559,7 @@ replaceBeginApplyInst(SILBuilder &builder, SILLocation loc,
     auto newYield = newYields[i];
     // Insert any end_borrow if the yielded value before the token's uses.
     SmallVector<SILInstruction *, 4> users(
-      makeUserIteratorRange(oldBAI->getTokenResult()->getUses()));
+      makeUserIteratorRange(oldYield->getUses()));
     auto yieldCastRes = castValueToABICompatibleType(
       &builder, loc, newYield, newYield->getType(), oldYield->getType(),
       users);
@@ -892,15 +894,13 @@ std::pair<FullApplySite, bool> swift::tryDevirtualizeClassMethod(
 /// \param classWitness The ClassDecl if this is a class witness method
 static SubstitutionMap
 getWitnessMethodSubstitutions(
-    ModuleDecl *mod,
+    ASTContext &ctx,
     ProtocolConformanceRef conformanceRef,
     GenericSignature requirementSig,
     GenericSignature witnessThunkSig,
     SubstitutionMap origSubMap,
     bool isSelfAbstract,
     ClassDecl *classWitness) {
-
-  auto &ctx = mod->getASTContext();
 
   if (witnessThunkSig.isNull())
     return SubstitutionMap();
@@ -915,7 +915,7 @@ getWitnessMethodSubstitutions(
 
   // If `Self` maps to a bound generic type, this gives us the
   // substitutions for the concrete type's generic parameters.
-  auto baseSubMap = conformance->getSubstitutions(mod);
+  auto baseSubMap = conformance->getSubstitutionMap();
 
   unsigned baseDepth = 0;
   auto *rootConformance = conformance->getRootConformance();
@@ -1021,7 +1021,7 @@ swift::getWitnessMethodSubstitutions(SILModule &module, ApplySite applySite,
 
   SubstitutionMap origSubs = applySite.getSubstitutionMap();
 
-  auto *mod = module.getSwiftModule();
+  auto &ctx = module.getASTContext();
   bool isSelfAbstract =
       witnessFnTy
           ->getSelfInstanceType(
@@ -1030,7 +1030,7 @@ swift::getWitnessMethodSubstitutions(SILModule &module, ApplySite applySite,
   auto *classWitness = witnessFnTy->getWitnessMethodClass(
       module, applySite.getFunction()->getTypeExpansionContext());
 
-  return ::getWitnessMethodSubstitutions(mod, cRef, requirementSig,
+  return ::getWitnessMethodSubstitutions(ctx, cRef, requirementSig,
                                          witnessThunkSig, origSubs,
                                          isSelfAbstract, classWitness);
 }
@@ -1122,11 +1122,38 @@ devirtualizeWitnessMethod(ApplySite applySite, SILFunction *f,
   return {newApplySite, changedCFG};
 }
 
-static bool canDevirtualizeWitnessMethod(ApplySite applySite) {
+static bool isNonGenericThunkOfGenericExternalFunction(SILFunction *thunk) {
+  if (!thunk->isThunk())
+    return false;
+  if (thunk->getGenericSignature())
+    return false;
+  for (SILBasicBlock &block : *thunk) {
+    for (SILInstruction &inst : block) {
+      if (FullApplySite fas = FullApplySite::isa(&inst)) {
+        if (SILFunction *calledFunc = fas.getReferencedFunctionOrNull()) {
+          if (fas.hasSubstitutions() && !calledFunc->isDefinition())
+            return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+static bool canDevirtualizeWitnessMethod(ApplySite applySite, bool isMandatory) {
   SILFunction *f;
   SILWitnessTable *wt;
 
   auto *wmi = cast<WitnessMethodInst>(applySite.getCallee());
+
+  // Handle vanishing tuples: don't devirtualize a call to a tuple conformance
+  // if the lookup type can possibly be unwrapped after substitution.
+  if (auto tupleType = dyn_cast<TupleType>(wmi->getLookupType())) {
+    if (tupleType->containsPackExpansionType() &&
+        tupleType->getNumScalarElements() <= 1) {
+      return false;
+    }
+  }
 
   std::tie(f, wt) = applySite.getModule().lookUpFunctionInWitnessTable(
       wmi->getConformance(), wmi->getMember(), SILModule::LinkingMode::LinkAll);
@@ -1150,6 +1177,25 @@ static bool canDevirtualizeWitnessMethod(ApplySite applySite) {
     return false;
   }
 
+  // The following check is for performance reasons: if `f` is a non-generic thunk
+  // which calls a (not inlinable) generic function in the defining module, it's
+  // more efficient to not devirtualize, but call the non-generic thunk - even though
+  // it's done through the witness table.
+  // Example:
+  // ```
+  //   protocol P {
+  //     func f(x: [Int])   // not generic
+  //   }
+  //   struct S: P {
+  //     func f(x: some RandomAccessCollection<Int>) { ... } // generic
+  //   }
+  // ```
+  // In the defining module, the generic conformance can be specialized (which is not
+  // possible in the client module, because it's not inlinable).
+  if (!isMandatory && isNonGenericThunkOfGenericExternalFunction(f)) {
+    return false;
+  }
+
   // FIXME: devirtualizeWitnessMethod does not support cases with covariant
   // 'Self'-rooted type parameters nested inside a collection type, like
   // '[Self]' or '[* : Self.A]', because it doesn't know how to deal with
@@ -1164,7 +1210,18 @@ static bool canDevirtualizeWitnessMethod(ApplySite applySite) {
   if (!interfaceTy->hasTypeParameter())
     return true;
 
-  auto *const selfGP = wmi->getLookupProtocol()->getProtocolSelfType();
+  auto subs = getWitnessMethodSubstitutions(f->getModule(), applySite,
+                                            f, wmi->getConformance());
+  CanSILFunctionType substCalleTy = f->getLoweredFunctionType()->substGenericArgs(
+      f->getModule(), subs,
+      applySite.getFunction()->getTypeExpansionContext());
+  CanSILFunctionType applySubstCalleeTy = applySite.getSubstCalleeType();
+
+  // If the function types match, there is no problem.
+  if (substCalleTy == applySubstCalleeTy)
+    return true;
+
+  auto selfGP = wmi->getLookupProtocol()->getSelfInterfaceType();
   auto isSelfRootedTypeParameter = [selfGP](Type T) -> bool {
     if (!T->hasTypeParameter())
       return false;
@@ -1200,8 +1257,9 @@ static bool canDevirtualizeWitnessMethod(ApplySite applySite) {
 /// of a function_ref, returning the new apply.
 std::pair<ApplySite, bool>
 swift::tryDevirtualizeWitnessMethod(ApplySite applySite,
-                                    OptRemark::Emitter *ore) {
-  if (!canDevirtualizeWitnessMethod(applySite))
+                                    OptRemark::Emitter *ore,
+                                    bool isMandatory) {
+  if (!canDevirtualizeWitnessMethod(applySite, isMandatory))
     return {ApplySite(), false};
 
   SILFunction *f;
@@ -1225,7 +1283,7 @@ swift::tryDevirtualizeWitnessMethod(ApplySite applySite,
 /// Return the new apply and true if the CFG was also modified.
 std::pair<ApplySite, bool>
 swift::tryDevirtualizeApply(ApplySite applySite, ClassHierarchyAnalysis *cha,
-                            OptRemark::Emitter *ore) {
+                            OptRemark::Emitter *ore, bool isMandatory) {
   LLVM_DEBUG(llvm::dbgs() << "    Trying to devirtualize: "
                           << *applySite.getInstruction());
 
@@ -1235,7 +1293,7 @@ swift::tryDevirtualizeApply(ApplySite applySite, ClassHierarchyAnalysis *cha,
   //   %9 = apply %8<Self = CodeUnit?>(%6#1) : ...
   //
   if (isa<WitnessMethodInst>(applySite.getCallee()))
-    return tryDevirtualizeWitnessMethod(applySite, ore);
+    return tryDevirtualizeWitnessMethod(applySite, ore, isMandatory);
 
   // TODO: check if we can also de-virtualize partial applies of class methods.
   FullApplySite fas = FullApplySite::isa(applySite.getInstruction());
@@ -1307,7 +1365,7 @@ bool swift::canDevirtualizeApply(FullApplySite applySite,
   //   %9 = apply %8<Self = CodeUnit?>(%6#1) : ...
   //
   if (isa<WitnessMethodInst>(applySite.getCallee()))
-    return canDevirtualizeWitnessMethod(applySite);
+    return canDevirtualizeWitnessMethod(applySite, /*isMandatory*/ false);
 
   /// Optimize a class_method and alloc_ref pair into a direct function
   /// reference:

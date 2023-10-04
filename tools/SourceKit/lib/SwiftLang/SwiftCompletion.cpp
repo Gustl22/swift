@@ -23,7 +23,7 @@
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/IDE/CodeCompletionCache.h"
 #include "swift/IDE/CodeCompletionResultPrinter.h"
-#include "swift/IDETool/CompletionInstance.h"
+#include "swift/IDETool/IDEInspectionInstance.h"
 
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -105,12 +105,13 @@ static void swiftCodeCompleteImpl(
   CompletionContext.setAddCallWithNoDefaultArgs(opts.addCallWithNoDefaultArgs);
 
   Lang.performWithParamsToCompletionLikeOperation(
-      UnresolvedInputFile, Offset, Args, FileSystem, CancellationToken,
+      UnresolvedInputFile, Offset, /*InsertCodeCompletionToken=*/true, Args,
+      FileSystem, CancellationToken,
       [&](CancellableResult<SwiftLangSupport::CompletionLikeOperationParams>
               ParamsResult) {
         ParamsResult.mapAsync<CodeCompleteResult>(
             [&](auto &CIParams, auto DeliverTransformed) {
-              Lang.getCompletionInstance()->codeComplete(
+              Lang.getIDEInspectionInstance()->codeComplete(
                   CIParams.Invocation, Args, FileSystem,
                   CIParams.completionBuffer, Offset, CIParams.DiagC,
                   CompletionContext, CIParams.CancellationFlag,
@@ -190,7 +191,7 @@ deliverCodeCompleteResults(SourceKit::CodeCompletionConsumer &SKConsumer,
 void SwiftLangSupport::codeComplete(
     llvm::MemoryBuffer *UnresolvedInputFile, unsigned Offset,
     OptionsDictionary *options, SourceKit::CodeCompletionConsumer &SKConsumer,
-    ArrayRef<const char *> Args, Optional<VFSOptions> vfsOptions,
+    ArrayRef<const char *> Args, llvm::Optional<VFSOptions> vfsOptions,
     SourceKitCancellationToken CancellationToken) {
 
   CodeCompletion::Options CCOpts;
@@ -205,7 +206,8 @@ void SwiftLangSupport::codeComplete(
   std::string error;
   // FIXME: the use of None as primary file is to match the fact we do not read
   // the document contents using the editor documents infrastructure.
-  auto fileSystem = getFileSystem(vfsOptions, /*primaryFile=*/None, error);
+  auto fileSystem =
+      getFileSystem(vfsOptions, /*primaryFile=*/llvm::None, error);
   if (!fileSystem) {
     return SKConsumer.failed(error);
   }
@@ -224,7 +226,7 @@ static void getResultStructure(
   auto *CCStr = result.getCompletionString();
   auto FirstTextChunk = CCStr->getFirstTextChunkIndex(leadingPunctuation);
 
-  if (!FirstTextChunk.hasValue())
+  if (!FirstTextChunk.has_value())
     return;
 
   bool isOperator = result.isOperator();
@@ -919,8 +921,7 @@ static void transformAndForwardResults(
         *contextFreeResult, SemanticContextKind::CurrentNominal,
         CodeCompletionFlairBit::ExpressionSpecific,
         exactMatch ? exactMatch->getNumBytesToErase() : 0,
-        /*TypeContext=*/nullptr, /*DC=*/nullptr, /*USRTypeContext=*/nullptr,
-        /*CanCurrDeclContextHandleAsync=*/false,
+        CodeCompletionResultTypeRelation::Unrelated,
         ContextualNotRecommendedReason::None);
 
     SwiftCompletionInfo info;
@@ -1095,7 +1096,7 @@ void SwiftLangSupport::codeCompleteOpen(
     StringRef name, llvm::MemoryBuffer *inputBuf, unsigned offset,
     OptionsDictionary *options, ArrayRef<FilterRule> rawFilterRules,
     GroupedCodeCompletionConsumer &consumer, ArrayRef<const char *> args,
-    Optional<VFSOptions> vfsOptions,
+    llvm::Optional<VFSOptions> vfsOptions,
     SourceKitCancellationToken CancellationToken) {
   StringRef filterText;
   unsigned resultOffset = 0;
@@ -1111,7 +1112,7 @@ void SwiftLangSupport::codeCompleteOpen(
   // FIXME: the use of None as primary file is to match the fact we do not read
   // the document contents using the editor documents infrastructure.
   auto fileSystem =
-      getFileSystem(vfsOptions, /*primaryFile=*/None, fileSystemError);
+      getFileSystem(vfsOptions, /*primaryFile=*/llvm::None, fileSystemError);
   if (!fileSystem)
     return consumer.failed(fileSystemError);
 

@@ -38,14 +38,10 @@ struct ExpectedFixIt;
 
 /// A range expressed in terms of line-and-column pairs.
 struct LineColumnRange {
-  static constexpr unsigned NoValue = ~0u;
-
   unsigned StartLine, StartCol;
   unsigned EndLine, EndCol;
 
-  LineColumnRange()
-      : StartLine(NoValue), StartCol(NoValue), EndLine(NoValue),
-        EndCol(NoValue) {}
+  LineColumnRange() : StartLine(0), StartCol(0), EndLine(0), EndCol(0) {}
 };
 
 class CapturedFixItInfo final {
@@ -63,9 +59,7 @@ public:
   /// Obtain the line-column range corresponding to the fix-it's
   /// replacement range.
   const LineColumnRange &getLineColumnRange(const SourceManager &SM,
-                                            unsigned BufferID,
-                                            bool ComputeStartLocLine,
-                                            bool ComputeEndLocLine) const;
+                                            unsigned BufferID) const;
 };
 
 struct CapturedDiagnosticInfo {
@@ -100,12 +94,15 @@ class DiagnosticVerifier : public DiagnosticConsumer {
   SmallVector<unsigned, 4> AdditionalBufferIDs;
   bool AutoApplyFixes;
   bool IgnoreUnknown;
+  ArrayRef<std::string> AdditionalExpectedPrefixes;
 
 public:
   explicit DiagnosticVerifier(SourceManager &SM, ArrayRef<unsigned> BufferIDs,
-                              bool AutoApplyFixes, bool IgnoreUnknown)
+                              bool AutoApplyFixes, bool IgnoreUnknown,
+                              ArrayRef<std::string> AdditionalExpectedPrefixes)
       : SM(SM), BufferIDs(BufferIDs), AutoApplyFixes(AutoApplyFixes),
-        IgnoreUnknown(IgnoreUnknown) {}
+        IgnoreUnknown(IgnoreUnknown),
+        AdditionalExpectedPrefixes(AdditionalExpectedPrefixes) {}
 
   void appendAdditionalBufferID(unsigned bufferID) {
     AdditionalBufferIDs.push_back(bufferID);

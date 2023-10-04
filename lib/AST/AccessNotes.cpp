@@ -28,7 +28,7 @@
 namespace swift {
 
 AccessNoteDeclName::AccessNoteDeclName()
-  : parentNames(), name(), accessorKind(None) { }
+    : parentNames(), name(), accessorKind(llvm::None) {}
 
 AccessNoteDeclName::AccessNoteDeclName(ASTContext &ctx, StringRef str) {
   auto parsedName = parseDeclName(str);
@@ -44,7 +44,7 @@ AccessNoteDeclName::AccessNoteDeclName(ASTContext &ctx, StringRef str) {
   else if (parsedName.IsSetter)
     accessorKind = AccessorKind::Set;
   else
-    accessorKind = None;
+    accessorKind = llvm::None;
 
   name = parsedName.formDeclName(ctx, /*isSubscript=*/true);
 }
@@ -61,7 +61,7 @@ bool AccessNoteDeclName::matches(ValueDecl *VD) const {
       return false;
     lookupVD = accessor->getStorage();
   }
-  else if (accessorKind.hasValue())
+  else if (accessorKind.has_value())
     return false;
 
   // Check that `name` matches `lookupVD`.
@@ -206,7 +206,7 @@ AccessNotesFile::load(ASTContext &ctx, const llvm::MemoryBuffer *buffer) {
   yamlIn >> notes;
 
   if (yamlIn.error())
-    return None;
+    return llvm::None;
 
   return notes;
 }
@@ -260,7 +260,7 @@ void MappingTraits<AccessNote>::mapping(IO &io, AccessNote &note) {
 }
 
 std::string MappingTraits<AccessNote>::validate(IO &io, AccessNote &note) {
-  if (note.ObjCName.hasValue()) {
+  if (note.ObjCName.has_value()) {
     if (!note.ObjC)
       note.ObjC = true;
     else if (!*note.ObjC)

@@ -49,9 +49,13 @@ else()
     HAS_SWIFT_MODULES
   )
 endif()
+set_target_properties(sourcekitdInProc PROPERTIES
+  DEFINE_SYMBOL sourcekitd_EXPORTS)
 target_link_libraries(sourcekitdInProc PRIVATE
   SourceKitSwiftLang
-  sourcekitdAPI)
+  sourcekitdAPI
+  sourcekitdService
+  swiftIDETool)
 
 # While it is possible to build this as a static library,
 # to get the runtime paths correct, it must be linked into a binary

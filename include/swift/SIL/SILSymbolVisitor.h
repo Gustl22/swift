@@ -109,7 +109,6 @@ public:
   virtual void addMethodLookupFunction(ClassDecl *CD) {}
   virtual void addNominalTypeDescriptor(NominalTypeDecl *NTD) {}
   virtual void addObjCInterface(ClassDecl *CD) {}
-  virtual void addObjCMetaclass(ClassDecl *CD) {}
   virtual void addObjCMethod(AbstractFunctionDecl *AFD) {}
   virtual void addObjCResilientClassStub(ClassDecl *CD) {}
   virtual void addOpaqueTypeDescriptor(OpaqueTypeDecl *OTD) {}
@@ -129,6 +128,14 @@ public:
 
 template <typename F>
 void enumerateFunctionsForHasSymbol(SILModule &M, ValueDecl *D, F Handler) {
+  // Handle clang decls separately.
+  if (auto *clangDecl = D->getClangDecl()) {
+    if (isa<clang::FunctionDecl>(clangDecl))
+      Handler(SILDeclRef(D).asForeign());
+
+    return;
+  }
+
   class SymbolVisitor : public SILSymbolVisitor {
     F Handler;
 

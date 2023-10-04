@@ -14,10 +14,12 @@
 #include "Callee.h"
 #include "FixedTypeInfo.h"
 #include "GenEnum.h"
+#include "GenPointerAuth.h"
 #include "GenType.h"
 #include "GenericRequirement.h"
 #include "IRGen.h"
 #include "IRGenModule.h"
+#include "MetadataLayout.h"
 #include "NativeConventionSchema.h"
 
 // FIXME: This include should removed once getFunctionLoweredSignature() is
@@ -28,6 +30,7 @@
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Types.h"
+#include "swift/IRGen/Linking.h"
 #include "swift/SIL/SILFunctionBuilder.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/Subsystems.h"
@@ -38,8 +41,8 @@
 using namespace swift;
 using namespace irgen;
 
-static Optional<Type> getPrimitiveTypeFromLLVMType(ASTContext &ctx,
-                                                   const llvm::Type *type) {
+static llvm::Optional<Type>
+getPrimitiveTypeFromLLVMType(ASTContext &ctx, const llvm::Type *type) {
   if (const auto *intType = dyn_cast<llvm::IntegerType>(type)) {
     switch (intType->getBitWidth()) {
     case 1:
@@ -53,7 +56,7 @@ static Optional<Type> getPrimitiveTypeFromLLVMType(ASTContext &ctx,
     case 64:
       return ctx.getUInt64Type();
     default:
-      return None;
+      return llvm::None;
     }
   } else if (type->isFloatTy()) {
     return ctx.getFloatType();
@@ -63,7 +66,7 @@ static Optional<Type> getPrimitiveTypeFromLLVMType(ASTContext &ctx,
     return ctx.getOpaquePointerType();
   }
   // FIXME: Handle vector type.
-  return None;
+  return llvm::None;
 }
 
 namespace swift {
@@ -71,7 +74,7 @@ namespace swift {
 class IRABIDetailsProviderImpl {
 public:
   IRABIDetailsProviderImpl(ModuleDecl &mod, const IRGenOptions &opts)
-      : typeConverter(mod),
+      : typeConverter(mod, /*addressLowered=*/true),
         silMod(SILModule::createEmptyModule(&mod, typeConverter, silOpts)),
         IRGen(opts, *silMod), IGM(IRGen, IRGen.createTargetMachine()) {}
 
@@ -80,7 +83,7 @@ public:
     auto *TI = &IGM.getTypeInfoForUnlowered(TD->getDeclaredTypeInContext());
     auto *fixedTI = dyn_cast<FixedTypeInfo>(TI);
     if (!fixedTI)
-      return None;
+      return llvm::None;
     return IRABIDetailsProvider::SizeAndAlignment{
         fixedTI->getFixedSize().getValue(),
         fixedTI->getFixedAlignment().getValue()};
@@ -138,17 +141,17 @@ public:
     auto silFuncType = function->getLoweredFunctionType();
     // FIXME: Async function support.
     if (silFuncType->isAsync())
-      return None;
+      return llvm::None;
     if (silFuncType->getLanguage() != SILFunctionLanguage::Swift)
-      return None;
+      return llvm::None;
 
     // FIXME: Tuple parameter mapping support.
     llvm::SmallVector<const ParamDecl *, 8> silParamMapping;
     for (auto param : *fd->getParameters()) {
       if (auto *tuple =
-              param->getType()->getDesugaredType()->getAs<TupleType>()) {
+              param->getInterfaceType()->getAs<TupleType>()) {
         if (tuple->getNumElements() > 0)
-          return None;
+          return llvm::None;
       }
     }
 
@@ -197,9 +200,75 @@ public:
     // Return nothing if we were unable to represent the exact signature
     // parameters.
     if (signatureParamCount != abiDetails->numParamIRTypesInSignature)
-      return None;
+      return llvm::None;
 
     return result;
+  }
+
+  using MethodDispatchInfo = IRABIDetailsProvider::MethodDispatchInfo;
+
+  llvm::Optional<MethodDispatchInfo::PointerAuthDiscriminator>
+  getMethodPointerAuthInfo(const AbstractFunctionDecl *funcDecl,
+                           SILDeclRef method) {
+    // FIXME: Async support.
+    if (funcDecl->hasAsync())
+      return llvm::None;
+    const auto &schema = IGM.getOptions().PointerAuth.SwiftClassMethods;
+    if (!schema)
+      return llvm::None;
+    auto discriminator =
+        PointerAuthInfo::getOtherDiscriminator(IGM, schema, method);
+    return MethodDispatchInfo::PointerAuthDiscriminator{
+        discriminator->getZExtValue()};
+  }
+
+  llvm::Optional<MethodDispatchInfo>
+  getMethodDispatchInfo(const AbstractFunctionDecl *funcDecl) {
+    if (funcDecl->isSemanticallyFinal())
+      return MethodDispatchInfo::direct();
+    // If this is an override of an existing method, then lookup
+    // its base method in its base class.
+    if (auto *overridenDecl = funcDecl->getOverriddenDecl())
+      funcDecl = overridenDecl;
+    auto *parentClass = dyn_cast<ClassDecl>(funcDecl->getDeclContext());
+    if (!parentClass)
+      return MethodDispatchInfo::direct();
+    // Resilient indirect calls should go through a thunk.
+    if (parentClass->hasResilientMetadata())
+      return MethodDispatchInfo::thunk(
+          LinkEntity::forDispatchThunk(
+              SILDeclRef(const_cast<AbstractFunctionDecl *>(funcDecl)))
+              .mangleAsString());
+    auto &layout = IGM.getMetadataLayout(parentClass);
+    if (!isa<ClassMetadataLayout>(layout))
+      return {};
+    auto &classLayout = cast<ClassMetadataLayout>(layout);
+    auto silDecl = SILDeclRef(const_cast<AbstractFunctionDecl *>(funcDecl));
+    auto *mi = classLayout.getStoredMethodInfoIfPresent(silDecl);
+    if (!mi)
+      return {};
+    switch (mi->TheKind) {
+    case ClassMetadataLayout::MethodInfo::Kind::DirectImpl:
+      return MethodDispatchInfo::direct();
+    case ClassMetadataLayout::MethodInfo::Kind::Offset:
+      if (mi->TheOffset.isStatic()) {
+        return MethodDispatchInfo::indirectVTableStaticOffset(
+            /*offset=*/mi->TheOffset.getStaticOffset().getValue(),
+            getMethodPointerAuthInfo(funcDecl, silDecl));
+      }
+      assert(mi->TheOffset.isDynamic());
+      return MethodDispatchInfo::indirectVTableRelativeOffset(
+          /*offset=*/mi->TheOffset.getRelativeOffset().getValue(),
+          /*symbolName=*/
+          LinkEntity::forClassMetadataBaseOffset(parentClass).mangleAsString(),
+          getMethodPointerAuthInfo(funcDecl, silDecl));
+    }
+    llvm_unreachable("invalid kind");
+  }
+
+  Type getClassBaseOffsetSymbolType() const {
+    return *getPrimitiveTypeFromLLVMType(
+        silMod->getASTContext(), IGM.ClassMetadataBaseOffsetTy->elements()[0]);
   }
 
   Lowering::TypeConverter typeConverter;
@@ -281,7 +350,7 @@ LoweredFunctionSignature::MetadataSourceParameter::MetadataSourceParameter(
 llvm::Optional<LoweredFunctionSignature::DirectResultType>
 LoweredFunctionSignature::getDirectResultType() const {
   if (!abiDetails.directResult)
-    return None;
+    return llvm::None;
   return DirectResultType(owner, abiDetails.directResult->typeInfo);
 }
 
@@ -404,4 +473,14 @@ IRABIDetailsProvider::getTypeMetadataAccessFunctionGenericRequirementParameters(
 llvm::MapVector<EnumElementDecl *, IRABIDetailsProvider::EnumElementInfo>
 IRABIDetailsProvider::getEnumTagMapping(const EnumDecl *ED) {
   return impl->getEnumTagMapping(ED);
+}
+
+llvm::Optional<IRABIDetailsProvider::MethodDispatchInfo>
+IRABIDetailsProvider::getMethodDispatchInfo(
+    const AbstractFunctionDecl *funcDecl) {
+  return impl->getMethodDispatchInfo(funcDecl);
+}
+
+Type IRABIDetailsProvider::getClassBaseOffsetSymbolType() const {
+  return impl->getClassBaseOffsetSymbolType();
 }

@@ -34,7 +34,8 @@ using namespace rewriting;
 
 /// For building a rewrite system for a generic signature from canonical
 /// requirements.
-void RuleBuilder::initWithGenericSignatureRequirements(
+void RuleBuilder::initWithGenericSignature(
+    ArrayRef<GenericTypeParamType *> genericParams,
     ArrayRef<Requirement> requirements) {
   assert(!Initialized);
   Initialized = 1;
@@ -47,6 +48,7 @@ void RuleBuilder::initWithGenericSignatureRequirements(
   }
 
   collectRulesFromReferencedProtocols();
+  collectPackShapeRules(genericParams);
 
   // Add rewrite rules for all top-level requirements.
   for (const auto &req : requirements)
@@ -56,6 +58,7 @@ void RuleBuilder::initWithGenericSignatureRequirements(
 /// For building a rewrite system for a generic signature from user-written
 /// requirements.
 void RuleBuilder::initWithWrittenRequirements(
+    ArrayRef<GenericTypeParamType *> genericParams,
     ArrayRef<StructuralRequirement> requirements) {
   assert(!Initialized);
   Initialized = 1;
@@ -68,6 +71,7 @@ void RuleBuilder::initWithWrittenRequirements(
   }
 
   collectRulesFromReferencedProtocols();
+  collectPackShapeRules(genericParams);
 
   // Add rewrite rules for all top-level requirements.
   for (const auto &req : requirements)
@@ -276,15 +280,15 @@ void RuleBuilder::addAssociatedType(const AssociatedTypeDecl *type,
 /// will be added in the corresponding term from the substitution array.
 void RuleBuilder::addRequirement(const Requirement &req,
                                  const ProtocolDecl *proto,
-                                 Optional<ArrayRef<Term>> substitutions,
-                                 Optional<unsigned> requirementID) {
+                                 llvm::Optional<ArrayRef<Term>> substitutions,
+                                 llvm::Optional<unsigned> requirementID) {
   if (Dump) {
     llvm::dbgs() << "+ ";
     req.dump(llvm::dbgs());
     llvm::dbgs() << "\n";
   }
 
-  assert(!substitutions.hasValue() || proto == nullptr && "Can't have both");
+  assert(!substitutions.has_value() || proto == nullptr && "Can't have both");
 
   // Compute the left hand side.
   auto subjectType = CanType(req.getFirstType());
@@ -399,7 +403,7 @@ void RuleBuilder::addRequirement(const StructuralRequirement &req,
                                  const ProtocolDecl *proto) {
   WrittenRequirements.push_back(req);
   unsigned requirementID = WrittenRequirements.size() - 1;
-  addRequirement(req.req.getCanonical(), proto, /*substitutions=*/None,
+  addRequirement(req.req.getCanonical(), proto, /*substitutions=*/llvm::None,
                  requirementID);
 }
 
@@ -433,7 +437,7 @@ void RuleBuilder::addTypeAlias(const ProtocolTypeAlias &alias,
   }
 
   RequirementRules.emplace_back(subjectTerm, constraintTerm,
-                                /*requirementID=*/None);
+                                /*requirementID=*/llvm::None);
 }
 
 /// If we haven't seen this protocol yet, save it for later so that we can
@@ -444,8 +448,8 @@ void RuleBuilder::addReferencedProtocol(const ProtocolDecl *proto) {
 }
 
 /// Compute the transitive closure of the set of all protocols referenced from
-/// the right hand sides of conformance requirements, and convert their
-/// requirements to rewrite rules.
+/// the right hand sides of conformance requirements, and import the rewrite
+/// rules from the requirement machine for each protocol component.
 void RuleBuilder::collectRulesFromReferencedProtocols() {
   // Compute the transitive closure.
   unsigned i = 0;
@@ -462,12 +466,9 @@ void RuleBuilder::collectRulesFromReferencedProtocols() {
   // if this is a rewrite system for a connected component of the protocol
   // dependency graph, add rewrite rules for each referenced protocol not part
   // of this connected component.
-
-  // First, collect all unique requirement machines, one for each connected
-  // component of each referenced protocol.
   llvm::DenseSet<RequirementMachine *> machines;
 
-  // Now visit each subordinate requirement machine pull in its rules.
+  // Now visit each protocol component requirement machine and pull in its rules.
   for (auto *proto : ProtocolsToImport) {
     // This will trigger requirement signature computation for this protocol,
     // if necessary, which will cause us to re-enter into a new RuleBuilder
@@ -478,16 +479,90 @@ void RuleBuilder::collectRulesFromReferencedProtocols() {
 
     auto *machine = Context.getRequirementMachine(proto);
     if (!machines.insert(machine).second) {
-      // We've already seen this connected component.
+      // We've already seen this protocol component.
       continue;
     }
 
     // We grab the machine's local rules, not *all* of its rules, to avoid
     // duplicates in case multiple machines share a dependency on a downstream
-    // protocol connected component.
+    // protocol component.
     auto localRules = machine->getLocalRules();
     ImportedRules.insert(ImportedRules.end(),
                          localRules.begin(),
                          localRules.end());
+  }
+}
+
+void RuleBuilder::collectPackShapeRules(ArrayRef<GenericTypeParamType *> genericParams) {
+  if (Dump) {
+    llvm::dbgs() << "adding shape rules\n";
+  }
+
+  if (!llvm::any_of(genericParams,
+                    [](GenericTypeParamType *t) {
+                      return t->isParameterPack();
+                    })) {
+    return;
+  }
+
+  // Each non-pack generic parameter is part of the "scalar shape class", represented
+  // by the empty term.
+  for (auto *genericParam : genericParams) {
+    if (genericParam->isParameterPack())
+      continue;
+
+    // Add the rule (τ_d_i.[shape] => [shape]).
+    MutableTerm lhs;
+    lhs.add(Symbol::forGenericParam(
+        cast<GenericTypeParamType>(genericParam->getCanonicalType()), Context));
+    lhs.add(Symbol::forShape(Context));
+
+    MutableTerm rhs;
+    rhs.add(Symbol::forShape(Context));
+
+    PermanentRules.emplace_back(lhs, rhs);
+  }
+
+  // A member type T.[P:A] is part of the same shape class as its base type T.
+  llvm::DenseSet<Symbol> visited;
+
+  auto addMemberShapeRule = [&](const ProtocolDecl *proto, AssociatedTypeDecl *assocType) {
+    auto symbol = Symbol::forAssociatedType(proto, assocType->getName(), Context);
+    if (!visited.insert(symbol).second)
+      return;
+
+    // Add the rule ([P:A].[shape] => [shape]).
+    MutableTerm lhs;
+    lhs.add(symbol);
+    lhs.add(Symbol::forShape(Context));
+
+    MutableTerm rhs;
+    rhs.add(Symbol::forShape(Context));
+
+    // Consider it an imported rule, since it is not part of our minimization
+    // domain. It would be more logical if we added these in the protocol component
+    // machine for this protocol, but instead we add them in the "leaf" generic
+    // signature machine. This avoids polluting machines that do not involve
+    // parameter packs with these extra rules, which would otherwise just slow
+    // things down.
+    Rule rule(Term::get(lhs, Context), Term::get(rhs, Context));
+    rule.markPermanent();
+    ImportedRules.push_back(rule);
+  };
+
+  for (auto *proto : ProtocolsToImport) {
+    if (Dump) {
+      llvm::dbgs() << "adding member shape rules for protocol " << proto->getName() << "\n";
+    }
+
+    for (auto *assocType : proto->getAssociatedTypeMembers()) {
+      addMemberShapeRule(proto, assocType);
+    }
+
+    for (auto *inheritedProto : Context.getInheritedProtocols(proto)) {
+      for (auto *assocType : inheritedProto->getAssociatedTypeMembers()) {
+        addMemberShapeRule(proto, assocType);
+      }
+    }
   }
 }

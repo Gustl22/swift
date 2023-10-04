@@ -155,6 +155,12 @@ areElementsABIAccessible(ArrayRef<EnumImplStrategy::Element> elts) {
   return IsABIAccessible;
 }
 
+static APInt zextOrSelf(const APInt &i, unsigned width) {
+  if (i.getBitWidth() < width)
+    return i.zext(width);
+  return i;
+}
+
 EnumImplStrategy::EnumImplStrategy(IRGenModule &IGM,
                                    TypeInfoKind tik,
                                    IsFixedSize_t alwaysFixedSize,
@@ -257,6 +263,9 @@ EnumImplStrategy::getTagIndex(EnumElementDecl *Case) const {
 static void emitResilientTagIndex(IRGenModule &IGM,
                                   const EnumImplStrategy *strategy,
                                   EnumElementDecl *Case) {
+  if (!Case->isAvailableDuringLowering())
+    return;
+
   auto resilientIdx = strategy->getTagIndex(Case);
   auto *global = cast<llvm::GlobalVariable>(
     IGM.getAddrOfEnumCase(Case, ForDefinition).getAddress());
@@ -271,62 +280,6 @@ EnumImplStrategy::emitResilientTagIndices(IRGenModule &IGM) const {
   for (auto &noPayload : ElementsWithNoPayload) {
     emitResilientTagIndex(IGM, this, noPayload.decl);
   }
-}
-
-void EnumImplStrategy::callOutlinedCopy(IRGenFunction &IGF,
-                                        Address dest, Address src, SILType T,
-                                        IsInitialization_t isInit,
-                                        IsTake_t isTake) const {
-  if (!IGF.IGM.getOptions().UseTypeLayoutValueHandling) {
-    OutliningMetadataCollector collector(IGF);
-    if (T.hasArchetype()) {
-      collectMetadataForOutlining(collector, T);
-    }
-    collector.emitCallToOutlinedCopy(dest, src, T, *TI, isInit, isTake);
-    return;
-  }
-
-  if (!T.hasArchetype()) {
-    // Call the outlined copy function (the implementation will call vwt in this
-    // case).
-    OutliningMetadataCollector collector(IGF);
-    collector.emitCallToOutlinedCopy(dest, src, T, *TI, isInit, isTake);
-    return;
-  }
-
-  if (isInit == IsInitialization && isTake == IsTake) {
-    return emitInitializeWithTakeCall(IGF, T, dest, src);
-  } else if (isInit == IsInitialization && isTake == IsNotTake) {
-    return emitInitializeWithCopyCall(IGF, T, dest, src);
-  } else if (isInit == IsNotInitialization && isTake == IsTake) {
-    return emitAssignWithTakeCall(IGF, T, dest, src);
-  } else if (isInit == IsNotInitialization && isTake == IsNotTake) {
-    return emitAssignWithCopyCall(IGF, T, dest, src);
-  }
-  llvm_unreachable("unknown case");
-}
-
-void EnumImplStrategy::callOutlinedDestroy(IRGenFunction &IGF,
-                                           Address addr, SILType T) const {
-  if (!IGF.IGM.getOptions().UseTypeLayoutValueHandling) {
-    OutliningMetadataCollector collector(IGF);
-    if (T.hasArchetype()) {
-      collectMetadataForOutlining(collector, T);
-    }
-    collector.emitCallToOutlinedDestroy(addr, T, *TI);
-    return;
-  }
-
-  if (!T.hasArchetype()) {
-    // Call the outlined copy function (the implementation will call vwt in this
-    // case).
-    OutliningMetadataCollector collector(IGF);
-    collector.emitCallToOutlinedDestroy(addr, T, *TI);
-    return;
-  }
-
-  emitDestroyCall(IGF, T, addr);
-  return;
 }
 
 namespace {
@@ -380,23 +333,27 @@ namespace {
                                      EnumDecl *theEnum,
                                      llvm::StructType *enumTy) override;
 
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                          SILType T) const override {
+    TypeLayoutEntry *
+    buildTypeLayoutEntry(IRGenModule &IGM,
+                         SILType T,
+                         bool useStructLayouts) const override {
       if (ElementsWithPayload.empty())
         return IGM.typeLayoutCache.getEmptyEntry();
       if (!ElementsAreABIAccessible)
         return IGM.typeLayoutCache.getOrCreateResilientEntry(T);
-      if (TIK >= Loadable) {
-        return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T);
+      if (TIK >= Loadable && !useStructLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(getTypeInfo(),
+                                                                 T);
       }
 
       unsigned emptyCases = 0;
       std::vector<TypeLayoutEntry *> nonEmptyCases;
       nonEmptyCases.push_back(
         getSingleton()->buildTypeLayoutEntry(IGM,
-                                             getSingletonType(IGM, T)));
-      return IGM.typeLayoutCache.getOrCreateEnumEntry(emptyCases,
-                                                      nonEmptyCases);
+                                             getSingletonType(IGM, T),
+                                             useStructLayouts));
+      return IGM.typeLayoutCache.getOrCreateEnumEntry(emptyCases, nonEmptyCases,
+                                                      T, getTypeInfo());
     }
 
     llvm::Value *
@@ -454,18 +411,21 @@ namespace {
                           Explosion &out) const override {
       // The projected value is the payload.
       if (getLoadableSingleton())
-        getLoadableSingleton()->reexplode(IGF, in, out);
+        getLoadableSingleton()->reexplode(in, out);
     }
 
-    void emitValueInjection(IRGenFunction &IGF,
+    void emitValueInjection(IRGenModule &IGM,
+                            IRBuilder &builder,
                             EnumElementDecl *elt,
                             Explosion &params,
                             Explosion &out) const override {
       // If the element carries no data, neither does the injection.
       // Otherwise, the result is identical.
       if (getLoadableSingleton())
-        getLoadableSingleton()->reexplode(IGF, params, out);
+        getLoadableSingleton()->reexplode(params, out);
     }
+
+    bool emitPayloadDirectlyIntoConstant() const override { return true; }
 
     void destructiveProjectDataForLoad(IRGenFunction &IGF,
                                        SILType T,
@@ -528,10 +488,10 @@ namespace {
     }
 
     void assign(IRGenFunction &IGF, Explosion &e, Address addr,
-                bool isOutlined) const override {
+                bool isOutlined, SILType T) const override {
       if (!getLoadableSingleton()) return;
       getLoadableSingleton()->assign(IGF, e, getSingletonAddress(IGF, addr),
-                                     isOutlined);
+                                     isOutlined, getSingletonType(IGF.IGM, T));
     }
 
     void assignWithCopy(IRGenFunction &IGF, Address dest, Address src,
@@ -539,7 +499,7 @@ namespace {
       if (!getSingleton()) return;
       if (!ElementsAreABIAccessible) {
         emitAssignWithCopyCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         dest = getSingletonAddress(IGF, dest);
         src = getSingletonAddress(IGF, src);
         getSingleton()->assignWithCopy(
@@ -554,7 +514,7 @@ namespace {
       if (!getSingleton()) return;
       if (!ElementsAreABIAccessible) {
         emitAssignWithTakeCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         dest = getSingletonAddress(IGF, dest);
         src = getSingletonAddress(IGF, src);
         getSingleton()->assignWithTake(
@@ -576,7 +536,7 @@ namespace {
       if (!getSingleton()) return;
       if (!ElementsAreABIAccessible) {
         emitInitializeWithCopyCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         dest = getSingletonAddress(IGF, dest);
         src = getSingletonAddress(IGF, src);
         getSingleton()->initializeWithCopy(
@@ -591,7 +551,7 @@ namespace {
       if (!getSingleton()) return;
       if (!ElementsAreABIAccessible) {
         emitInitializeWithTakeCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         dest = getSingletonAddress(IGF, dest);
         src = getSingletonAddress(IGF, src);
         getSingleton()->initializeWithTake(
@@ -610,9 +570,9 @@ namespace {
       collector.collectTypeMetadataForLayout(T);
     }
 
-    void reexplode(IRGenFunction &IGF, Explosion &src, Explosion &dest)
+    void reexplode(Explosion &src, Explosion &dest)
     const override {
-      if (getLoadableSingleton()) getLoadableSingleton()->reexplode(IGF, src, dest);
+      if (getLoadableSingleton()) getLoadableSingleton()->reexplode(src, dest);
     }
 
     void copy(IRGenFunction &IGF, Explosion &src, Explosion &dest,
@@ -622,9 +582,15 @@ namespace {
     }
 
     void consume(IRGenFunction &IGF, Explosion &src,
-                 Atomicity atomicity) const override {
+                 Atomicity atomicity,
+                 SILType T) const override {
+      if (tryEmitConsumeUsingDeinit(IGF, src, T)) {
+        return;
+      }
+
       if (getLoadableSingleton())
-        getLoadableSingleton()->consume(IGF, src, atomicity);
+        getLoadableSingleton()->consume(IGF, src, atomicity,
+                                        getSingletonType(IGF.IGM, T));
     }
 
     void fixLifetime(IRGenFunction &IGF, Explosion &src) const override {
@@ -633,11 +599,15 @@ namespace {
 
     void destroy(IRGenFunction &IGF, Address addr, SILType T,
                  bool isOutlined) const override {
+      if (tryEmitDestroyUsingDeinit(IGF, addr, T)) {
+        return;
+      }
+                 
       if (getSingleton() &&
-          !getSingleton()->isPOD(ResilienceExpansion::Maximal)) {
+          !getSingleton()->isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
         if (!ElementsAreABIAccessible) {
           emitDestroyCall(IGF, T, addr);
-        } else if (isOutlined || T.hasOpenedExistential()) {
+        } else if (isOutlined || T.hasParameterizedExistential()) {
           getSingleton()->destroy(IGF, getSingletonAddress(IGF, addr),
                                   getSingletonType(IGF.IGM, T), isOutlined);
         } else {
@@ -646,10 +616,11 @@ namespace {
       }
     }
 
-    void packIntoEnumPayload(IRGenFunction &IGF, EnumPayload &payload,
+    void packIntoEnumPayload(IRGenModule &IGM,
+                             IRBuilder &builder, EnumPayload &payload,
                              Explosion &in, unsigned offset) const override {
       if (getLoadableSingleton())
-        return getLoadableSingleton()->packIntoEnumPayload(IGF, payload,
+        return getLoadableSingleton()->packIntoEnumPayload(IGM, builder, payload,
                                                            in, offset);
     }
 
@@ -683,6 +654,44 @@ namespace {
 
       // Pre swift-5.1 runtimes were missing the initialization of the
       // the extraInhabitantCount field. Do it here instead.
+      auto payloadRef = IGF.Builder.CreateBitOrPointerCast(
+          payloadLayout, IGF.IGM.TypeLayoutTy->getPointerTo());
+      auto payloadExtraInhabitantCount =
+          IGF.Builder.CreateLoad(IGF.Builder.CreateStructGEP(
+              Address(payloadRef, IGF.IGM.TypeLayoutTy, Alignment(1)), 3,
+              Size(IGF.IGM.DataLayout.getTypeAllocSize(IGF.IGM.SizeTy) * 2 +
+                   IGF.IGM.DataLayout.getTypeAllocSize(IGF.IGM.Int32Ty))));
+      emitStoreOfExtraInhabitantCount(IGF, payloadExtraInhabitantCount,
+                                      metadata);
+    }
+
+    void initializeMetadataWithLayoutString(
+        IRGenFunction &IGF, llvm::Value *metadata, bool isVWTMutable, SILType T,
+        MetadataDependencyCollector *collector) const override {
+      if (TIK >= Fixed)
+        return;
+
+      assert(ElementsWithPayload.size() == 1 &&
+             "empty singleton enum should not be dynamic!");
+
+      auto payloadTy =
+          T.getEnumElementType(ElementsWithPayload[0].decl, IGM.getSILModule(),
+                               IGM.getMaximalTypeExpansionContext());
+
+      auto request = DynamicMetadataRequest::getNonBlocking(
+          MetadataState::LayoutComplete, collector);
+      auto payloadMetadata =
+          IGF.emitTypeMetadataRefForLayout(payloadTy, request);
+
+      auto flags = emitEnumLayoutFlags(IGF.IGM, isVWTMutable);
+      IGF.Builder.CreateCall(
+          IGF.IGM
+              .getInitEnumMetadataSingleCaseWithLayoutStringFunctionPointer(),
+          {metadata, flags, payloadMetadata});
+
+      // Pre swift-5.1 runtimes were missing the initialization of the
+      // the extraInhabitantCount field. Do it here instead.
+      auto payloadLayout = emitTypeLayoutRef(IGF, payloadTy, collector);
       auto payloadRef = IGF.Builder.CreateBitOrPointerCast(
           payloadLayout, IGF.IGM.TypeLayoutTy->getPointerTo());
       auto payloadExtraInhabitantCount =
@@ -945,7 +954,8 @@ namespace {
       (void)in.claim(getExplosionSize());
     }
 
-    void emitValueInjection(IRGenFunction &IGF,
+    void emitValueInjection(IRGenModule &IGM,
+                            IRBuilder &builder,
                             EnumElementDecl *elt,
                             Explosion &params,
                             Explosion &out) const override {
@@ -994,6 +1004,13 @@ namespace {
       // witness table initialization.
     }
 
+    void initializeMetadataWithLayoutString(
+        IRGenFunction &IGF, llvm::Value *metadata, bool isVWTMutable, SILType T,
+        MetadataDependencyCollector *collector) const override {
+      // No-payload enums are always fixed-size so never need dynamic value
+      // witness table initialization.
+    }
+
     /// \group Required for SingleScalarTypeInfo
 
     llvm::Type *getScalarType() const {
@@ -1027,7 +1044,8 @@ namespace {
     void collectMetadataForOutlining(OutliningMetadataCollector &collector,
                                      SILType T) const override {}
 
-    static constexpr IsPOD_t IsScalarPOD = IsPOD;
+    static constexpr IsTriviallyDestroyable_t IsScalarTriviallyDestroyable
+      = IsTriviallyDestroyable;
 
     ClusteredBitVector getTagBitsForPayloads() const override {
       // No tag bits; no-payload enums always use fixed representations.
@@ -1040,7 +1058,7 @@ namespace {
     getBitPatternForNoPayloadElement(EnumElementDecl *theCase) const override {
       Size size = cast<FixedTypeInfo>(TI)->getFixedSize();
       auto val = getDiscriminatorIdxConst(theCase)->getValue();
-      return ClusteredBitVector::fromAPInt(val.zextOrSelf(size.getValueInBits()));
+      return ClusteredBitVector::fromAPInt(zextOrSelf(val, size.getValueInBits()));
     }
 
     ClusteredBitVector
@@ -1083,9 +1101,15 @@ namespace {
                                      EnumDecl *theEnum,
                                      llvm::StructType *enumTy) override;
 
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                          SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T);
+    TypeLayoutEntry *
+    buildTypeLayoutEntry(IRGenModule &IGM,
+                         SILType T,
+                         bool useStructLayouts) const override {
+      if (!useStructLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(getTypeInfo(), T);
+      }
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T,
+                                            ScalarKind::TriviallyDestroyable);
     }
 
 
@@ -1235,9 +1259,15 @@ namespace {
                                      EnumDecl *theEnum,
                                      llvm::StructType *enumTy) override;
 
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                          SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T);
+    TypeLayoutEntry *
+    buildTypeLayoutEntry(IRGenModule &IGM,
+                         SILType T,
+                         bool useStructLayouts) const override {
+      if (!useStructLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(getTypeInfo(), T);
+      }
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T,
+                                            ScalarKind::TriviallyDestroyable);
     }
 
     /// \group Extra inhabitants for C-compatible enums.
@@ -1486,14 +1516,14 @@ namespace {
     }
 
     void assign(IRGenFunction &IGF, Explosion &e, Address addr,
-                bool isOutlined) const override {
+                bool isOutlined, SILType T) const override {
       assert(TIK >= Loadable);
       Explosion old;
-      if (!isPOD(ResilienceExpansion::Maximal))
+      if (!isTriviallyDestroyable(ResilienceExpansion::Maximal))
         loadAsTake(IGF, addr, old);
       initialize(IGF, e, addr, isOutlined);
-      if (!isPOD(ResilienceExpansion::Maximal))
-        consume(IGF, old, IGF.getDefaultAtomicity());
+      if (!isTriviallyDestroyable(ResilienceExpansion::Maximal))
+        consume(IGF, old, IGF.getDefaultAtomicity(), T);
     }
 
     void initialize(IRGenFunction &IGF, Explosion &e, Address addr,
@@ -1510,7 +1540,7 @@ namespace {
       assert(TIK >= Loadable);
     }
 
-    void reexplode(IRGenFunction &IGF, Explosion &src, Explosion &dest)
+    void reexplode(Explosion &src, Explosion &dest)
     const override {
       assert(TIK >= Loadable);
       dest.add(src.claim(getExplosionSize()));
@@ -1568,19 +1598,20 @@ namespace {
       return {std::move(payload), extraTag};
     }
     
-    void packIntoEnumPayload(IRGenFunction &IGF,
+    void packIntoEnumPayload(IRGenModule &IGM,
+                             IRBuilder &builder,
                              EnumPayload &outerPayload,
                              Explosion &src,
                              unsigned offset) const override {
       // Pack payload, if any.
-      auto payload = EnumPayload::fromExplosion(IGF.IGM, src, PayloadSchema);
-      payload.packIntoEnumPayload(IGF, outerPayload, offset);
+      auto payload = EnumPayload::fromExplosion(IGM, src, PayloadSchema);
+      payload.packIntoEnumPayload(IGM, builder, outerPayload, offset);
 
       // Pack tag bits, if any.
       if (ExtraTagBitCount > 0) {
         unsigned extraTagOffset = PayloadBitCount + offset;
 
-        outerPayload.insertValue(IGF, src.claimNext(), extraTagOffset);
+        outerPayload.insertValue(IGM, builder, src.claimNext(), extraTagOffset);
       }
     }
 
@@ -1638,17 +1669,24 @@ namespace {
       return false;
     }
 
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                          SILType T) const override {
-     if (!ElementsAreABIAccessible)
-       return IGM.typeLayoutCache.getOrCreateResilientEntry(T);
+    TypeLayoutEntry *
+    buildTypeLayoutEntry(IRGenModule &IGM,
+                         SILType T,
+                         bool useStructLayouts) const override {
+      if (!ElementsAreABIAccessible)
+        return IGM.typeLayoutCache.getOrCreateResilientEntry(T);
+
+      // TODO: Remove once single payload enums are fully supported
+      // if (CopyDestroyKind == Normal)
+      //   return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(getTypeInfo(),
+      //                                                            T);
 
       unsigned emptyCases = ElementsWithNoPayload.size();
       std::vector<TypeLayoutEntry *> nonEmptyCases;
       nonEmptyCases.push_back(getPayloadTypeInfo().buildTypeLayoutEntry(
-          IGM, getPayloadType(IGM, T)));
-      return IGM.typeLayoutCache.getOrCreateEnumEntry(emptyCases,
-                                                      nonEmptyCases);
+          IGM, getPayloadType(IGM, T), useStructLayouts));
+      return IGM.typeLayoutCache.getOrCreateEnumEntry(emptyCases, nonEmptyCases,
+                                                      T, getTypeInfo());
     }
 
     EnumElementDecl *getPayloadElement() const {
@@ -1680,8 +1718,9 @@ namespace {
     enum CopyDestroyStrategy {
       /// No special behavior.
       Normal,
-      /// The payload is POD, so copying is bitwise, and destruction is a noop.
-      POD,
+      /// The payload is trivially destructible, so copying is bitwise (if
+      /// allowed), and destruction is a noop.
+      TriviallyDestroyable,
       /// The payload type is ABI-inaccessible, so we can't recurse.
       ABIInaccessible,
       /// The payload is a single reference-counted value, and we have
@@ -1771,7 +1810,8 @@ namespace {
         Explosion payloadValue;
         auto &loadableTI = getLoadablePayloadTypeInfo();
         loadableTI.unpackFromEnumPayload(IGF, payload, payloadValue, 0);
-        loadableTI.consume(IGF, payloadValue, IGF.getDefaultAtomicity());
+        loadableTI.consume(IGF, payloadValue, IGF.getDefaultAtomicity(),
+                           getPayloadType(IGF.IGM, theEnumType));
       }
 
       IGF.Builder.CreateBr(endBB);
@@ -1806,12 +1846,12 @@ namespace {
     {
       assert(ElementsWithPayload.size() == 1);
 
-      // If the payload is POD, then we can use POD value semantics.
+      // If the payload is TriviallyDestroyable, then we can use TriviallyDestroyable value semantics.
       auto &payloadTI = *ElementsWithPayload[0].ti;
       if (!payloadTI.isABIAccessible()) {
         CopyDestroyKind = ABIInaccessible;
-      } else if (payloadTI.isPOD(ResilienceExpansion::Maximal)) {
-        CopyDestroyKind = POD;
+      } else if (payloadTI.isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
+        CopyDestroyKind = TriviallyDestroyable;
       // If the payload is a single refcounted pointer and we have a single
       // empty case, then the layout will be a nullable pointer, and we can
       // pass enum values directly into swift_retain/swift_release as-is.
@@ -2332,19 +2372,20 @@ namespace {
     }
 
   public:
-    void emitValueInjection(IRGenFunction &IGF,
+    void emitValueInjection(IRGenModule &IGM,
+                            IRBuilder &builder,
                             EnumElementDecl *elt,
                             Explosion &params,
                             Explosion &out) const override {
       // The payload case gets its native representation. If there are extra
       // tag bits, set them to zero.
       if (elt == getPayloadElement()) {
-        auto payload = EnumPayload::zero(IGF.IGM, PayloadSchema);
+        auto payload = EnumPayload::zero(IGM, PayloadSchema);
         auto &loadablePayloadTI = getLoadablePayloadTypeInfo();
-        loadablePayloadTI.packIntoEnumPayload(IGF, payload, params, 0);
-        payload.explode(IGF.IGM, out);
+        loadablePayloadTI.packIntoEnumPayload(IGM, builder, payload, params, 0);
+        payload.explode(IGM, out);
         if (ExtraTagBitCount > 0)
-          out.add(getZeroExtraTagConstant(IGF.IGM));
+          out.add(getZeroExtraTagConstant(IGM));
         return;
       }
 
@@ -2352,11 +2393,11 @@ namespace {
       // by setting the tag bits.
       APInt payloadPattern, extraTag;
       std::tie(payloadPattern, extraTag) = getNoPayloadCaseValue(elt);
-      auto payload = EnumPayload::fromBitPattern(IGF.IGM, payloadPattern,
+      auto payload = EnumPayload::fromBitPattern(IGM, payloadPattern,
                                                  PayloadSchema);
-      payload.explode(IGF.IGM, out);
+      payload.explode(IGM, out);
       if (ExtraTagBitCount > 0) {
-        out.add(llvm::ConstantInt::get(IGF.IGM.getLLVMContext(), extraTag));
+        out.add(llvm::ConstantInt::get(IGM.getLLVMContext(), extraTag));
       }
     }
 
@@ -2461,7 +2502,7 @@ namespace {
       case NullableRefcounted:
         return IGM.getReferenceType(Refcounting);
       case ForwardToPayload:
-      case POD:
+      case TriviallyDestroyable:
       case Normal:
       case ABIInaccessible:
         llvm_unreachable("not a refcounted payload");
@@ -2485,7 +2526,7 @@ namespace {
         return;
       }
       case ForwardToPayload:
-      case POD:
+      case TriviallyDestroyable:
       case Normal:
       case ABIInaccessible:
         llvm_unreachable("not a refcounted payload");
@@ -2499,7 +2540,7 @@ namespace {
         IGF.emitFixLifetime(ptr);
         return;
       case ForwardToPayload:
-      case POD:
+      case TriviallyDestroyable:
       case Normal:
       case ABIInaccessible:
         llvm_unreachable("not a refcounted payload");
@@ -2521,7 +2562,7 @@ namespace {
         return;
       }
       case ForwardToPayload:
-      case POD:
+      case TriviallyDestroyable:
       case Normal:
       case ABIInaccessible:
         llvm_unreachable("not a refcounted payload");
@@ -2555,7 +2596,7 @@ namespace {
                                   Explosion &asEnumOut) const {
       auto &payloadTI = getLoadablePayloadTypeInfo();
       auto payload = EnumPayload::zero(IGF.IGM, PayloadSchema);
-      payloadTI.packIntoEnumPayload(IGF, payload, asPayloadIn, 0);
+      payloadTI.packIntoEnumPayload(IGF.IGM, IGF.Builder, payload, asPayloadIn, 0);
       payload.explode(IGF.IGM, asEnumOut);
     }
 
@@ -2565,15 +2606,15 @@ namespace {
       assert(TIK >= Loadable);
 
       switch (CopyDestroyKind) {
-      case POD:
-        reexplode(IGF, src, dest);
+      case TriviallyDestroyable:
+        reexplode(src, dest);
         return;
 
       case ABIInaccessible:
         llvm_unreachable("ABI-inaccessible type cannot be loadable");
 
       case Normal: {
-        if (loweredType.hasOpenedExistential()) {
+        if (loweredType.hasLocalArchetype()) {
           EnumPayload payload;
           llvm::Value *extraTag;
           std::tie(payload, extraTag) =
@@ -2631,11 +2672,14 @@ namespace {
     }
 
     void consume(IRGenFunction &IGF, Explosion &src,
-                 Atomicity atomicity) const override {
+                 Atomicity atomicity, SILType T) const override {
+      if (tryEmitConsumeUsingDeinit(IGF, src, T)) {
+        return;
+      }
       assert(TIK >= Loadable);
 
       switch (CopyDestroyKind) {
-      case POD:
+      case TriviallyDestroyable:
         (void)src.claim(getExplosionSize());
         return;
 
@@ -2643,7 +2687,7 @@ namespace {
         llvm_unreachable("ABI-inaccessible type cannot be loadable");
 
       case Normal: {
-        if (loweredType.hasOpenedExistential()) {
+        if (loweredType.hasLocalArchetype()) {
           EnumPayload payload;
           llvm::Value *extraTag;
           std::tie(payload, extraTag) =
@@ -2657,7 +2701,8 @@ namespace {
             Explosion payloadValue;
             auto &loadableTI = getLoadablePayloadTypeInfo();
             loadableTI.unpackFromEnumPayload(IGF, payload, payloadValue, 0);
-            loadableTI.consume(IGF, payloadValue, IGF.getDefaultAtomicity());
+            loadableTI.consume(IGF, payloadValue, IGF.getDefaultAtomicity(),
+                               getPayloadType(IGF.IGM, T));
           }
 
           IGF.Builder.CreateBr(endBB);
@@ -2690,7 +2735,8 @@ namespace {
         // operation.
         Explosion srcAsPayload;
         unpackIntoPayloadExplosion(IGF, src, srcAsPayload);
-        payloadTI.consume(IGF, srcAsPayload, atomicity);
+        payloadTI.consume(IGF, srcAsPayload, atomicity,
+                          getPayloadType(IGF.IGM, T));
         return;
       }
       }
@@ -2700,7 +2746,7 @@ namespace {
       assert(TIK >= Loadable);
 
       switch (CopyDestroyKind) {
-      case POD:
+      case TriviallyDestroyable:
         (void)src.claim(getExplosionSize());
         return;
 
@@ -2754,14 +2800,18 @@ namespace {
 
     void destroy(IRGenFunction &IGF, Address addr, SILType T,
                  bool isOutlined) const override {
-      if (CopyDestroyKind == POD) {
+      if (tryEmitDestroyUsingDeinit(IGF, addr, T)) {
+        return;
+      }
+
+      if (CopyDestroyKind == TriviallyDestroyable) {
         return;
       }
       if (!ElementsAreABIAccessible) {
         return emitDestroyCall(IGF, T, addr);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         switch (CopyDestroyKind) {
-        case POD:
+        case TriviallyDestroyable:
           return;
 
         case ABIInaccessible:
@@ -2803,24 +2853,7 @@ namespace {
         }
         }
       } else {
-        if (!IGF.IGM.getOptions().UseTypeLayoutValueHandling) {
-          OutliningMetadataCollector collector(IGF);
-          if (T.hasArchetype()) {
-            collectMetadataForOutlining(collector, T);
-          }
-          collector.emitCallToOutlinedDestroy(addr, T, *TI);
-          return;
-        }
-
-        if (!T.hasArchetype()) {
-          // Call the outlined copy function (the implementation will call vwt
-          // in this case).
-          OutliningMetadataCollector collector(IGF);
-          collector.emitCallToOutlinedDestroy(addr, T, *TI);
-          return;
-        }
-
-        emitDestroyCall(IGF, T, addr);
+        callOutlinedDestroy(IGF, addr, T);
         return;
       }
     }
@@ -2871,7 +2904,7 @@ namespace {
       auto PayloadT = getPayloadType(IGM, T);
 
       switch (CopyDestroyKind) {
-      case POD:
+      case TriviallyDestroyable:
         return emitPrimitiveCopy(IGF, dest, src, T);
 
       case ABIInaccessible:
@@ -2990,7 +3023,7 @@ namespace {
       auto &C = IGM.getLLVMContext();
 
       switch (CopyDestroyKind) {
-      case POD:
+      case TriviallyDestroyable:
         return emitPrimitiveCopy(IGF, dest, src, T);
 
       case ABIInaccessible:
@@ -3063,7 +3096,7 @@ namespace {
                         SILType T, bool isOutlined) const override {
       if (!ElementsAreABIAccessible) {
         emitAssignWithCopyCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         emitIndirectAssign(IGF, dest, src, T, IsNotTake, isOutlined);
       } else {
         callOutlinedCopy(IGF, dest, src, T, IsNotInitialization, IsNotTake);
@@ -3074,7 +3107,7 @@ namespace {
                         SILType T, bool isOutlined) const override {
       if (!ElementsAreABIAccessible) {
         emitAssignWithTakeCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         emitIndirectAssign(IGF, dest, src, T, IsTake, isOutlined);
       } else {
         callOutlinedCopy(IGF, dest, src, T, IsNotInitialization, IsTake);
@@ -3085,7 +3118,7 @@ namespace {
                             SILType T, bool isOutlined) const override {
       if (!ElementsAreABIAccessible) {
         emitInitializeWithCopyCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         emitIndirectInitialize(IGF, dest, src, T, IsNotTake, isOutlined);
       } else {
         callOutlinedCopy(IGF, dest, src, T, IsInitialization, IsNotTake);
@@ -3096,7 +3129,7 @@ namespace {
                             SILType T, bool isOutlined) const override {
       if (!ElementsAreABIAccessible) {
         emitInitializeWithTakeCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         emitIndirectInitialize(IGF, dest, src, T, IsTake, isOutlined);
       } else {
         callOutlinedCopy(IGF, dest, src, T, IsInitialization, IsTake);
@@ -3200,6 +3233,30 @@ namespace {
       auto flags = emitEnumLayoutFlags(IGM, isVWTMutable);
       IGF.Builder.CreateCall(
           IGM.getInitEnumMetadataSinglePayloadFunctionPointer(),
+          {metadata, flags, payloadLayout, emptyCasesVal});
+    }
+
+    void initializeMetadataWithLayoutString(
+        IRGenFunction &IGF, llvm::Value *metadata, bool isVWTMutable, SILType T,
+        MetadataDependencyCollector *collector) const override {
+      // Fixed-size enums don't need dynamic witness table initialization.
+      if (TIK >= Fixed)
+        return;
+
+      // Ask the runtime to do our layout using the payload metadata and number
+      // of empty cases.
+      auto payloadTy =
+          T.getEnumElementType(ElementsWithPayload[0].decl, IGM.getSILModule(),
+                               IGM.getMaximalTypeExpansionContext());
+
+      auto request = DynamicMetadataRequest::getNonBlocking(
+          MetadataState::LayoutComplete, collector);
+      auto payloadLayout = IGF.emitTypeMetadataRefForLayout(payloadTy, request);
+      auto emptyCasesVal =
+          llvm::ConstantInt::get(IGM.Int32Ty, ElementsWithNoPayload.size());
+      auto flags = emitEnumLayoutFlags(IGM, isVWTMutable);
+      IGF.Builder.CreateCall(
+          IGM.getInitEnumMetadataSinglePayloadWithLayoutStringFunctionPointer(),
           {metadata, flags, payloadLayout, emptyCasesVal});
     }
 
@@ -3417,7 +3474,7 @@ namespace {
       auto mask = BitPatternBuilder(IGM.Triple.isLittleEndian());
       mask.append(baseMask);
       mask.padWithSetBitsTo(totalSize);
-      return mask.build().getValue();
+      return mask.build().value();
     }
 
     ClusteredBitVector
@@ -3431,7 +3488,7 @@ namespace {
       Size size = cast<FixedTypeInfo>(TI)->getFixedSize();
       if (ExtraTagBitCount > 0) {
         auto paddedWidth = size.getValueInBits() - PayloadBitCount;
-        value.append(extraPart.zextOrSelf(paddedWidth));
+        value.append(zextOrSelf(extraPart, paddedWidth));
       }
       return value.build();
     }
@@ -3497,9 +3554,9 @@ namespace {
     enum CopyDestroyStrategy {
       /// No special behavior.
       Normal,
-      /// The payloads are all POD, so copying is bitwise, and destruction is a
-      /// noop.
-      POD,
+      /// The payloads are all trivially destructible, so copying is bitwise
+      /// (if allowed), and destruction is a noop.
+      TriviallyDestroyable,
       /// One or more of the payloads is ABI-inaccessible, so we cannot recurse.
       ABIInaccessible,
       /// The payloads are all bitwise-takable, but have no other special
@@ -3522,14 +3579,17 @@ namespace {
     mutable llvm::Function *consumeEnumFunction = nullptr;
     SmallVector<llvm::Type *, 2> PayloadTypesAndTagType;
 
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                          SILType T) const override {
+    TypeLayoutEntry *
+    buildTypeLayoutEntry(IRGenModule &IGM,
+                         SILType T,
+                         bool useStructLayouts) const override {
       if (!ElementsAreABIAccessible)
         return IGM.typeLayoutCache.getOrCreateResilientEntry(T);
 
-      if (AllowFixedLayoutOptimizations && TIK >= Loadable) {
+      if (!useStructLayouts && AllowFixedLayoutOptimizations && TIK >= Loadable) {
         // The type layout entry code does not handle spare bits atm.
-        return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T);
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(getTypeInfo(),
+                                                                 T);
       }
 
       unsigned emptyCases = ElementsWithNoPayload.size();
@@ -3539,10 +3599,10 @@ namespace {
             elt.decl, IGM.getSILModule(), IGM.getMaximalTypeExpansionContext());
 
         nonEmptyCases.push_back(
-            elt.ti->buildTypeLayoutEntry(IGM, eltPayloadType));
+            elt.ti->buildTypeLayoutEntry(IGM, eltPayloadType, useStructLayouts));
       }
-      return IGM.typeLayoutCache.getOrCreateEnumEntry(emptyCases,
-                                                      nonEmptyCases);
+      return IGM.typeLayoutCache.getOrCreateEnumEntry(emptyCases, nonEmptyCases,
+                                                      T, getTypeInfo());
     }
 
     llvm::Function *emitCopyEnumFunction(IRGenModule &IGM, SILType type) const {
@@ -3597,7 +3657,10 @@ namespace {
         Explosion value;
         projectPayloadValue(IGF, parts.payload, tagIndex, lti, value);
 
-        lti.consume(IGF, value, IGF.getDefaultAtomicity());
+        lti.consume(IGF, value, IGF.getDefaultAtomicity(),
+                    type.getEnumElementType(elt.decl,
+                                          IGM.getSILTypes(),
+                                          IGM.getMaximalTypeExpansionContext()));
       });
 
       IGF.Builder.CreateRetVoid();
@@ -3638,13 +3701,13 @@ namespace {
 
       // Check the payloads to see if we can take advantage of common layout to
       // optimize our value semantics.
-      bool allPOD = true;
+      bool allTriviallyDestroyable = true;
       bool allBitwiseTakable = true;
       bool allSingleRefcount = true;
       bool haveRefcounting = false;
       for (auto &elt : ElementsWithPayload) {
-        if (!elt.ti->isPOD(ResilienceExpansion::Maximal))
-          allPOD = false;
+        if (!elt.ti->isTriviallyDestroyable(ResilienceExpansion::Maximal))
+          allTriviallyDestroyable = false;
         if (!elt.ti->isBitwiseTakable(ResilienceExpansion::Maximal))
           allBitwiseTakable = false;
 
@@ -3668,9 +3731,9 @@ namespace {
 
       if (!ElementsAreABIAccessible) {
         CopyDestroyKind = ABIInaccessible;
-      } else if (allPOD) {
-        assert(!allSingleRefcount && "pod *and* refcounted?!");
-        CopyDestroyKind = POD;
+      } else if (allTriviallyDestroyable) {
+        assert(!allSingleRefcount && "TriviallyDestroyable *and* refcounted?!");
+        CopyDestroyKind = TriviallyDestroyable;
       // FIXME: Memory corruption issues arise when enabling this for mixed
       // Swift/ObjC enums.
       } else if (allSingleRefcount
@@ -3760,7 +3823,7 @@ namespace {
       switch (CopyDestroyKind) {
       case TaggedRefcounted:
         return IGM.getReferenceType(Refcounting);
-      case POD:
+      case TriviallyDestroyable:
       case BitwiseTakable:
       case Normal:
       case ABIInaccessible:
@@ -3776,7 +3839,7 @@ namespace {
       case TaggedRefcounted:
         IGF.emitStrongRetain(ptr, Refcounting, IGF.getDefaultAtomicity());
         return;
-      case POD:
+      case TriviallyDestroyable:
       case BitwiseTakable:
       case Normal:
       case ABIInaccessible:
@@ -3790,7 +3853,7 @@ namespace {
       case TaggedRefcounted:
         IGF.emitFixLifetime(ptr);
         return;
-      case POD:
+      case TriviallyDestroyable:
       case BitwiseTakable:
       case Normal:
       case ABIInaccessible:
@@ -3804,7 +3867,7 @@ namespace {
       case TaggedRefcounted:
         IGF.emitStrongRelease(ptr, Refcounting, IGF.getDefaultAtomicity());
         return;
-      case POD:
+      case TriviallyDestroyable:
       case BitwiseTakable:
       case Normal:
       case ABIInaccessible:
@@ -3831,9 +3894,9 @@ namespace {
                                     llvm::Value *tagIndex) const {
       auto result = EnumPayload::zero(IGF.IGM, PayloadSchema);
       if (!CommonSpareBits.empty())
-        result.emitScatterBits(IGF, ~CommonSpareBits.asAPInt(), tagIndex);
+        result.emitScatterBits(IGF.IGM, IGF.Builder, ~CommonSpareBits.asAPInt(), tagIndex);
       if (!PayloadTagBits.empty())
-        result.emitScatterBits(IGF, PayloadTagBits.asAPInt(), tag);
+        result.emitScatterBits(IGF.IGM, IGF.Builder, PayloadTagBits.asAPInt(), tag);
       return result;
     }
 
@@ -4319,17 +4382,18 @@ namespace {
                      cast<LoadableTypeInfo>(*foundPayload->ti), out);
     }
 
-    void packIntoEnumPayload(IRGenFunction &IGF,
+    void packIntoEnumPayload(IRGenModule &IGM,
+                             IRBuilder &builder,
                              EnumPayload &outerPayload,
                              Explosion &src,
                              unsigned offset) const override {
       auto innerPayload = EnumPayload::fromExplosion(IGM, src,
                                                      PayloadSchema);
       // Pack the payload, if any.
-      innerPayload.packIntoEnumPayload(IGF, outerPayload, offset);
+      innerPayload.packIntoEnumPayload(IGM, builder, outerPayload, offset);
       // Pack the extra bits, if any.
       if (ExtraTagBitCount > 0)
-        outerPayload.insertValue(IGF, src.claimNext(),
+        outerPayload.insertValue(IGM, builder, src.claimNext(),
                                  CommonSpareBits.size() + offset);
     }
 
@@ -4349,7 +4413,7 @@ namespace {
     }
 
   private:
-    void emitPayloadInjection(IRGenFunction &IGF,
+    void emitPayloadInjection(IRBuilder &builder,
                               const FixedTypeInfo &payloadTI,
                               Explosion &params, Explosion &out,
                               unsigned tag) const {
@@ -4357,13 +4421,13 @@ namespace {
       auto &loadablePayloadTI = cast<LoadableTypeInfo>(payloadTI); // FIXME
       
       auto payload = EnumPayload::zero(IGM, PayloadSchema);
-      loadablePayloadTI.packIntoEnumPayload(IGF, payload, params, 0);
+      loadablePayloadTI.packIntoEnumPayload(IGM, builder, payload, params, 0);
 
       // If we have spare bits, pack tag bits into them.
       unsigned numSpareBits = PayloadTagBits.count();
       if (numSpareBits > 0) {
         APInt tagMaskVal = scatterBits(PayloadTagBits.asAPInt(), tag);
-        payload.emitApplyOrMask(IGF, tagMaskVal);
+        payload.emitApplyOrMask(IGM, builder, tagMaskVal);
       }
 
       payload.explode(IGM, out);
@@ -4450,7 +4514,7 @@ namespace {
         auto mask = APInt::getLowBitsSet(CommonSpareBits.size(),
                                          std::min(32U, numCaseBits));
         payload = EnumPayload::zero(IGM, PayloadSchema);
-        payload.emitScatterBits(IGF, mask, tagIndex);
+        payload.emitScatterBits(IGF.IGM, IGF.Builder, mask, tagIndex);
       }
 
       // If the tag bits do not fit in the spare bits, the remaining tag bits
@@ -4464,8 +4528,7 @@ namespace {
       return {payload, extraTag};
     }
 
-    void emitNoPayloadInjection(IRGenFunction &IGF, Explosion &out,
-                                unsigned index) const {
+    void emitNoPayloadInjection(Explosion &out, unsigned index) const {
       APInt payloadVal, extraTag;
       std::tie(payloadVal, extraTag) = getNoPayloadCaseValue(index);
       
@@ -4485,7 +4548,7 @@ namespace {
       unsigned numNontrivialPayloads
         = std::count_if(ElementsWithPayload.begin(), ElementsWithPayload.end(),
                      [](Element e) -> bool {
-                       return !e.ti->isPOD(ResilienceExpansion::Maximal);
+                       return !e.ti->isTriviallyDestroyable(ResilienceExpansion::Maximal);
                      });
 
       bool anyTrivial = !ElementsWithNoPayload.empty()
@@ -4502,7 +4565,7 @@ namespace {
         auto &payloadTI = *payloadCasePair.ti;
 
         // Trivial payloads don't need any work.
-        if (payloadTI.isPOD(ResilienceExpansion::Maximal)) {
+        if (payloadTI.isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
           ++tagIndex;
           continue;
         }
@@ -4542,7 +4605,8 @@ namespace {
     }
 
   public:
-    void emitValueInjection(IRGenFunction &IGF,
+    void emitValueInjection(IRGenModule &IGM,
+                            IRBuilder &builder,
                             EnumElementDecl *elt,
                             Explosion &params,
                             Explosion &out) const override {
@@ -4551,7 +4615,7 @@ namespace {
                                    ElementsWithPayload.end(),
                                [&](const Element &e) { return e.decl == elt; });
       if (payloadI != ElementsWithPayload.end())
-        return emitPayloadInjection(IGF, cast<FixedTypeInfo>(*payloadI->ti),
+        return emitPayloadInjection(builder, cast<FixedTypeInfo>(*payloadI->ti),
                                     params, out,
                                     payloadI - ElementsWithPayload.begin());
 
@@ -4559,7 +4623,7 @@ namespace {
                                  ElementsWithNoPayload.end(),
                                [&](const Element &e) { return e.decl == elt; });
       assert(emptyI != ElementsWithNoPayload.end() && "case not in enum");
-      emitNoPayloadInjection(IGF, out, emptyI - ElementsWithNoPayload.begin());
+      emitNoPayloadInjection(out, emptyI - ElementsWithNoPayload.begin());
     }
 
     void copy(IRGenFunction &IGF, Explosion &src, Explosion &dest,
@@ -4567,8 +4631,8 @@ namespace {
       assert(TIK >= Loadable);
 
       switch (CopyDestroyKind) {
-      case POD:
-        reexplode(IGF, src, dest);
+      case TriviallyDestroyable:
+        reexplode(src, dest);
         return;
 
       case ABIInaccessible:
@@ -4576,7 +4640,7 @@ namespace {
 
       case BitwiseTakable:
       case Normal: {
-        if (loweredType.hasOpenedExistential()) {
+        if (loweredType.hasLocalArchetype()) {
           auto parts = destructureAndTagLoadableEnum(IGF, src);
 
           forNontrivialPayloads(
@@ -4626,10 +4690,13 @@ namespace {
     }
 
     void consume(IRGenFunction &IGF, Explosion &src,
-                 Atomicity atomicity) const override {
+                 Atomicity atomicity, SILType T) const override {
+      if (tryEmitConsumeUsingDeinit(IGF, src, T)) {
+        return;
+      }
       assert(TIK >= Loadable);
       switch (CopyDestroyKind) {
-      case POD:
+      case TriviallyDestroyable:
         (void)src.claim(getExplosionSize());
         return;
 
@@ -4638,7 +4705,7 @@ namespace {
 
       case BitwiseTakable:
       case Normal: {
-        if (loweredType.hasOpenedExistential()) {
+        if (loweredType.hasLocalArchetype()) {
           auto parts = destructureAndTagLoadableEnum(IGF, src);
 
           forNontrivialPayloads(
@@ -4648,7 +4715,10 @@ namespace {
                 Explosion value;
                 projectPayloadValue(IGF, parts.payload, tagIndex, lti, value);
 
-                lti.consume(IGF, value, IGF.getDefaultAtomicity());
+                lti.consume(IGF, value, IGF.getDefaultAtomicity(),
+                            T.getEnumElementType(elt.decl,
+                                    IGF.IGM.getSILTypes(),
+                                    IGF.IGM.getMaximalTypeExpansionContext()));
               });
           return;
         }
@@ -4680,7 +4750,7 @@ namespace {
       assert(TIK >= Loadable);
 
       switch (CopyDestroyKind) {
-      case POD:
+      case TriviallyDestroyable:
         (void)src.claim(getExplosionSize());
         return;
 
@@ -4723,7 +4793,7 @@ namespace {
       auto &C = IGM.getLLVMContext();
 
       switch (CopyDestroyKind) {
-      case POD:
+      case TriviallyDestroyable:
         return emitPrimitiveCopy(IGF, dest, src, T);
 
       case ABIInaccessible:
@@ -4743,7 +4813,7 @@ namespace {
 
           loadAsTake(IGF, dest, tmpOld);
           initialize(IGF, tmpSrc, dest, isOutlined);
-          consume(IGF, tmpOld, IGF.getDefaultAtomicity());
+          consume(IGF, tmpOld, IGF.getDefaultAtomicity(), T);
           return;
         }
 
@@ -4776,7 +4846,7 @@ namespace {
       auto &C = IGM.getLLVMContext();
 
       switch (CopyDestroyKind) {
-      case POD:
+      case TriviallyDestroyable:
         return emitPrimitiveCopy(IGF, dest, src, T);
 
       case ABIInaccessible:
@@ -4810,7 +4880,7 @@ namespace {
 
         /// True if the type is trivially copyable or takable by this operation.
         auto isTrivial = [&](const TypeInfo &ti) -> bool {
-          return ti.isPOD(ResilienceExpansion::Maximal)
+          return ti.isTriviallyDestroyable(ResilienceExpansion::Maximal)
               || (isTake && ti.isBitwiseTakable(ResilienceExpansion::Maximal));
         };
         
@@ -4909,7 +4979,7 @@ namespace {
                         SILType T, bool isOutlined) const override {
       if (!ElementsAreABIAccessible) {
         emitAssignWithCopyCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         emitIndirectAssign(IGF, dest, src, T, IsNotTake, isOutlined);
       } else {
         callOutlinedCopy(IGF, dest, src, T, IsNotInitialization, IsNotTake);
@@ -4920,7 +4990,7 @@ namespace {
                         SILType T, bool isOutlined) const override {
       if (!ElementsAreABIAccessible) {
         emitAssignWithTakeCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         emitIndirectAssign(IGF, dest, src, T, IsTake, isOutlined);
       } else {
         callOutlinedCopy(IGF, dest, src, T, IsNotInitialization, IsTake);
@@ -4931,7 +5001,7 @@ namespace {
                             SILType T, bool isOutlined) const override {
       if (!ElementsAreABIAccessible) {
         emitInitializeWithCopyCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         emitIndirectInitialize(IGF, dest, src, T, IsNotTake, isOutlined);
       } else {
         callOutlinedCopy(IGF, dest, src, T, IsInitialization, IsNotTake);
@@ -4942,7 +5012,7 @@ namespace {
                             SILType T, bool isOutlined) const override {
       if (!ElementsAreABIAccessible) {
         emitInitializeWithTakeCall(IGF, T, dest, src);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         emitIndirectInitialize(IGF, dest, src, T, IsTake, isOutlined);
       } else {
         callOutlinedCopy(IGF, dest, src, T, IsInitialization, IsTake);
@@ -4967,14 +5037,18 @@ namespace {
 
     void destroy(IRGenFunction &IGF, Address addr, SILType T,
                  bool isOutlined) const override {
-      if (CopyDestroyKind == POD) {
+      if (tryEmitDestroyUsingDeinit(IGF, addr, T)) {
+        return;
+      }
+
+      if (CopyDestroyKind == TriviallyDestroyable) {
         return;
       }
       if (!ElementsAreABIAccessible) {
         emitDestroyCall(IGF, T, addr);
-      } else if (isOutlined || T.hasOpenedExistential()) {
+      } else if (isOutlined || T.hasParameterizedExistential()) {
         switch (CopyDestroyKind) {
-        case POD:
+        case TriviallyDestroyable:
           return;
 
         case ABIInaccessible:
@@ -4988,7 +5062,7 @@ namespace {
           if (TI->isLoadable()) {
             Explosion tmp;
             loadAsTake(IGF, addr, tmp);
-            consume(IGF, tmp, IGF.getDefaultAtomicity());
+            consume(IGF, tmp, IGF.getDefaultAtomicity(), T);
             return;
           }
 
@@ -5036,7 +5110,7 @@ namespace {
         APInt tagBitMask = scatterBits(PayloadTagBits.asAPInt(), spareTagBits);
 
         payload.emitApplyAndMask(IGF, spareBitMask);
-        payload.emitApplyOrMask(IGF, tagBitMask);
+        payload.emitApplyOrMask(IGM, IGF.Builder, tagBitMask);
         payload.store(IGF, payloadAddr);
       }
 
@@ -5076,7 +5150,7 @@ namespace {
         payload.emitApplyAndMask(IGF, spareBitMask);
 
         // Store the tag into the spare bits.
-        payload.emitScatterBits(IGF, PayloadTagBits.asAPInt(), spareTagBits);
+        payload.emitScatterBits(IGF.IGM, IGF.Builder, PayloadTagBits.asAPInt(), spareTagBits);
 
         // Store the payload back.
         payload.store(IGF, payloadAddr);
@@ -5256,6 +5330,36 @@ namespace {
       return firstAddr;
     }
 
+    llvm::Value *emitPayloadMetadataArray(IRGenFunction &IGF, SILType T,
+                                 MetadataDependencyCollector *collector) const {
+      auto numPayloads = ElementsWithPayload.size();
+      auto metadataBufferTy = llvm::ArrayType::get(IGM.TypeMetadataPtrTy,
+                                                   numPayloads);
+      auto metadataBuffer = IGF.createAlloca(metadataBufferTy,
+                                             IGM.getPointerAlignment(),
+                                             "payload_types");
+      llvm::Value *firstAddr = nullptr;
+      for (unsigned i = 0; i < numPayloads; ++i) {
+        auto &elt = ElementsWithPayload[i];
+        Address eltAddr = IGF.Builder.CreateStructGEP(metadataBuffer, i,
+                                                  IGM.getPointerSize() * i);
+        if (i == 0) firstAddr = eltAddr.getAddress();
+
+        auto payloadTy =
+            T.getEnumElementType(elt.decl, IGF.getSILModule(),
+                                 IGF.IGM.getMaximalTypeExpansionContext());
+
+        auto request = DynamicMetadataRequest::getNonBlocking(
+          MetadataState::LayoutComplete, collector);
+        auto metadata = IGF.emitTypeMetadataRefForLayout(payloadTy, request);
+
+        IGF.Builder.CreateStore(metadata, eltAddr);
+      }
+      assert(firstAddr && "Expected firstAddr to be assigned to");
+
+      return firstAddr;
+    }
+
     void initializeMetadata(IRGenFunction &IGF,
                             llvm::Value *metadata,
                             bool isVWTMutable,
@@ -5272,6 +5376,23 @@ namespace {
       auto flags = emitEnumLayoutFlags(IGM, isVWTMutable);
       IGF.Builder.CreateCall(
           IGM.getInitEnumMetadataMultiPayloadFunctionPointer(),
+          {metadata, flags, numPayloadsVal, payloadLayoutArray});
+    }
+
+    void initializeMetadataWithLayoutString(
+        IRGenFunction &IGF, llvm::Value *metadata, bool isVWTMutable, SILType T,
+        MetadataDependencyCollector *collector) const override {
+      // Fixed-size enums don't need dynamic metadata initialization.
+      if (TIK >= Fixed) return;
+
+      // Ask the runtime to set up the metadata record for a dynamic enum.
+      auto payloadLayoutArray = emitPayloadMetadataArray(IGF, T, collector);
+      auto numPayloadsVal = llvm::ConstantInt::get(IGM.SizeTy,
+                                                   ElementsWithPayload.size());
+
+      auto flags = emitEnumLayoutFlags(IGM, isVWTMutable);
+      IGF.Builder.CreateCall(
+          IGM.getInitEnumMetadataMultiPayloadWithLayoutStringFunctionPointer(),
           {metadata, flags, numPayloadsVal, payloadLayoutArray});
     }
 
@@ -5436,7 +5557,7 @@ namespace {
         // Factor the index value into parts to scatter into the payload and
         // to store in the extra tag bits, if any.
         auto payload = EnumPayload::zero(IGM, PayloadSchema);
-        payload.emitScatterBits(IGF, CommonSpareBits.asAPInt(), indexValue);
+        payload.emitScatterBits(IGF.IGM, IGF.Builder, CommonSpareBits.asAPInt(), indexValue);
         payload.store(IGF, projectPayload(IGF, dest));
         if (getExtraTagBitCountForExtraInhabitants() > 0) {
           auto tagBits = IGF.Builder.CreateLShr(indexValue,
@@ -5494,7 +5615,7 @@ namespace {
         auto mask = BitPatternBuilder(IGM.Triple.isLittleEndian());
         mask.append(CommonSpareBits);
         mask.padWithSetBitsTo(fixedTI->getFixedSize().getValueInBits());
-        tagBits = mask.build().getValue();
+        tagBits = mask.build().value();
       }
       return tagBits;
     }
@@ -5555,7 +5676,7 @@ namespace {
         value.appendClearBits(CommonSpareBits.size());
         value.append(APInt(bits - CommonSpareBits.size(), mask & extraTagMask));
       }
-      return value.build().getValue();
+      return value.build().value();
     }
 
     ClusteredBitVector
@@ -5578,7 +5699,7 @@ namespace {
       Size size = cast<FixedTypeInfo>(TI)->getFixedSize();
       if (ExtraTagBitCount > 0) {
         auto paddedWidth = size.getValueInBits() - PayloadBitCount;
-        auto extraPadded = extraPart.zextOrSelf(paddedWidth);
+        auto extraPadded = zextOrSelf(extraPart, paddedWidth);
         value.append(std::move(extraPadded));
       }
       return value.build();
@@ -5647,7 +5768,10 @@ namespace {
       emitDestructiveProjectEnumDataCall(IGF, T, enumAddr);
     }
 
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM, SILType T) const override {
+    TypeLayoutEntry *
+    buildTypeLayoutEntry(IRGenModule &IGM,
+                         SILType T,
+                         bool useStructLayouts) const override {
       return IGM.typeLayoutCache.getOrCreateResilientEntry(T);
     }
 
@@ -5839,7 +5963,8 @@ namespace {
       llvm_unreachable("resilient enums are always indirect");
     }
   
-    void emitValueInjection(IRGenFunction &IGF,
+    void emitValueInjection(IRGenModule &IGM,
+                            IRBuilder &builder,
                             EnumElementDecl *elt,
                             Explosion &params,
                             Explosion &out) const override {
@@ -5882,7 +6007,7 @@ namespace {
     }
 
     void assign(IRGenFunction &IGF, Explosion &e, Address addr,
-                bool isOutlined) const override {
+                bool isOutlined, SILType T) const override {
       llvm_unreachable("resilient enums are always indirect");
     }
 
@@ -5891,7 +6016,7 @@ namespace {
       llvm_unreachable("resilient enums are always indirect");
     }
 
-    void reexplode(IRGenFunction &IGF, Explosion &src,
+    void reexplode(Explosion &src,
                            Explosion &dest) const override {
       llvm_unreachable("resilient enums are always indirect");
     }
@@ -5902,7 +6027,7 @@ namespace {
     }
 
     void consume(IRGenFunction &IGF, Explosion &src,
-                 Atomicity atomicity) const override {
+                 Atomicity atomicity, SILType T) const override {
       llvm_unreachable("resilient enums are always indirect");
     }
 
@@ -5910,7 +6035,8 @@ namespace {
       llvm_unreachable("resilient enums are always indirect");
     }
 
-    void packIntoEnumPayload(IRGenFunction &IGF,
+    void packIntoEnumPayload(IRGenModule &IGM,
+                             IRBuilder &builder,
                              EnumPayload &outerPayload,
                              Explosion &src,
                              unsigned offset) const override {
@@ -5948,6 +6074,12 @@ namespace {
                             bool isVWTMutable,
                             SILType T,
                         MetadataDependencyCollector *collector) const override {
+      llvm_unreachable("resilient enums cannot be defined");
+    }
+
+    void initializeMetadataWithLayoutString(
+        IRGenFunction &IGF, llvm::Value *metadata, bool isVWTMutable, SILType T,
+        MetadataDependencyCollector *collector) const override {
       llvm_unreachable("resilient enums cannot be defined");
     }
 
@@ -6039,6 +6171,13 @@ EnumImplStrategy::get(TypeConverter &TC, SILType type, EnumDecl *theEnum) {
     ++numElements;
 
     if (!elt->hasAssociatedValues()) {
+      elementsWithNoPayload.push_back({elt, nullptr, nullptr});
+      continue;
+    }
+
+    // For the purposes of memory layout, treat unavailable cases as if they do
+    // not have a payload.
+    if (!elt->isAvailableDuringLowering()) {
       elementsWithNoPayload.push_back({elt, nullptr, nullptr});
       continue;
     }
@@ -6238,9 +6377,11 @@ namespace {
                                    ReferenceCounting *rc) const override {
       return Strategy.isSingleRetainablePointer(expansion, rc);
     }
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                          SILType ty) const override {
-      return Strategy.buildTypeLayoutEntry(IGM, ty);
+    TypeLayoutEntry
+    *buildTypeLayoutEntry(IRGenModule &IGM,
+                          SILType ty,
+                          bool useStructLayouts) const override {
+      return Strategy.buildTypeLayoutEntry(IGM, ty, useStructLayouts);
     }
     bool canValueWitnessExtraInhabitantsUpTo(IRGenModule &IGM,
                                              unsigned index) const override {
@@ -6293,9 +6434,13 @@ namespace {
   public:
     FixedEnumTypeInfo(EnumImplStrategy &strategy,
                       llvm::StructType *T, Size S, SpareBitVector SB,
-                      Alignment A, IsPOD_t isPOD, IsBitwiseTakable_t isBT,
+                      Alignment A,
+                      IsTriviallyDestroyable_t isTriviallyDestroyable,
+                      IsBitwiseTakable_t isBT,
+                      IsCopyable_t copyable,
                       IsFixedSize_t alwaysFixedSize)
-      : FixedEnumTypeInfoBase(strategy, T, S, std::move(SB), A, isPOD, isBT,
+      : FixedEnumTypeInfoBase(strategy, T, S, std::move(SB), A,
+                              isTriviallyDestroyable, isBT, copyable,
                               alwaysFixedSize) {}
   };
 
@@ -6305,9 +6450,12 @@ namespace {
     // FIXME: Derive spare bits from element layout.
     LoadableEnumTypeInfo(EnumImplStrategy &strategy,
                          llvm::StructType *T, Size S, SpareBitVector SB,
-                         Alignment A, IsPOD_t isPOD,
+                         Alignment A,
+                         IsTriviallyDestroyable_t isTriviallyDestroyable,
+                         IsCopyable_t copyable,
                          IsFixedSize_t alwaysFixedSize)
-      : FixedEnumTypeInfoBase(strategy, T, S, std::move(SB), A, isPOD,
+      : FixedEnumTypeInfoBase(strategy, T, S, std::move(SB), A,
+                              isTriviallyDestroyable, copyable,
                               alwaysFixedSize) {}
 
     void addToAggLowering(IRGenModule &IGM, SwiftAggLowering &lowering,
@@ -6327,33 +6475,34 @@ namespace {
       return Strategy.loadAsTake(IGF, addr, e);
     }
     void assign(IRGenFunction &IGF, Explosion &e, Address addr,
-                bool isOutlined) const override {
-      return Strategy.assign(IGF, e, addr, isOutlined);
+                bool isOutlined, SILType T) const override {
+      return Strategy.assign(IGF, e, addr, isOutlined, T);
     }
     void initialize(IRGenFunction &IGF, Explosion &e, Address addr,
                     bool isOutlined) const override {
       return Strategy.initialize(IGF, e, addr, isOutlined);
     }
-    void reexplode(IRGenFunction &IGF, Explosion &src,
+    void reexplode( Explosion &src,
                    Explosion &dest) const override {
-      return Strategy.reexplode(IGF, src, dest);
+      return Strategy.reexplode(src, dest);
     }
     void copy(IRGenFunction &IGF, Explosion &src,
               Explosion &dest, Atomicity atomicity) const override {
       return Strategy.copy(IGF, src, dest, atomicity);
     }
     void consume(IRGenFunction &IGF, Explosion &src,
-                 Atomicity atomicity) const override {
-      return Strategy.consume(IGF, src, atomicity);
+                 Atomicity atomicity, SILType T) const override {
+      return Strategy.consume(IGF, src, atomicity, T);
     }
     void fixLifetime(IRGenFunction &IGF, Explosion &src) const override {
       return Strategy.fixLifetime(IGF, src);
     }
-    void packIntoEnumPayload(IRGenFunction &IGF,
+    void packIntoEnumPayload(IRGenModule &IGM,
+                             IRBuilder &builder,
                              EnumPayload &payload,
                              Explosion &in,
                              unsigned offset) const override {
-      return Strategy.packIntoEnumPayload(IGF, payload, in, offset);
+      return Strategy.packIntoEnumPayload(IGM, builder, payload, in, offset);
     }
     void unpackFromEnumPayload(IRGenFunction &IGF,
                                const EnumPayload &payload,
@@ -6375,10 +6524,11 @@ namespace {
     NonFixedEnumTypeInfo(EnumImplStrategy &strategy,
                          llvm::Type *irTy,
                          Alignment align,
-                         IsPOD_t pod,
+                         IsTriviallyDestroyable_t pod,
                          IsBitwiseTakable_t bt,
+                         IsCopyable_t copy,
                          IsABIAccessible_t abiAccessible)
-      : EnumTypeInfoBase(strategy, irTy, align, pod, bt, abiAccessible) {}
+      : EnumTypeInfoBase(strategy, irTy, align, pod, bt, copy, abiAccessible) {}
   };
 
   /// TypeInfo for dynamically-sized enum types.
@@ -6387,8 +6537,10 @@ namespace {
   {
   public:
     ResilientEnumTypeInfo(EnumImplStrategy &strategy,
-                          llvm::Type *irTy, IsABIAccessible_t abiAccessible)
-      : EnumTypeInfoBase(strategy, irTy, abiAccessible) {}
+                          llvm::Type *irTy,
+                          IsCopyable_t copyable,
+                          IsABIAccessible_t abiAccessible)
+      : EnumTypeInfoBase(strategy, irTy, copyable, abiAccessible) {}
   };
 } // end anonymous namespace
 
@@ -6411,19 +6563,26 @@ irgen::getEnumImplStrategy(IRGenModule &IGM, CanType ty) {
 TypeInfo *
 EnumImplStrategy::getFixedEnumTypeInfo(llvm::StructType *T, Size S,
                                        SpareBitVector SB,
-                                       Alignment A, IsPOD_t isPOD,
-                                       IsBitwiseTakable_t isBT) {
+                                       Alignment A,
+                                       IsTriviallyDestroyable_t isTriviallyDestroyable,
+                                       IsBitwiseTakable_t isBT,
+                                       IsCopyable_t isCopyable) {
   TypeInfo *mutableTI;
   switch (TIK) {
   case Opaque:
     llvm_unreachable("not valid");
   case Fixed:
-    mutableTI = new FixedEnumTypeInfo(*this, T, S, std::move(SB), A, isPOD, isBT,
+    mutableTI = new FixedEnumTypeInfo(*this, T, S, std::move(SB), A,
+                                      isTriviallyDestroyable,
+                                      isBT,
+                                      isCopyable,
                                       AlwaysFixedSize);
     break;
   case Loadable:
     assert(isBT && "loadable enum not bitwise takable?!");
-    mutableTI = new LoadableEnumTypeInfo(*this, T, S, std::move(SB), A, isPOD,
+    mutableTI = new LoadableEnumTypeInfo(*this, T, S, std::move(SB), A,
+                                         isTriviallyDestroyable,
+                                         isCopyable,
                                          AlwaysFixedSize);
     break;
   }
@@ -6436,15 +6595,20 @@ SingletonEnumImplStrategy::completeEnumTypeLayout(TypeConverter &TC,
                                                   SILType Type,
                                                   EnumDecl *theEnum,
                                                   llvm::StructType *enumTy) {
+  auto deinit = theEnum->getValueTypeDestructor()
+    ? IsNotTriviallyDestroyable : IsTriviallyDestroyable;
+  auto copyable = theEnum->isMoveOnly()
+    ? IsNotCopyable : IsCopyable;
   if (ElementsWithPayload.empty()) {
     enumTy->setBody(ArrayRef<llvm::Type*>{}, /*isPacked*/ true);
     Alignment alignment(1);
     applyLayoutAttributes(TC.IGM, theEnum, /*fixed*/true, alignment);
     return registerEnumTypeInfo(new LoadableEnumTypeInfo(*this, enumTy,
-                                                         Size(0), {},
-                                                         alignment,
-                                                         IsPOD,
-                                                         AlwaysFixedSize));
+                 Size(0), {},
+                 alignment,
+                 deinit,
+                 copyable,
+                 AlwaysFixedSize));
   } else {
     const TypeInfo &eltTI = *getSingleton();
 
@@ -6461,21 +6625,23 @@ SingletonEnumImplStrategy::completeEnumTypeLayout(TypeConverter &TC,
       applyLayoutAttributes(TC.IGM, theEnum, /*fixed*/false, alignment);
       auto enumAccessible = IsABIAccessible_t(TC.IGM.isTypeABIAccessible(Type));
       return registerEnumTypeInfo(new NonFixedEnumTypeInfo(*this, enumTy,
-                             alignment,
-                             eltTI.isPOD(ResilienceExpansion::Maximal),
-                             eltTI.isBitwiseTakable(ResilienceExpansion::Maximal),
-                             enumAccessible));
+             alignment,
+             deinit & eltTI.isTriviallyDestroyable(ResilienceExpansion::Maximal),
+             eltTI.isBitwiseTakable(ResilienceExpansion::Maximal),
+             copyable,
+             enumAccessible));
     } else {
       auto &fixedEltTI = cast<FixedTypeInfo>(eltTI);
       auto alignment = fixedEltTI.getFixedAlignment();
       applyLayoutAttributes(TC.IGM, theEnum, /*fixed*/true, alignment);
 
       return getFixedEnumTypeInfo(enumTy,
-                        fixedEltTI.getFixedSize(),
-                        fixedEltTI.getSpareBits(),
-                        alignment,
-                        fixedEltTI.isPOD(ResilienceExpansion::Maximal),
-                        fixedEltTI.isBitwiseTakable(ResilienceExpansion::Maximal));
+        fixedEltTI.getFixedSize(),
+        fixedEltTI.getSpareBits(),
+        alignment,
+        deinit & fixedEltTI.isTriviallyDestroyable(ResilienceExpansion::Maximal),
+        fixedEltTI.isBitwiseTakable(ResilienceExpansion::Maximal),
+        copyable);
     }
   }
 }
@@ -6505,9 +6671,16 @@ NoPayloadEnumImplStrategy::completeEnumTypeLayout(TypeConverter &TC,
   Alignment alignment(tagSize.getValue());
   applyLayoutAttributes(TC.IGM, theEnum, /*fixed*/true, alignment);
 
+  auto deinit = theEnum->getValueTypeDestructor()
+    ? IsNotTriviallyDestroyable : IsTriviallyDestroyable;
+  auto copyable = theEnum->isMoveOnly()
+    ? IsNotCopyable : IsCopyable;
   return registerEnumTypeInfo(new LoadableEnumTypeInfo(*this,
                               enumTy, tagSize, std::move(spareBits),
-                              alignment, IsPOD, AlwaysFixedSize));
+                              alignment,
+                              deinit,
+                              copyable,
+                              AlwaysFixedSize));
 }
 
 TypeInfo *
@@ -6530,7 +6703,7 @@ CCompatibleEnumImplStrategy::completeEnumTypeLayout(TypeConverter &TC,
   auto &rawTI = TC.getCompleteTypeInfo(
                                    theEnum->getRawType()->getCanonicalType());
   auto &rawFixedTI = cast<FixedTypeInfo>(rawTI);
-  assert(rawFixedTI.isPOD(ResilienceExpansion::Maximal)
+  assert(rawFixedTI.isTriviallyDestroyable(ResilienceExpansion::Maximal)
          && "c-compatible raw type isn't POD?!");
   ExplosionSchema rawSchema = rawTI.getSchema();
   assert(rawSchema.size() == 1
@@ -6552,7 +6725,8 @@ CCompatibleEnumImplStrategy::completeEnumTypeLayout(TypeConverter &TC,
                                                rawFixedTI.getFixedSize(),
                                                rawFixedTI.getSpareBits(),
                                                alignment,
-                                               IsPOD,
+                                               IsTriviallyDestroyable,
+                                               IsCopyable,
                                                IsFixedSize));
 }
 
@@ -6617,10 +6791,15 @@ TypeInfo *SinglePayloadEnumImplStrategy::completeFixedLayout(
   auto alignment = payloadTI.getFixedAlignment();
   applyLayoutAttributes(TC.IGM, theEnum, /*fixed*/true, alignment);
 
+  auto deinit = theEnum->getValueTypeDestructor()
+    ? IsNotTriviallyDestroyable : IsTriviallyDestroyable;
+  auto copyable = theEnum->isMoveOnly()
+    ? IsNotCopyable : IsCopyable;
   getFixedEnumTypeInfo(
       enumTy, Size(sizeWithTag), spareBits.build(), alignment,
-      payloadTI.isPOD(ResilienceExpansion::Maximal),
-      payloadTI.isBitwiseTakable(ResilienceExpansion::Maximal));
+      deinit & payloadTI.isTriviallyDestroyable(ResilienceExpansion::Maximal),
+      payloadTI.isBitwiseTakable(ResilienceExpansion::Maximal),
+      copyable);
   if (TIK >= Loadable && CopyDestroyKind == Normal) {
     computePayloadTypesAndTagType(TC.IGM, *TI, PayloadTypesAndTagType);
     loweredType = Type;
@@ -6647,10 +6826,15 @@ TypeInfo *SinglePayloadEnumImplStrategy::completeDynamicLayout(
   
   auto enumAccessible = IsABIAccessible_t(TC.IGM.isTypeABIAccessible(Type));
 
+  auto deinit = theEnum->getValueTypeDestructor()
+    ? IsNotTriviallyDestroyable : IsTriviallyDestroyable;
+  auto copyable = theEnum->isMoveOnly()
+    ? IsNotCopyable : IsCopyable;
   return registerEnumTypeInfo(new NonFixedEnumTypeInfo(*this, enumTy,
          alignment,
-         payloadTI.isPOD(ResilienceExpansion::Maximal),
+         deinit & payloadTI.isTriviallyDestroyable(ResilienceExpansion::Maximal),
          payloadTI.isBitwiseTakable(ResilienceExpansion::Maximal),
+         copyable,
          enumAccessible));
 }
 
@@ -6680,15 +6864,18 @@ MultiPayloadEnumImplStrategy::completeFixedLayout(TypeConverter &TC,
   // of the largest payload.
   CommonSpareBits = {};
   Alignment worstAlignment(1);
-  IsPOD_t isPOD = IsPOD;
+  auto isCopyable = theEnum->isMoveOnly()
+    ? IsNotCopyable : IsCopyable;
+  auto isTriviallyDestroyable = theEnum->getValueTypeDestructor()
+    ? IsNotTriviallyDestroyable : IsTriviallyDestroyable;
   IsBitwiseTakable_t isBT = IsBitwiseTakable;
   PayloadSize = 0;
   for (auto &elt : ElementsWithPayload) {
     auto &fixedPayloadTI = cast<FixedTypeInfo>(*elt.ti);
     if (fixedPayloadTI.getFixedAlignment() > worstAlignment)
       worstAlignment = fixedPayloadTI.getFixedAlignment();
-    if (!fixedPayloadTI.isPOD(ResilienceExpansion::Maximal))
-      isPOD = IsNotPOD;
+    if (!fixedPayloadTI.isTriviallyDestroyable(ResilienceExpansion::Maximal))
+      isTriviallyDestroyable = IsNotTriviallyDestroyable;
     if (!fixedPayloadTI.isBitwiseTakable(ResilienceExpansion::Maximal))
       isBT = IsNotBitwiseTakable;
 
@@ -6820,7 +7007,8 @@ MultiPayloadEnumImplStrategy::completeFixedLayout(TypeConverter &TC,
   applyLayoutAttributes(TC.IGM, theEnum, /*fixed*/ true, worstAlignment);
 
   getFixedEnumTypeInfo(enumTy, Size(sizeWithTag), std::move(spareBits),
-                       worstAlignment, isPOD, isBT);
+                       worstAlignment, isTriviallyDestroyable, isBT,
+                       isCopyable);
   if (TIK >= Loadable &&
       (CopyDestroyKind == Normal || CopyDestroyKind == BitwiseTakable)) {
     computePayloadTypesAndTagType(TC.IGM, *TI, PayloadTypesAndTagType);
@@ -6844,12 +7032,13 @@ TypeInfo *MultiPayloadEnumImplStrategy::completeDynamicLayout(
   // during initializeMetadata. We can at least glean the best available
   // static information from the payloads.
   Alignment alignment(1);
-  IsPOD_t pod = IsPOD;
-  IsBitwiseTakable_t bt = IsBitwiseTakable;
+  auto td = theEnum->getValueTypeDestructor()
+    ? IsNotTriviallyDestroyable : IsTriviallyDestroyable;
+  auto bt = IsBitwiseTakable;
   for (auto &element : ElementsWithPayload) {
     auto &payloadTI = *element.ti;
     alignment = std::max(alignment, payloadTI.getBestKnownAlignment());
-    pod &= payloadTI.isPOD(ResilienceExpansion::Maximal);
+    td &= payloadTI.isTriviallyDestroyable(ResilienceExpansion::Maximal);
     bt &= payloadTI.isBitwiseTakable(ResilienceExpansion::Maximal);
   }
   
@@ -6857,8 +7046,10 @@ TypeInfo *MultiPayloadEnumImplStrategy::completeDynamicLayout(
 
   auto enumAccessible = IsABIAccessible_t(TC.IGM.isTypeABIAccessible(Type));
   
+  auto cp = theEnum->isMoveOnly()
+    ? IsNotCopyable : IsCopyable;
   return registerEnumTypeInfo(new NonFixedEnumTypeInfo(*this, enumTy,
-                                                       alignment, pod, bt,
+                                                       alignment, td, bt, cp,
                                                        enumAccessible));
 }
 
@@ -6879,8 +7070,11 @@ ResilientEnumImplStrategy::completeEnumTypeLayout(TypeConverter &TC,
                                                   EnumDecl *theEnum,
                                                   llvm::StructType *enumTy) {
   auto abiAccessible = IsABIAccessible_t(TC.IGM.isTypeABIAccessible(Type));
+  auto copyable = theEnum->isMoveOnly()
+    ? IsNotCopyable : IsCopyable;
   return registerEnumTypeInfo(
-                       new ResilientEnumTypeInfo(*this, enumTy, abiAccessible));
+                       new ResilientEnumTypeInfo(*this, enumTy, copyable,
+                                                 abiAccessible));
 }
 
 const TypeInfo *TypeConverter::convertEnumType(TypeBase *key, CanType type,
@@ -6966,7 +7160,8 @@ const TypeInfo *TypeConverter::convertEnumType(TypeBase *key, CanType type,
 }
 
 void IRGenModule::emitEnumDecl(EnumDecl *theEnum) {
-  if (!IRGen.hasLazyMetadata(theEnum)) {
+  if (!IRGen.hasLazyMetadata(theEnum) &&
+      !theEnum->getASTContext().LangOpts.hasFeature(Feature::Embedded)) {
     emitEnumMetadata(*this, theEnum);
     emitFieldDescriptor(theEnum);
   }
@@ -6999,7 +7194,7 @@ void irgen::emitInjectLoadableEnum(IRGenFunction &IGF, SILType enumTy,
                                     Explosion &data,
                                     Explosion &out) {
   getEnumImplStrategy(IGF.IGM, enumTy)
-    .emitValueInjection(IGF, theCase, data, out);
+    .emitValueInjection(IGF.IGM, IGF.Builder, theCase, data, out);
 }
 
 void irgen::emitProjectLoadableEnum(IRGenFunction &IGF, SILType enumTy,
@@ -7128,13 +7323,13 @@ llvm::Value *irgen::emitGatherBits(IRGenFunction &IGF,
 /// move them to the bit positions indicated by the mask.
 /// Equivalent to a parallel bit deposit instruction (PDEP),
 /// although we don't currently emit PDEP directly.
-llvm::Value *irgen::emitScatterBits(IRGenFunction &IGF,
+llvm::Value *irgen::emitScatterBits(IRGenModule &IGM,
+                                    IRBuilder &builder,
                                     llvm::APInt mask,
                                     llvm::Value *source,
                                     unsigned packedLowBit) {
-  auto &DL = IGF.IGM.DataLayout;
-  auto &B = IGF.Builder;
-  auto &C = IGF.IGM.getLLVMContext();
+  auto &DL = IGM.DataLayout;
+  auto &C = IGM.getLLVMContext();
 
   // Expand or contract the packed bits to the destination type.
   auto bitSize = mask.getBitWidth();
@@ -7142,7 +7337,7 @@ llvm::Value *irgen::emitScatterBits(IRGenFunction &IGF,
   if (!sourceTy) {
     auto numBits = DL.getTypeSizeInBits(source->getType());
     sourceTy = llvm::IntegerType::get(C, numBits);
-    source = B.CreateBitOrPointerCast(source, sourceTy);
+    source = builder.CreateBitOrPointerCast(source, sourceTy);
   }
   assert(packedLowBit < sourceTy->getBitWidth() &&
       "packedLowBit out of range");
@@ -7152,11 +7347,11 @@ llvm::Value *irgen::emitScatterBits(IRGenFunction &IGF,
   if (usedBits > 0 && sourceTy->getBitWidth() > bitSize) {
     // Need to shift before truncation if the packed value is wider
     // than the mask.
-    source = B.CreateLShr(source, uint64_t(usedBits));
+    source = builder.CreateLShr(source, uint64_t(usedBits));
     usedBits = 0;
   }
   if (sourceTy->getBitWidth() != bitSize) {
-    source = B.CreateZExtOrTrunc(source, destTy);
+    source = builder.CreateZExtOrTrunc(source, destTy);
   }
 
   // No need to AND with the mask if the whole source can just be
@@ -7182,18 +7377,18 @@ llvm::Value *irgen::emitScatterBits(IRGenFunction &IGF,
     llvm::Value *part = source;
     int64_t offset = int64_t(partMask.countTrailingZeros()) - usedBits;
     if (offset > 0) {
-      part = B.CreateShl(part, uint64_t(offset));
+      part = builder.CreateShl(part, uint64_t(offset));
     } else if (offset < 0) {
-      part = B.CreateLShr(part, uint64_t(-offset));
+      part = builder.CreateLShr(part, uint64_t(-offset));
     }
 
     // Mask out selected bits.
     if (needMask) {
-      part = B.CreateAnd(part, partMask);
+      part = builder.CreateAnd(part, partMask);
     }
 
     // Accumulate the result.
-    result = result ? B.CreateOr(result, part) : part;
+    result = result ? builder.CreateOr(result, part) : part;
 
     // Update the offset and remaining mask.
     usedBits += partMask.countPopulation();

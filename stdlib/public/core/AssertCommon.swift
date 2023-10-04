@@ -29,8 +29,9 @@ func _isDebugAssertConfiguration() -> Bool {
   return Int32(Builtin.assert_configuration()) == 0
 }
 
-@usableFromInline @_transparent
-internal func _isReleaseAssertConfiguration() -> Bool {
+@_transparent
+public // @testable, used in _Concurrency executor preconditions
+func _isReleaseAssertConfiguration() -> Bool {
   // The values for the assert_configuration call are:
   // 0: Debug
   // 1: Release
@@ -93,6 +94,7 @@ internal func _assertionFailure(
   file: StaticString, line: UInt,
   flags: UInt32
 ) -> Never {
+#if !$Embedded
   prefix.withUTF8Buffer {
     (prefix) -> Void in
     message.withUTF8Buffer {
@@ -108,6 +110,7 @@ internal func _assertionFailure(
       }
     }
   }
+#endif
   Builtin.int_trap()
 }
 
@@ -119,6 +122,7 @@ internal func _assertionFailure(
 @usableFromInline
 @inline(never)
 @_semantics("programtermination_point")
+@_unavailableInEmbedded
 internal func _assertionFailure(
   _ prefix: StaticString, _ message: String,
   file: StaticString, line: UInt,
@@ -151,6 +155,7 @@ internal func _assertionFailure(
 @usableFromInline
 @inline(never)
 @_semantics("programtermination_point")
+@_unavailableInEmbedded
 internal func _assertionFailure(
   _ prefix: StaticString, _ message: String,
   flags: UInt32
@@ -169,6 +174,18 @@ internal func _assertionFailure(
 
   Builtin.int_trap()
 }
+
+#if $Embedded
+@usableFromInline
+@inline(never)
+@_semantics("programtermination_point")
+internal func _assertionFailure(
+  _ prefix: StaticString, _ message: StaticString,
+  flags: UInt32
+) -> Never {
+  Builtin.int_trap()
+}
+#endif
 
 /// This function should be used only in the implementation of stdlib
 /// assertions.
@@ -201,6 +218,7 @@ func _unimplementedInitializer(className: StaticString,
   // redundant parameter values (#file etc.) are eliminated, and don't leak
   // information about the user's source.
 
+#if !$Embedded
   if _isDebugAssertConfiguration() {
     className.withUTF8Buffer {
       (className) in
@@ -229,10 +247,12 @@ func _unimplementedInitializer(className: StaticString,
       }
     }
   }
+#endif
 
   Builtin.int_trap()
 }
 
+@_unavailableInEmbedded
 public // COMPILER_INTRINSIC
 func _undefined<T>(
   _ message: @autoclosure () -> String = String(),
@@ -253,9 +273,13 @@ internal func _diagnoseUnexpectedEnumCaseValue<SwitchedValue, RawValue>(
   type: SwitchedValue.Type,
   rawValue: RawValue
 ) -> Never {
+#if !$Embedded
   _assertionFailure("Fatal error",
                     "unexpected enum case '\(type)(rawValue: \(rawValue))'",
                     flags: _fatalErrorFlags())
+#else
+  Builtin.int_trap()
+#endif
 }
 
 /// Called when falling off the end of a switch and the value is not safe to
@@ -269,8 +293,27 @@ internal func _diagnoseUnexpectedEnumCaseValue<SwitchedValue, RawValue>(
 internal func _diagnoseUnexpectedEnumCase<SwitchedValue>(
   type: SwitchedValue.Type
 ) -> Never {
+#if !$Embedded
   _assertionFailure(
     "Fatal error",
     "unexpected enum case while switching on value of type '\(type)'",
     flags: _fatalErrorFlags())
+#else
+  Builtin.int_trap()
+#endif
+}
+
+/// Called when a function marked `unavailable` with `@available` is invoked
+/// and the module containing the unavailable function was compiled with
+/// `-unavailable-decl-optimization=stub`.
+///
+/// This function should not be inlined because it is cold and inlining just
+/// bloats code.
+@backDeployed(before: SwiftStdlib 5.9)
+@inline(never)
+@_semantics("unavailable_code_reached")
+@usableFromInline // COMPILER_INTRINSIC
+internal func _diagnoseUnavailableCodeReached() -> Never {
+  _assertionFailure(
+    "Fatal error", "Unavailable code reached", flags: _fatalErrorFlags())
 }

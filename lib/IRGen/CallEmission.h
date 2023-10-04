@@ -17,8 +17,9 @@
 #ifndef SWIFT_IRGEN_CALLEMISSION_H
 #define SWIFT_IRGEN_CALLEMISSION_H
 
-#include "Temporary.h"
+#include "Address.h"
 #include "Callee.h"
+#include "Temporary.h"
 
 namespace llvm {
   class CallSite;
@@ -49,6 +50,10 @@ protected:
   /// Temporaries required by the call.
   TemporarySet Temporaries;
 
+  /// Temporaries required by the call that are not mapped to any
+  /// SIL value.
+  SmallVector<StackAddress, 8> RawTempraries;
+
   /// The function we're going to call.
   Callee CurCallee;
 
@@ -63,15 +68,27 @@ protected:
   /// RemainingArgsForCallee, at least between calls.
   bool EmittedCall;
 
+  /// The basic block to which the call to a potentially throwing foreign
+  /// function should jump to continue normal execution of the program.
+  llvm::BasicBlock *invokeNormalDest = nullptr;
+
+  /// The basic block to which the call to a potentially throwing foreign
+  /// function should jump to in case an exception has been thrown during the
+  /// invocation of the call.
+  llvm::BasicBlock *invokeUnwindDest = nullptr;
+
   virtual void setFromCallee();
   void emitToUnmappedMemory(Address addr);
   void emitToUnmappedExplosion(Explosion &out);
-  virtual void emitCallToUnmappedExplosion(llvm::CallInst *call, Explosion &out) = 0;
+  virtual void emitCallToUnmappedExplosion(llvm::CallBase *call,
+                                           Explosion &out) = 0;
   void emitYieldsToExplosion(Explosion &out);
+  void setKeyPathAccessorArguments(Explosion &in, bool isOutlined,
+                                   Explosion &out);
   virtual FunctionPointer getCalleeFunctionPointer() = 0;
-  llvm::CallInst *emitCallSite();
+  llvm::CallBase *emitCallSite();
 
-  virtual llvm::CallInst *createCall(const FunctionPointer &fn,
+  virtual llvm::CallBase *createCall(const FunctionPointer &fn,
                                      ArrayRef<llvm::Value *> args) = 0;
 
   CallEmission(IRGenFunction &IGF, llvm::Value *selfValue, Callee &&callee)
@@ -105,7 +122,7 @@ public:
                     bool isOutlined);
   void emitToExplosion(Explosion &out, bool isOutlined);
 
-  llvm::CallInst *emitCoroutineAsOrdinaryFunction() {
+  llvm::CallBase *emitCoroutineAsOrdinaryFunction() {
     assert(IsCoroutine);
     IsCoroutine = false;
 

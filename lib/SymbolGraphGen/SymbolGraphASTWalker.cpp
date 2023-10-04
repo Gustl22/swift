@@ -13,6 +13,7 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/SymbolGraphGen/SymbolGraphGen.h"
 
@@ -27,8 +28,17 @@ namespace {
 ///
 /// This does a by-name comparison to consider a module's underlying Clang module to be equivalent
 /// to the wrapping module of the same name.
-bool areModulesEqual(const ModuleDecl *lhs, const ModuleDecl *rhs) {
-  return lhs->getNameStr() == rhs->getNameStr();
+///
+/// If the `isClangEqual` argument is set to `false`, the modules must also be from the same
+/// compiler, i.e. a Swift module and its underlying Clang module would be considered not equal.
+bool areModulesEqual(const ModuleDecl *lhs, const ModuleDecl *rhs, bool isClangEqual = true) {
+  if (lhs->getNameStr() != rhs->getNameStr())
+    return false;
+
+  if (!isClangEqual && (lhs->isNonSwiftModule() != rhs->isNonSwiftModule()))
+    return false;
+
+  return true;
 }
 
 } // anonymous namespace
@@ -40,7 +50,7 @@ SymbolGraphASTWalker::SymbolGraphASTWalker(
     const SymbolGraphOptions &Options)
     : Options(Options), M(M), ExportedImportedModules(ExportedImportedModules),
       QualifiedExportedImports(QualifiedExportedImports),
-      MainGraph(*this, M, None, Ctx) {}
+      MainGraph(*this, M, llvm::None, Ctx) {}
 
 /// Get a "sub" symbol graph for the parent module of a type that
 /// the main module `M` is extending.
@@ -65,8 +75,8 @@ SymbolGraph *SymbolGraphASTWalker::getModuleSymbolGraph(const Decl *D) {
 
   if (areModulesEqual(&this->M, M)) {
     return &MainGraph;
-  } else if (MainGraph.DeclaringModule.hasValue() &&
-             areModulesEqual(MainGraph.DeclaringModule.getValue(), M)) {
+  } else if (MainGraph.DeclaringModule.has_value() &&
+             areModulesEqual(MainGraph.DeclaringModule.value(), M)) {
     // Cross-import overlay modules already appear as "extensions" of their declaring module; we
     // should put actual extensions of that module into the main graph
     return &MainGraph;
@@ -89,7 +99,7 @@ SymbolGraph *SymbolGraphASTWalker::getModuleSymbolGraph(const Decl *D) {
   }
   auto *Memory = Ctx.allocate(sizeof(SymbolGraph), alignof(SymbolGraph));
   auto *SG = new (Memory)
-      SymbolGraph(*this, MainGraph.M, Optional<ModuleDecl *>(M), Ctx);
+      SymbolGraph(*this, MainGraph.M, llvm::Optional<ModuleDecl *>(M), Ctx);
 
   ExtendedModuleGraphs.insert({M->getNameStr(), SG});
   return SG;
@@ -132,6 +142,7 @@ bool SymbolGraphASTWalker::walkToDeclPre(Decl *D, CharSourceRange Range) {
   case swift::DeclKind::TypeAlias:
   case swift::DeclKind::AssociatedType:
   case swift::DeclKind::Extension:
+  case swift::DeclKind::Macro:
     break;
 
   // We'll descend into everything else.
@@ -148,6 +159,10 @@ bool SymbolGraphASTWalker::walkToDeclPre(Decl *D, CharSourceRange Range) {
     auto ExtendedSG = getModuleSymbolGraph(ExtendedNominal);
     // Ignore effectively private decls.
     if (ExtendedSG->isImplicitlyPrivate(Extension)) {
+      return false;
+    }
+
+    if (SG->isUnconditionallyUnavailableOnAllPlatforms(Extension)) {
       return false;
     }
 
@@ -180,78 +195,33 @@ bool SymbolGraphASTWalker::walkToDeclPre(Decl *D, CharSourceRange Range) {
       // We want to add conformsTo relationships for all protocols implicitly
       // implied by those explicitly stated on the extension.
       //
-      // Thus, we have to expand two syntactic constructs:
-      //  * `protocol A: B, C { ... }` declarations, where those that still have
-      //    to be expanded are stored in `UnexpandedProtocols`
-      //    that still have to be expanded
-      //  * `typealias A = B & C` declarations, which are directly expanded to
-      //    unexpanded protocols in `HandleProtocolOrComposition`
-      //
-      // The expansion adds the base protocol to `Protocols` and calls
-      // `HandleProtocolOrComposition` for the implied protocols. This process
-      // continues until there is nothing left to expand (`UnexpandedProtocols`
-      // is empty), because `HandleProtocolOrComposition` didn't add any new
-      // unexpanded protocols. At that point, all direct and indirect
-      // conformances are stored in `Protocols`.
+      // We start by collecting the conformances declared on the extension with
+      // `getLocalConformances`. From there, we inspect each protocol for any
+      // other protocols it inherits (whether stated explicitly or via a
+      // composed protocol type alias) with `getInheritedProtocols`. Each new
+      // protocol is added to `UnexpandedProtocols` until there are no new
+      // protocols to add. At that point, all direct and indirect conformances
+      // are stored in `Protocols`.
 
-      SmallVector<const ProtocolDecl *, 4> Protocols;
+      SmallPtrSet<const ProtocolDecl *, 4> Protocols;
       SmallVector<const ProtocolDecl *, 4> UnexpandedProtocols;
-
-      // Unwrap `UnexpandedCompositions` and add all unexpanded protocols to the
-      // `UnexpandedProtocols` list for expansion.
-      auto HandleProtocolOrComposition = [&](Type Ty) {
-        if (const auto *Proto =
-                dyn_cast_or_null<ProtocolDecl>(Ty->getAnyNominal())) {
-          UnexpandedProtocols.push_back(Proto);
-          return;
-        }
-
-        SmallVector<const ProtocolCompositionType *, 4> UnexpandedCompositions;
-
-        if (const auto *Comp = Ty->getAs<ProtocolCompositionType>()) {
-          UnexpandedCompositions.push_back(Comp);
-        } else {
-          llvm_unreachable("Expected ProtocolDecl or ProtocolCompositionType");
-        }
-
-        while (const auto *Comp = UnexpandedCompositions.pop_back_val()) {
-          for (const auto &Member : Comp->getMembers()) {
-            if (const auto *Proto =
-                    dyn_cast_or_null<ProtocolDecl>(Member->getAnyNominal())) {
-              Protocols.push_back(Proto);
-              UnexpandedProtocols.push_back(Proto);
-            } else if (const auto *Comp =
-                           Member->getAs<ProtocolCompositionType>()) {
-              UnexpandedCompositions.push_back(Comp);
-            } else {
-              abort();
-            }
-          }
-        }
-      };
 
       // Start the process with the conformances stated
       // explicitly on the extension.
-      for (const auto &InheritedLoc : Extension->getInherited()) {
-        auto InheritedTy = InheritedLoc.getType();
-        if (!InheritedTy) {
-          continue;
-        }
-        HandleProtocolOrComposition(InheritedTy);
+      for (const auto *Conformance : Extension->getLocalConformances()) {
+        UnexpandedProtocols.push_back(Conformance->getProtocol());
       }
 
       // "Recursively" expand the unexpanded list and populate
       // the expanded `Protocols` list (in an iterative manner).
       while (!UnexpandedProtocols.empty()) {
         const auto *Proto = UnexpandedProtocols.pop_back_val();
-        for (const auto &InheritedEntry : Proto->getInherited()) {
-          auto InheritedTy = InheritedEntry.getType();
-          if (!InheritedTy) {
-            continue;
+        if (!Protocols.contains(Proto)) {
+          for (const auto *InheritedProtocol : Proto->getInheritedProtocols()) {
+            UnexpandedProtocols.push_back(InheritedProtocol);
           }
-          HandleProtocolOrComposition(InheritedTy);
+          Protocols.insert(Proto);
         }
-        Protocols.push_back(Proto);
       }
 
       // Record the expanded list of protocols.
@@ -346,9 +316,9 @@ bool SymbolGraphASTWalker::isConsideredExportedImported(const Decl *D) const {
   return false;
 }
 
-bool SymbolGraphASTWalker::isFromExportedImportedModule(const Decl* D) const {
+bool SymbolGraphASTWalker::isFromExportedImportedModule(const Decl* D, bool countUnderlyingClangModule) const {
   auto *M = D->getModuleContext();
-  return isQualifiedExportedImport(D) || isExportedImportedModule(M);
+  return isQualifiedExportedImport(D) || isExportedImportedModule(M, countUnderlyingClangModule);
 }
 
 bool SymbolGraphASTWalker::isQualifiedExportedImport(const Decl *D) const {
@@ -357,9 +327,9 @@ bool SymbolGraphASTWalker::isQualifiedExportedImport(const Decl *D) const {
   });
 }
 
-bool SymbolGraphASTWalker::isExportedImportedModule(const ModuleDecl *M) const {
-  return llvm::any_of(ExportedImportedModules, [&M](const auto *MD) {
-    return areModulesEqual(M, MD->getModuleContext());
+bool SymbolGraphASTWalker::isExportedImportedModule(const ModuleDecl *M, bool countUnderlyingClangModule) const {
+  return llvm::any_of(ExportedImportedModules, [&M, countUnderlyingClangModule](const auto *MD) {
+    return areModulesEqual(M, MD->getModuleContext(), /*isClangEqual*/countUnderlyingClangModule);
   });
 }
 
@@ -370,5 +340,8 @@ bool SymbolGraphASTWalker::isOurModule(const ModuleDecl *M) const {
 bool SymbolGraphASTWalker::shouldBeRecordedAsExtension(
     const ExtensionDecl *ED) const {
   return Options.EmitExtensionBlockSymbols &&
-      !areModulesEqual(ED->getModuleContext(), ED->getExtendedNominal()->getModuleContext());
+         !areModulesEqual(ED->getModuleContext(),
+                          ED->getExtendedNominal()->getModuleContext()) &&
+         !isExportedImportedModule(
+             ED->getExtendedNominal()->getModuleContext());
 }

@@ -1,6 +1,21 @@
-add_swift_target_library(swiftCxx ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_OVERLAY
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/../../cmake/modules)
+include(StdlibOptions)
+
+set(SWIFT_CXX_DEPS symlink_clang_headers)
+if(SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT)
+  list(APPEND SWIFT_CXX_DEPS copy-legacy-layouts)
+endif()
+
+add_swift_target_library(swiftCxx STATIC NO_LINK_NAME IS_STDLIB IS_SWIFT_ONLY IS_FRAGILE
+    CxxConvertibleToCollection.swift
+    CxxDictionary.swift
+    CxxPair.swift
+    CxxOptional.swift
+    CxxSet.swift
     CxxRandomAccessCollection.swift
     CxxSequence.swift
+    CxxVector.swift
+    UnsafeCxxIterators.swift
 
     SWIFT_COMPILE_FLAGS ${SWIFT_RUNTIME_SWIFT_COMPILE_FLAGS} ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
     -Xfrontend -enable-experimental-cxx-interop
@@ -9,7 +24,10 @@ add_swift_target_library(swiftCxx ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_OVE
     -Xcc -nostdinc++
 
     LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
-    INSTALL_IN_COMPONENT sdk-overlay)
+    DEPENDS ${SWIFT_CXX_DEPS}
+    INSTALL_IN_COMPONENT compiler
+    INSTALL_WITH_SHARED)
 
+add_subdirectory(libstdcxx)
 add_subdirectory(std)
 add_subdirectory(cxxshim)

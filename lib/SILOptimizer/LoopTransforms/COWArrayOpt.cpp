@@ -105,7 +105,7 @@ class COWArrayOpt {
   RCIdentityFunctionInfo *RCIA;
   SILFunction *Function;
   SILLoop *Loop;
-  Optional<SmallVector<SILBasicBlock *, 8>> LoopExitingBlocks;
+  llvm::Optional<SmallVector<SILBasicBlock *, 8>> LoopExitingBlocks;
   SILBasicBlock *Preheader;
   DominanceInfo *DomTree;
   bool HasChanged = false;
@@ -493,7 +493,7 @@ ArraySemanticsCall getEndMutationCall(const UserRange &AddressUsers) {
 
 /// Returns true if this instruction is a safe array use if all of its users are
 /// also safe array users.
-static Optional<SILInstructionResultArray>
+static llvm::Optional<SILInstructionResultArray>
 isTransitiveSafeUser(SILInstruction *I) {
   switch (I->getKind()) {
   case SILInstructionKind::StructExtractInst:
@@ -509,7 +509,7 @@ isTransitiveSafeUser(SILInstruction *I) {
   case SILInstructionKind::BeginBorrowInst:
     return I->getResults();
   default:
-    return None;
+    return llvm::None;
   }
 }
 
@@ -533,8 +533,8 @@ bool COWArrayOpt::checkSafeArrayValueUses(UserList &ArrayValueUsers) {
     /// instruction is safe only if all of its users are safe. Check this
     /// recursively.
     auto results = isTransitiveSafeUser(UseInst);
-    if (results.hasValue()) {
-      for (auto result : results.getValue()) {
+    if (results.has_value()) {
+      for (auto result : results.value()) {
         if (!std::all_of(result->use_begin(), result->use_end(),
                          [this](Operand *Op) -> bool {
                            return checkSafeArrayElementUse(Op->getUser(),
@@ -641,8 +641,8 @@ bool COWArrayOpt::checkSafeArrayElementUse(SILInstruction *UseInst,
   // and return false if any of them are not transitive escape array element
   // uses.
   auto results = isTransitiveSafeUser(UseInst);
-  if (results.hasValue()) {
-    for (auto result : results.getValue()) {
+  if (results.has_value()) {
+    for (auto result : results.value()) {
       if (!std::all_of(result->use_begin(), result->use_end(),
                        [this](Operand *Op) -> bool {
                          return checkSafeArrayElementUse(Op->getUser(),

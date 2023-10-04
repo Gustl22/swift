@@ -132,7 +132,7 @@ static bool canParameterizeCallOperand(const CallInst *CI, unsigned opIdx) {
       return false;
   }
   if (isCalleeOperand(CI, opIdx) &&
-      CI->getOperandBundle(LLVMContext::OB_ptrauth).hasValue()) {
+      CI->getOperandBundle(LLVMContext::OB_ptrauth).has_value()) {
     // The operand is the callee and it has already been signed. Ignore this
     // because we cannot add another ptrauth bundle to the call instruction.
     return false;
@@ -1188,6 +1188,9 @@ void SwiftMergeFunctions::removeEquivalenceClassFromTree(FunctionEntry *FE) {
 // Selects proper bitcast operation,
 // but a bit simpler then CastInst::getCastOpcode.
 static Value *createCast(IRBuilder<> &Builder, Value *V, Type *DestTy) {
+  if (V->getType() == DestTy)
+    return V;
+
   Type *SrcTy = V->getType();
   if (SrcTy->isStructTy()) {
     assert(DestTy->isStructTy());
@@ -1357,7 +1360,8 @@ bool SwiftMergeFunctions::replaceDirectCallers(Function *Old, Function *New,
                                             NewArgAttrs);
     newAttrList = fixUpTypesInByValAndStructRetAttributes(FType, newAttrList);
     NewCI->setAttributes(newAttrList);
-    CI->replaceAllUsesWith(NewCI);
+    Value *retVal = createCast(Builder, NewCI, CI->getType());
+    CI->replaceAllUsesWith(retVal);
     CI->eraseFromParent();
   }
   assert(Old->use_empty() && "should have replaced all uses of old function");

@@ -17,10 +17,13 @@
 #ifndef SWIFT_SUBSYSTEMS_H
 #define SWIFT_SUBSYSTEMS_H
 
+#include "swift/AST/TBDGenRequests.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/OptionSet.h"
 #include "swift/Basic/PrimarySpecificPaths.h"
 #include "swift/Basic/Version.h"
+#include "swift/Frontend/Frontend.h"
+#include "swift/SIL/SILDeclRef.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
@@ -35,12 +38,15 @@ namespace llvm {
   class Module;
   class TargetOptions;
   class TargetMachine;
+  namespace vfs {
+    class OutputBackend;
+  }
 }
 
 namespace swift {
   class GenericSignatureBuilder;
   class ASTContext;
-  class CodeCompletionCallbacksFactory;
+  class IDEInspectionCallbacksFactory;
   class Decl;
   class DeclContext;
   class DiagnosticConsumer;
@@ -64,6 +70,7 @@ namespace swift {
   class SerializationOptions;
   class SILOptions;
   class SILModule;
+  class SILTypeResolutionContext;
   class SourceFile;
   enum class SourceFileKind;
   class SourceManager;
@@ -104,9 +111,8 @@ namespace swift {
 
   /// @}
 
-  /// Finish the code completion.
-  void performCodeCompletionSecondPass(SourceFile &SF,
-                                       CodeCompletionCallbacksFactory &Factory);
+  void performIDEInspectionSecondPass(SourceFile &SF,
+                                      IDEInspectionCallbacksFactory &Factory);
 
   /// Lex and return a vector of tokens for the given buffer.
   std::vector<Token> tokenize(const LangOptions &LangOpts,
@@ -164,10 +170,9 @@ namespace swift {
   /// code completion).
   ///
   /// \returns A well-formed type on success, or an \c ErrorType.
-  Type performTypeResolution(TypeRepr *TyR, ASTContext &Ctx, bool isSILMode,
-                             bool isSILType,
+  Type performTypeResolution(TypeRepr *TyR, ASTContext &Ctx,
                              GenericSignature GenericSig,
-                             GenericParamList *GenericParams,
+                             SILTypeResolutionContext *SILContext,
                              DeclContext *DC, bool ProduceDiagnostics = true);
 
   /// Expose TypeChecker's handling of GenericParamList to SIL parsing.
@@ -182,6 +187,14 @@ namespace swift {
   performASTLowering(ModuleDecl *M, Lowering::TypeConverter &TC,
                      const SILOptions &options,
                      const IRGenOptions *irgenOptions = nullptr);
+
+  /// Turn the given module into SIL IR.
+  ///
+  /// The module must contain source files. The optimizer will assume that the
+  /// SIL of all files in the module is present in the SILModule.
+  std::unique_ptr<SILModule>
+  performASTLowering(CompilerInstance &CI,
+                     llvm::SmallVector<SymbolSource, 1> Sources);
 
   /// Turn a source file into SIL IR.
   std::unique_ptr<SILModule>
@@ -237,10 +250,11 @@ namespace swift {
                       llvm::GlobalVariable **outModuleHash = nullptr);
 
   /// Given an already created LLVM module, construct a pass pipeline and run
-  /// the Swift LLVM Pipeline upon it. This does not cause the module to be
-  /// printed, only to be optimized.
+  /// the Swift LLVM Pipeline upon it. This will include the emission of LLVM IR
+  /// if requested (\out is not null).
   void performLLVMOptimizations(const IRGenOptions &Opts, llvm::Module *Module,
-                                llvm::TargetMachine *TargetMachine);
+                                llvm::TargetMachine *TargetMachine,
+                                llvm::raw_pwrite_stream *out);
 
   /// Compiles and writes the given LLVM module into an output stream in the
   /// format specified in the \c IRGenOptions.
@@ -276,6 +290,7 @@ namespace swift {
   /// \param Module LLVM module to code gen, required.
   /// \param TargetMachine target of code gen, required.
   /// \param OutputFilename Filename for output.
+  /// \param Backend OutputBackend for writing output.
   bool performLLVM(const IRGenOptions &Opts,
                    DiagnosticEngine &Diags,
                    llvm::sys::Mutex *DiagMutex,
@@ -283,6 +298,7 @@ namespace swift {
                    llvm::Module *Module,
                    llvm::TargetMachine *TargetMachine,
                    StringRef OutputFilename,
+                   llvm::vfs::OutputBackend &Backend,
                    UnifiedStatsReporter *Stats);
 
   /// Dump YAML describing all fixed-size types imported from the given module.

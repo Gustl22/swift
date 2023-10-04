@@ -1,3 +1,5 @@
+[** ‼️ The official C++ interoperability documentation is live at Swift.org and provides an up-to-date guide for mixing Swift and C++ ‼️ **](https://www.swift.org/documentation/cxx-interop/)
+
 # C++ Interop User Manual
 
 The following document explains how C++ APIs are imported into Swift and is targeted at users of C++ interoperability. Hopefully this document will help you understand why the compiler cannot import various APIs and help you update these APIs to be useable from Swift. First, the document will lay out some API patterns and definitions, then it will discuss how the Swift compiler decides if an API should be usable in Swift. 
@@ -5,6 +7,35 @@ The following document explains how C++ APIs are imported into Swift and is targ
 ## Reference Types
 
 Reference types have reference semantics and object identity. A reference type is a pointer (or “reference”) to some object which means there is a layer of indirection. When a reference type is copied, the pointer’s value is copied rather than the object’s storage. This means reference types can be used to represent non-copyable types in C++. Any C++ APIs that use reference types must have at least one layer of indirection to the type (a pointer or reference). Currently reference types must be immortal (never deallocated) or have manually managed lifetimes. You can specify a type has reference semantics by using the `import_reference` swift attribute.
+
+### Importing custom reference counted types into Swift
+
+C++ types that have their own reference count and custom retain/release operations
+can be bridged over as reference types into Swift. Swift's automatic reference counting (ARC)
+will automatically retain and release them using their C++ reference counting operations.
+
+The `import_reference` swift attribute can be applied with the appropriate `retain` and `release` attributes
+to import a type with such semantics as a reference type into Swift.
+The example below illustrates how this can be done for the C++ `MyReferenceObject` class:
+
+```c++
+#define SWIFT_CXX_REF_MYREFOBJECT   \
+    __attribute__((swift_attr("import_reference")))   \
+    __attribute__((swift_attr("retain:incRef")))   \
+    __attribute__((swift_attr("release:decRef")))
+
+class SWIFT_CXX_REF_MYREFOBJECT MyReferenceObject {
+private:
+  int referenceCount; // the custom reference count.
+};
+
+/// Increment the reference count for the given object.
+void incRef(MyReferenceObject *object);
+
+/// Decrement the reference count for the given object. When it reaches zero,
+/// the object is deallocated.
+void decRef(MyReferenceObject *object);
+```
 
 ## Owned Types
 

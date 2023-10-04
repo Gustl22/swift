@@ -49,6 +49,10 @@
 
 #include <fstream>
 #include <signal.h>
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #define DEBUG_TYPE "batch-mode"
 
@@ -116,8 +120,8 @@ Compilation::Compilation(DiagnosticEngine &Diags,
                          bool EnableIncrementalBuild,
                          bool EnableBatchMode,
                          unsigned BatchSeed,
-                         Optional<unsigned> BatchCount,
-                         Optional<unsigned> BatchSizeLimit,
+                         llvm::Optional<unsigned> BatchCount,
+                         llvm::Optional<unsigned> BatchSizeLimit,
                          bool SaveTemps,
                          bool ShowDriverTimeCompilation,
                          std::unique_ptr<UnifiedStatsReporter> StatsReporter,
@@ -515,7 +519,7 @@ namespace driver {
         return {};
       }
       return getFineGrainedDepGraph()
-          .findJobsToRecompileWhenNodesChange(changedNodes.getValue());
+          .findJobsToRecompileWhenNodesChange(changedNodes.value());
     }
 
     void handleDependenciesReloadFailure(const bool cmdFailed,
@@ -662,7 +666,7 @@ namespace driver {
                                        ProcInfo);
       }
 
-      if (Comp.getStatsReporter() && ProcInfo.getResourceUsage().hasValue())
+      if (Comp.getStatsReporter() && ProcInfo.getResourceUsage().has_value())
         Comp.getStatsReporter()->recordJobMaxRSS(
             ProcInfo.getResourceUsage()->Maxrss);
 
@@ -727,6 +731,23 @@ namespace driver {
                  : TaskFinishedResponse::StopExecution;
     }
 
+#if defined(_WIN32)
+    struct FileBinaryModeRAII {
+      FileBinaryModeRAII(FILE *F) : F(F) {
+        PrevMode = _setmode(_fileno(F), _O_BINARY);
+      }
+      ~FileBinaryModeRAII() {
+        _setmode(_fileno(F), PrevMode);
+      }
+      FILE *F;
+      int PrevMode;
+    };
+#else
+    struct FileBinaryModeRAII {
+      FileBinaryModeRAII(FILE *) {}
+    };
+#endif
+
     void processOutputOfFinishedProcess(ProcessId Pid, int ReturnCode,
                                         const Job *const FinishedCmd,
                                         StringRef Output,
@@ -739,8 +760,14 @@ namespace driver {
       case OutputLevel::Verbose:
         // Send the buffered output to stderr, though only if we
         // support getting buffered output.
-        if (TaskQueue::supportsBufferingOutput())
+        if (TaskQueue::supportsBufferingOutput()) {
+          // Temporarily change stderr to binary mode to avoid double
+          // LF -> CR LF conversions on the outputs from child
+          // processes, which have already this conversion appplied.
+          // This makes a difference only for Windows.
+          FileBinaryModeRAII F(stderr);
           llvm::errs() << Output;
+        }
         break;
       case OutputLevel::Parseable:
         emitParseableOutputForEachFinishedJob(Pid, ReturnCode, Output,
@@ -768,7 +795,8 @@ namespace driver {
 
     TaskFinishedResponse taskSignalled(ProcessId Pid, StringRef ErrorMsg,
                                        StringRef Output, StringRef Errors,
-                                       void *Context, Optional<int> Signal,
+                                       void *Context,
+                                       llvm::Optional<int> Signal,
                                        TaskProcessInformation ProcInfo) {
       const Job *SignalledCmd = (const Job *)Context;
 
@@ -792,7 +820,7 @@ namespace driver {
           llvm::errs() << Output;
       }
 
-      if (Comp.getStatsReporter() && ProcInfo.getResourceUsage().hasValue())
+      if (Comp.getStatsReporter() && ProcInfo.getResourceUsage().has_value())
         Comp.getStatsReporter()->recordJobMaxRSS(
             ProcInfo.getResourceUsage()->Maxrss);
 
@@ -801,10 +829,10 @@ namespace driver {
                                  diag::error_unable_to_execute_command,
                                  ErrorMsg);
 
-      if (Signal.hasValue()) {
+      if (Signal.has_value()) {
         Comp.getDiags().diagnose(SourceLoc(), diag::error_command_signalled,
                                  SignalledCmd->getSource().getClassName(),
-                                 Signal.getValue());
+                                 Signal.value());
       } else {
         Comp.getDiags()
             .diagnose(SourceLoc(),
@@ -901,7 +929,7 @@ namespace driver {
           mergeModulesJob = cmd;
         }
 
-        const Optional<std::pair<bool, bool>> shouldSchedAndIsCascading =
+        const llvm::Optional<std::pair<bool, bool>> shouldSchedAndIsCascading =
             computeShouldInitiallyScheduleJobAndDependents(cmd);
         if (!shouldSchedAndIsCascading)
           return getEveryCompileJob(); // Load error, just run them all
@@ -933,17 +961,17 @@ namespace driver {
     /// Return whether \p Cmd should be scheduled when using dependencies, and if
     /// the job is cascading. Or if there was a dependency-read error, return
     /// \c None to indicate don't-know.
-    Optional<std::pair<bool, bool>>
+    llvm::Optional<std::pair<bool, bool>>
     computeShouldInitiallyScheduleJobAndDependents(const Job *Cmd) {
       auto CondAndHasDepsIfNoError =
           loadDependenciesAndComputeCondition(Cmd);
       if (!CondAndHasDepsIfNoError)
-        return None; // swiftdeps read error, abandon dependencies
+        return llvm::None; // swiftdeps read error, abandon dependencies
 
       Job::Condition Cond;
       bool HasDependenciesFileName;
       std::tie(Cond, HasDependenciesFileName) =
-          CondAndHasDepsIfNoError.getValue();
+          CondAndHasDepsIfNoError.value();
 
       const bool shouldSched = shouldScheduleCompileJobAccordingToCondition(
           Cmd, Cond, HasDependenciesFileName);
@@ -955,7 +983,7 @@ namespace driver {
 
     /// Returns job condition, and whether a dependency file was specified.
     /// But returns None if there was a dependency read error.
-    Optional<std::pair<Job::Condition, bool>>
+    llvm::Optional<std::pair<Job::Condition, bool>>
     loadDependenciesAndComputeCondition(const Job *const Cmd) {
       // merge-modules Jobs do not have .swiftdeps files associated with them,
       // however, their compilation condition is computed as a function of their
@@ -982,7 +1010,7 @@ namespace driver {
           loadDepGraphFromPath(Cmd, DependenciesFile);
       if (depGraphLoadError) {
         dependencyLoadFailed(DependenciesFile, /*Warn=*/true);
-        return None;
+        return llvm::None;
       }
       return std::make_pair(Cmd->getCondition(), true);
     }
@@ -1187,8 +1215,8 @@ namespace driver {
     size_t pickNumberOfPartitions() {
 
       // If the user asked for something, use that.
-      if (Comp.getBatchCount().hasValue())
-        return Comp.getBatchCount().getValue();
+      if (Comp.getBatchCount().has_value())
+        return Comp.getBatchCount().value();
 
       // This is a long comment to justify a simple calculation.
       //
@@ -1297,7 +1325,7 @@ namespace driver {
       size_t DefaultSizeLimit = 25;
       size_t NumTasks = TQ->getNumberOfParallelTasks();
       size_t NumFiles = PendingExecution.size();
-      size_t SizeLimit = Comp.getBatchSizeLimit().getValueOr(DefaultSizeLimit);
+      size_t SizeLimit = Comp.getBatchSizeLimit().value_or(DefaultSizeLimit);
       return std::max(NumTasks, DivideRoundingUp(NumFiles, SizeLimit));
     }
 
@@ -1547,7 +1575,7 @@ namespace driver {
     bool loadDepGraphFromPath(const Job *Cmd, const StringRef DependenciesFile) {
       const auto changes = getFineGrainedDepGraph().loadFromPath(
           Cmd, DependenciesFile, Comp.getDiags());
-      const bool didDependencyLoadSucceed = changes.hasValue();
+      const bool didDependencyLoadSucceed = changes.has_value();
       return !didDependencyLoadSucceed;
     }
 

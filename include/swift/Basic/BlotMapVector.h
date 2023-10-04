@@ -29,7 +29,8 @@ bool compareKeyAgainstDefaultKey(const std::pair<KeyT, ValueT> &Pair) {
 /// iteration over its elements. Plus the special blot operation.
 template <typename KeyT, typename ValueT,
           typename MapT = llvm::DenseMap<KeyT, size_t>,
-          typename VectorT = std::vector<Optional<std::pair<KeyT, ValueT>>>>
+          typename VectorT =
+              std::vector<llvm::Optional<std::pair<KeyT, ValueT>>>>
 class BlotMapVector {
   /// Map keys to indices in Vector.
   MapT Map;
@@ -63,7 +64,7 @@ public:
       Vector.push_back({std::make_pair(Arg, ValueT())});
       return (*Vector[Num]).second;
     }
-    return Vector[Pair.first->second].getValue().second;
+    return Vector[Pair.first->second].value().second;
   }
 
   template <typename... Ts>
@@ -107,7 +108,7 @@ public:
     if (It == Map.end())
       return Vector.end();
     auto Iter = Vector.begin() + It->second;
-    if (!Iter->hasValue())
+    if (!Iter->has_value())
       return Vector.end();
     return Iter;
   }
@@ -125,7 +126,7 @@ public:
     typename MapT::iterator It = Map.find(Key);
     if (It == Map.end())
       return false;
-    Vector[It->second] = None;
+    Vector[It->second] = llvm::None;
     Map.erase(It);
     return true;
   }
@@ -148,7 +149,7 @@ public:
     if (Iter == Map.end())
       return ValueT();
     auto &P = Vector[Iter->second];
-    if (!P.hasValue())
+    if (!P.has_value())
       return ValueT();
     return P->second;
   }
@@ -161,7 +162,7 @@ public:
 template <typename KeyT, typename ValueT, unsigned N,
           typename MapT = llvm::SmallDenseMap<KeyT, size_t, N>,
           typename VectorT =
-              llvm::SmallVector<Optional<std::pair<KeyT, ValueT>>, N>>
+              llvm::SmallVector<llvm::Optional<std::pair<KeyT, ValueT>>, N>>
 class SmallBlotMapVector : public BlotMapVector<KeyT, ValueT, MapT, VectorT> {
 public:
   SmallBlotMapVector() {}

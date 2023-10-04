@@ -230,9 +230,18 @@ class LLVM(cmake_product.CMakeProduct):
             build_targets = ['clean']
 
         if self.args.skip_build or not self.args.build_llvm:
+            # We can't skip the build completely because the standalone
+            # build of Swift depends on these.
             build_targets = ['llvm-tblgen', 'clang-resource-headers',
                              'intrinsics_gen', 'clang-tablegen-targets']
-            if not self.args.build_toolchain_only:
+
+            # If we are not performing a toolchain-only build or generating
+            # Xcode projects, then we also want to include the following
+            # targets for testing purposes.
+            if (
+                not self.args.build_toolchain_only
+                and self.args.cmake_generator != 'Xcode'
+            ):
                 build_targets.extend([
                     'FileCheck',
                     'not',
@@ -338,6 +347,12 @@ class LLVM(cmake_product.CMakeProduct):
             llvm_cmake_options.define('LLVM_TABLEGEN', llvm_tblgen)
             clang_tblgen = os.path.join(host_build_dir, 'bin', 'clang-tblgen')
             llvm_cmake_options.define('CLANG_TABLEGEN', clang_tblgen)
+            confusable_chars_gen = os.path.join(host_build_dir, 'bin',
+                                                'clang-tidy-confusable-chars-gen')
+            llvm_cmake_options.define('CLANG_TIDY_CONFUSABLE_CHARS_GEN',
+                                      confusable_chars_gen)
+            pseudo_gen = os.path.join(host_build_dir, 'bin', 'clang-pseudo-gen')
+            llvm_cmake_options.define('CLANG_PSEUDO_GEN', pseudo_gen)
             llvm = os.path.join(host_build_dir, 'llvm')
             llvm_cmake_options.define('LLVM_NATIVE_BUILD', llvm)
 
@@ -346,19 +361,42 @@ class LLVM(cmake_product.CMakeProduct):
         self.cmake_options.extend(host_config.cmake_options)
         self.cmake_options.extend(llvm_cmake_options)
 
+        self._handle_cxx_headers(host_target, platform)
+
+        self.build_with_cmake(build_targets, self.args.llvm_build_variant, [])
+
+        # copy over the compiler-rt builtins for iOS/tvOS/watchOS to ensure
+        # that Swift's stdlib can use compiler-rt builtins when targeting
+        # iOS/tvOS/watchOS.
+        if self.args.build_llvm and system() == 'Darwin':
+            self.copy_embedded_compiler_rt_builtins_from_darwin_host_toolchain(
+                self.build_dir)
+
+    def _handle_cxx_headers(self, host_target, platform):
         # When we are building LLVM create symlinks to the c++ headers. We need
         # to do this before building LLVM since compiler-rt depends on being
         # built with the just built clang compiler. These are normally put into
         # place during the cmake step of LLVM's build when libcxx is in
         # tree... but we are not building llvm with libcxx in tree when we build
         # swift. So we need to do configure's work here.
-        host_cxx_headers_dir = None
         if system() == 'Darwin':
-            host_cxx_dir = os.path.dirname(self.toolchain.cxx)
-            host_cxx_headers_dir = os.path.join(host_cxx_dir, os.pardir, os.pardir,
-                                                'usr', 'include', 'c++')
+            # We don't need this for Darwin since libcxx is present in SDKs present
+            # in Xcode 12.5 and onward (build-script requires Xcode 13.0 at a minimum),
+            # and clang knows how to find it there
+            # However, we should take care of removing the symlink
+            # laid down by a previous invocation, so to avoid failures
+            # finding c++ headers should the target folder become invalid
+            cxx_include_symlink = os.path.join(self.build_dir, 'include', 'c++')
+            if os.path.islink(cxx_include_symlink):
+                print('removing the symlink to system headers in the local '
+                      f'clang build directory {cxx_include_symlink} .',
+                      flush=True)
+                shell.remove(cxx_include_symlink)
 
-        elif system() == 'Haiku':
+            return
+
+        host_cxx_headers_dir = None
+        if system() == 'Haiku':
             host_cxx_headers_dir = '/boot/system/develop/headers/c++'
 
         # This means we're building natively on Android in the Termux
@@ -384,17 +422,8 @@ class LLVM(cmake_product.CMakeProduct):
             os.makedirs(built_cxx_include_dir)
         print('symlinking the system headers ({}) into the local '
               'clang build directory ({}).'.format(
-                  host_cxx_headers_dir, built_cxx_include_dir))
+                  host_cxx_headers_dir, built_cxx_include_dir), flush=True)
         shell.call(['ln', '-s', '-f', host_cxx_headers_dir, built_cxx_include_dir])
-
-        self.build_with_cmake(build_targets, self.args.llvm_build_variant, [])
-
-        # copy over the compiler-rt builtins for iOS/tvOS/watchOS to ensure
-        # that Swift's stdlib can use compiler-rt builtins when targeting
-        # iOS/tvOS/watchOS.
-        if self.args.build_llvm and system() == 'Darwin':
-            self.copy_embedded_compiler_rt_builtins_from_darwin_host_toolchain(
-                self.build_dir)
 
     def should_test(self, host_target):
         """should_test() -> Bool
@@ -445,6 +474,6 @@ class LLVM(cmake_product.CMakeProduct):
 
         if self.args.llvm_install_components and system() == 'Darwin':
             clang_dest_dir = '{}{}'.format(host_install_destdir,
-                                           targets.install_prefix())
+                                           self.args.install_prefix)
             self.copy_embedded_compiler_rt_builtins_from_darwin_host_toolchain(
                 clang_dest_dir)

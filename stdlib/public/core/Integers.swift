@@ -566,8 +566,15 @@ extension AdditiveArithmetic {
 ///         print("\(z) is greater than \(x).")
 ///     }
 ///     // Prints "23 is greater than -23."
+
+#if !$Embedded
+public typealias _CustomStringConvertibleOrNone = CustomStringConvertible
+#else
+public typealias _CustomStringConvertibleOrNone = Any
+#endif
+
 public protocol BinaryInteger :
-  Hashable, Numeric, CustomStringConvertible, Strideable
+  Hashable, Numeric, _CustomStringConvertibleOrNone, Strideable
   where Magnitude: BinaryInteger, Magnitude.Magnitude == Magnitude
 {
   /// A Boolean value indicating whether this type is a signed integer type.
@@ -1493,6 +1500,7 @@ extension BinaryInteger {
 //===--- CustomStringConvertible conformance ------------------------------===//
 //===----------------------------------------------------------------------===//
 
+@_unavailableInEmbedded
 extension BinaryInteger {
   internal func _description(radix: Int, uppercase: Bool) -> String {
     _precondition(2...36 ~= radix, "Radix must be between 2 and 36")
@@ -1658,39 +1666,26 @@ extension BinaryInteger {
   public static func == <
     Other: BinaryInteger
   >(lhs: Self, rhs: Other) -> Bool {
-    let lhsNegative = Self.isSigned && lhs < (0 as Self)
-    let rhsNegative = Other.isSigned && rhs < (0 as Other)
-
-    if lhsNegative != rhsNegative { return false }
-
-    // Here we know the values are of the same sign.
-    //
-    // There are a few possible scenarios from here:
-    //
-    // 1. Both values are negative
-    //  - If one value is strictly wider than the other, then it is safe to
-    //    convert to the wider type.
-    //  - If the values are of the same width, it does not matter which type we
-    //    choose to convert to as the values are already negative, and thus
-    //    include the sign bit if two's complement representation already.
-    // 2. Both values are non-negative
-    //  - If one value is strictly wider than the other, then it is safe to
-    //    convert to the wider type.
-    //  - If the values are of the same width, than signedness matters, as not
-    //    unsigned types are 'wider' in a sense they don't need to 'waste' the
-    //    sign bit. Therefore it is safe to convert to the unsigned type.
-
-    if lhs.bitWidth < rhs.bitWidth {
-      return Other(truncatingIfNeeded: lhs) == rhs
+    // Use bit pattern conversion to widen the comparand with smaller bit width.
+    if Self.isSigned == Other.isSigned {
+      return lhs.bitWidth >= rhs.bitWidth ?
+        lhs == Self(truncatingIfNeeded: rhs) :
+        Other(truncatingIfNeeded: lhs) == rhs
     }
-    if lhs.bitWidth > rhs.bitWidth {
-      return lhs == Self(truncatingIfNeeded: rhs)
+    // If `Self` is signed but `Other` is unsigned, then we have to
+    // be a little more careful about widening, since:
+    // (1) a fixed-width signed type can't represent the largest values of
+    //     a fixed-width unsigned type of equal bit width; and
+    // (2) an unsigned type (obviously) can't represent a negative value.
+    if Self.isSigned {    
+      return lhs.bitWidth > rhs.bitWidth ? // (1)
+        lhs == Self(truncatingIfNeeded: rhs) :
+        (lhs >= (0 as Self) && Other(truncatingIfNeeded: lhs) == rhs) // (2)
     }
-
-    if Self.isSigned {
-      return Other(truncatingIfNeeded: lhs) == rhs
-    }
-    return lhs == Self(truncatingIfNeeded: rhs)
+    // Analogous reasoning applies if `Other` is signed but `Self` is not.
+    return lhs.bitWidth < rhs.bitWidth ?
+      Other(truncatingIfNeeded: lhs) == rhs :
+      (rhs >= (0 as Other) && lhs == Self(truncatingIfNeeded: rhs))
   }
 
   /// Returns a Boolean value indicating whether the two given values are not
@@ -1730,34 +1725,26 @@ extension BinaryInteger {
   ///   - rhs: Another integer to compare.
   @_transparent
   public static func < <Other: BinaryInteger>(lhs: Self, rhs: Other) -> Bool {
-    let lhsNegative = Self.isSigned && lhs < (0 as Self)
-    let rhsNegative = Other.isSigned && rhs < (0 as Other)
-    if lhsNegative != rhsNegative { return lhsNegative }
-
-    if lhs == (0 as Self) && rhs == (0 as Other) { return false }
-
-    // if we get here, lhs and rhs have the same sign. If they're negative,
-    // then Self and Other are both signed types, and one of them can represent
-    // values of the other type. Otherwise, lhs and rhs are positive, and one
-    // of Self, Other may be signed and the other unsigned.
-
-    let rhsAsSelf = Self(truncatingIfNeeded: rhs)
-    let rhsAsSelfNegative = rhsAsSelf < (0 as Self)
-
-
-    // Can we round-trip rhs through Other?
-    if Other(truncatingIfNeeded: rhsAsSelf) == rhs &&
-      // This additional check covers the `Int8.max < (128 as UInt8)` case.
-      // Since the types are of the same width, init(truncatingIfNeeded:)
-      // will result in a simple bitcast, so that rhsAsSelf would be -128, and
-      // `lhs < rhsAsSelf` will return false.
-      // We basically guard against that bitcast by requiring rhs and rhsAsSelf
-      // to be the same sign.
-      rhsNegative == rhsAsSelfNegative {
-      return lhs < rhsAsSelf
+    // Use bit pattern conversion to widen the comparand with smaller bit width.
+    if Self.isSigned == Other.isSigned {
+      return lhs.bitWidth >= rhs.bitWidth ?
+        lhs < Self(truncatingIfNeeded: rhs) :
+        Other(truncatingIfNeeded: lhs) < rhs
     }
-
-    return Other(truncatingIfNeeded: lhs) < rhs
+    // If `Self` is signed but `Other` is unsigned, then we have to
+    // be a little more careful about widening, since:
+    // (1) a fixed-width signed type can't represent the largest values of
+    //     a fixed-width unsigned type of equal bit width; and
+    // (2) an unsigned type (obviously) can't represent a negative value.
+    if Self.isSigned {
+      return lhs.bitWidth > rhs.bitWidth ? // (1)
+        lhs < Self(truncatingIfNeeded: rhs) :
+        (lhs < (0 as Self) || Other(truncatingIfNeeded: lhs) < rhs) // (2)
+    }
+    // Analogous reasoning applies if `Other` is signed but `Self` is not.
+    return lhs.bitWidth < rhs.bitWidth ?
+      Other(truncatingIfNeeded: lhs) < rhs :
+      (rhs > (0 as Other) && lhs < Self(truncatingIfNeeded: rhs))
   }
 
   /// Returns a Boolean value indicating whether the value of the first
@@ -1912,7 +1899,14 @@ extension BinaryInteger {
 /// customization points for arithmetic operations. When you provide just those
 /// methods, the standard library provides default implementations for all
 /// other arithmetic methods and operators.
-public protocol FixedWidthInteger: BinaryInteger, LosslessStringConvertible
+
+#if !$Embedded
+public typealias _LosslessStringConvertibleOrNone = LosslessStringConvertible
+#else
+public protocol _LosslessStringConvertibleOrNone {}
+#endif
+
+public protocol FixedWidthInteger: BinaryInteger, _LosslessStringConvertibleOrNone
 where Magnitude: FixedWidthInteger & UnsignedInteger,
       Stride: FixedWidthInteger & SignedInteger {
   /// The number of bits used for the underlying binary representation of
@@ -2630,6 +2624,7 @@ extension FixedWidthInteger {
   }
 }
 
+@_unavailableInEmbedded
 extension FixedWidthInteger {
   /// Returns a random value within the specified range, using the given
   /// generator as a source for randomness.
@@ -3051,10 +3046,14 @@ extension FixedWidthInteger {
   @inline(__always)
   public init<T: BinaryFloatingPoint>(_ source: T) {
     guard let value = Self._convert(from: source).value else {
+      #if !$Embedded
       fatalError("""
         \(T.self) value cannot be converted to \(Self.self) because it is \
         outside the representable range
         """)
+      #else
+      fatalError("value not representable")
+      #endif
     }
     self = value
   }
@@ -3360,6 +3359,7 @@ extension FixedWidthInteger {
   }
 }
 
+@_unavailableInEmbedded
 extension FixedWidthInteger {
   @inlinable
   public static func _random<R: RandomNumberGenerator>(

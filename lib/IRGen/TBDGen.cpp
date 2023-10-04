@@ -90,7 +90,7 @@ getAllMovedPlatformVersions(Decl *D) {
   for (auto *attr: D->getAttrs()) {
     if (auto *ODA = dyn_cast<OriginallyDefinedInAttr>(attr)) {
       auto Active = ODA->isActivePlatform(D->getASTContext());
-      if (Active.hasValue()) {
+      if (Active.has_value()) {
         Results.push_back(*Active);
       }
     }
@@ -107,11 +107,11 @@ static StringRef getLinkerPlatformName(uint8_t Id) {
   }
 }
 
-static Optional<uint8_t> getLinkerPlatformId(StringRef Platform) {
-  return llvm::StringSwitch<Optional<uint8_t>>(Platform)
+static llvm::Optional<uint8_t> getLinkerPlatformId(StringRef Platform) {
+  return llvm::StringSwitch<llvm::Optional<uint8_t>>(Platform)
 #define LD_PLATFORM(Name, Id) .Case(#Name, Id)
 #include "ldPlatformKinds.def"
-    .Default(None);
+      .Default(llvm::None);
 }
 
 StringRef InstallNameStore::getInstallName(LinkerPlatformId Id) const {
@@ -132,7 +132,7 @@ static std::set<int8_t> getSequenceNodePlatformList(ASTContext &Ctx, Node *N) {
   for (auto &E: *cast<SequenceNode>(N)) {
     auto Platform = getScalaNodeText(&E);
     auto Id = getLinkerPlatformId(Platform);
-    if (Id.hasValue()) {
+    if (Id.has_value()) {
       Results.insert(*Id);
     } else {
       // Diagnose unrecognized platform name.
@@ -156,7 +156,7 @@ parseEntry(ASTContext &Ctx,
       auto *MN = cast<MappingNode>(&*It);
       std::string ModuleName;
       std::string InstallName;
-      Optional<std::set<int8_t>> Platforms;
+      llvm::Optional<std::set<int8_t>> Platforms;
       for (auto &Pair: *MN) {
         auto Key = getScalaNodeText(Pair.getKey());
         auto* Value = Pair.getValue();
@@ -174,9 +174,9 @@ parseEntry(ASTContext &Ctx,
         return 1;
       auto &Store = Stores.insert(std::make_pair(ModuleName,
         InstallNameStore())).first->second;
-      if (Platforms.hasValue()) {
+      if (Platforms.has_value()) {
         // This install name is platform-specific.
-        for (auto Id: Platforms.getValue()) {
+        for (auto Id: Platforms.value()) {
           Store.PlatformInstallName[Id] = InstallName;
         }
       } else {
@@ -268,13 +268,25 @@ getLinkerPlatformName(OriginallyDefinedInAttr::ActiveVersion Ver) {
 
 /// Find the most relevant introducing version of the decl stack we have visited
 /// so far.
-static Optional<llvm::VersionTuple>
-getInnermostIntroVersion(ArrayRef<Decl*> DeclStack, PlatformKind Platform) {
+static llvm::Optional<llvm::VersionTuple>
+getInnermostIntroVersion(ArrayRef<Decl *> DeclStack, PlatformKind Platform) {
   for (auto It = DeclStack.rbegin(); It != DeclStack.rend(); ++ It) {
     if (auto Result = (*It)->getIntroducedOSVersion(Platform))
       return Result;
   }
-  return None;
+  return llvm::None;
+}
+
+/// Using the introducing version of a symbol as the start version to redirect
+/// linkage path isn't sufficient. This is because the executable can be deployed
+/// to OS versions that were before the symbol was introduced. When that happens,
+/// strictly using the introductory version can lead to NOT redirecting.
+static llvm::VersionTuple calculateLdPreviousVersionStart(ASTContext &ctx,
+                                                llvm::VersionTuple introVer) {
+  auto minDep = ctx.LangOpts.getMinPlatformVersion();
+  if (minDep < introVer)
+    return llvm::VersionTuple(1, 0);
+  return introVer;
 }
 
 void TBDGenVisitor::addLinkerDirectiveSymbolsLdPrevious(StringRef name,
@@ -293,7 +305,7 @@ void TBDGenVisitor::addLinkerDirectiveSymbolsLdPrevious(StringRef name,
   for (auto &Ver: MovedVers) {
     auto IntroVer = getInnermostIntroVersion(DeclStack, Ver.Platform);
     assert(IntroVer && "cannot find OS intro version");
-    if (!IntroVer.hasValue())
+    if (!IntroVer.has_value())
       continue;
     // This decl is available after the top-level symbol has been moved here,
     // so we don't need the linker directives.
@@ -320,10 +332,11 @@ void TBDGenVisitor::addLinkerDirectiveSymbolsLdPrevious(StringRef name,
     OS << InstallName << "$";
     OS << ComptibleVersion << "$";
     OS << std::to_string((uint8_t)PlatformNumber) << "$";
-    static auto getMinor = [](Optional<unsigned> Minor) {
-      return Minor.hasValue() ? *Minor : 0;
+    static auto getMinor = [](llvm::Optional<unsigned> Minor) {
+      return Minor.has_value() ? *Minor : 0;
     };
-    OS << IntroVer->getMajor() << "." << getMinor(IntroVer->getMinor()) << "$";
+    auto verStart = calculateLdPreviousVersionStart(Ctx, *IntroVer);
+    OS << verStart.getMajor() << "." << getMinor(verStart.getMinor()) << "$";
     OS << Ver.Version.getMajor() << "." << getMinor(Ver.Version.getMinor()) << "$";
     OS << name << "$";
     addSymbolInternal(OS.str(), SymbolKind::GlobalSymbol,
@@ -351,17 +364,17 @@ void TBDGenVisitor::addLinkerDirectiveSymbolsLdHide(StringRef name,
   unsigned Major[2];
   unsigned Minor[2];
   Major[1] = MovedVer.getMajor();
-  Minor[1] = MovedVer.getMinor().hasValue() ? *MovedVer.getMinor(): 0;
+  Minor[1] = MovedVer.getMinor().has_value() ? *MovedVer.getMinor(): 0;
   auto IntroVer = getInnermostIntroVersion(DeclStack, Platform);
   assert(IntroVer && "cannot find the start point of availability");
-  if (!IntroVer.hasValue())
+  if (!IntroVer.has_value())
     return;
   // This decl is available after the top-level symbol has been moved here,
   // so we don't need the linker directives.
   if (*IntroVer >= MovedVer)
     return;
   Major[0] = IntroVer->getMajor();
-  Minor[0] = IntroVer->getMinor().hasValue() ? IntroVer->getMinor().getValue() : 0;
+  Minor[0] = IntroVer->getMinor().has_value() ? IntroVer->getMinor().value() : 0;
   for (auto CurMaj = Major[0]; CurMaj <= Major[1]; ++ CurMaj) {
     unsigned MinRange[2] = {0, 31};
     if (CurMaj == Major[0])
@@ -401,6 +414,9 @@ void TBDGenVisitor::addSymbol(StringRef name, SymbolSource source,
 }
 
 bool TBDGenVisitor::willVisitDecl(Decl *D) {
+  if (!D->isAvailableDuringLowering())
+    return false;
+
   // A @_silgen_name("...") function without a body only exists to
   // forward-declare a symbol from another library.
   if (auto AFD = dyn_cast<AbstractFunctionDecl>(D))
@@ -425,9 +441,8 @@ void TBDGenVisitor::addFunction(StringRef name, SILDeclRef declRef) {
 }
 
 void TBDGenVisitor::addGlobalVar(VarDecl *VD) {
-  // FIXME: We ought to have a symbol source for this.
   Mangle::ASTMangler mangler;
-  addSymbol(mangler.mangleEntity(VD), SymbolSource::forUnknown());
+  addSymbol(mangler.mangleEntity(VD), SymbolSource::forGlobal(VD));
 }
 
 void TBDGenVisitor::addLinkEntity(LinkEntity entity) {
@@ -456,9 +471,16 @@ void TBDGenVisitor::addProtocolWitnessThunk(RootProtocolConformance *C,
                                             ValueDecl *requirementDecl) {
   Mangle::ASTMangler Mangler;
 
+  std::string decorated = Mangler.mangleWitnessThunk(C, requirementDecl);
   // FIXME: We should have a SILDeclRef SymbolSource for this.
-  addSymbol(Mangler.mangleWitnessThunk(C, requirementDecl),
-            SymbolSource::forUnknown());
+  addSymbol(decorated, SymbolSource::forUnknown());
+
+  if (requirementDecl->isProtocolRequirement()) {
+    ValueDecl *PWT = C->getWitness(requirementDecl).getDecl();
+    if (const auto *AFD = dyn_cast<AbstractFunctionDecl>(PWT))
+      if (AFD->hasAsync())
+        addSymbol(decorated + "Tu", SymbolSource::forUnknown());
+  }
 }
 
 void TBDGenVisitor::addFirstFileSymbols() {
@@ -531,18 +553,18 @@ enum DylibVersionKind_t: unsigned {
 /// If an individual component is greater than the highest number that can be
 /// represented in its alloted space, it will be truncated to the maximum value
 /// that fits in the alloted space, which matches the behavior of the linker.
-static Optional<llvm::MachO::PackedVersion>
+static llvm::Optional<llvm::MachO::PackedVersion>
 parsePackedVersion(DylibVersionKind_t kind, StringRef versionString,
                    ASTContext &ctx) {
   if (versionString.empty())
-    return None;
+    return llvm::None;
 
   llvm::MachO::PackedVersion version;
   auto result = version.parse64(versionString);
   if (!result.first) {
     ctx.Diags.diagnose(SourceLoc(), diag::tbd_err_invalid_version,
                        (unsigned)kind, versionString);
-    return None;
+    return llvm::None;
   }
   if (result.second) {
     ctx.Diags.diagnose(SourceLoc(), diag::tbd_warn_truncating_version,
@@ -570,7 +592,6 @@ TBDFile GenerateTBDRequest::evaluate(Evaluator &evaluator,
   file.setInstallName(opts.InstallName);
   file.setTwoLevelNamespace();
   file.setSwiftABIVersion(irgen::getSwiftABIVersion());
-  file.setInstallAPI(opts.IsInstallAPI);
 
   if (auto packed = parsePackedVersion(CurrentVersion,
                                        opts.CurrentVersion, ctx)) {
@@ -584,13 +605,14 @@ TBDFile GenerateTBDRequest::evaluate(Evaluator &evaluator,
 
   llvm::MachO::Target target(ctx.LangOpts.Target);
   file.addTarget(target);
+  llvm::MachO::TargetList targets{target};
   // Add target variant
-  if (ctx.LangOpts.TargetVariant.hasValue()) {
+  if (ctx.LangOpts.TargetVariant.has_value()) {
     llvm::MachO::Target targetVar(*ctx.LangOpts.TargetVariant);
     file.addTarget(targetVar);
+    targets.push_back(targetVar);
   }
 
-  llvm::MachO::TargetList targets{target};
   auto addSymbol = [&](StringRef symbol, SymbolKind kind, SymbolSource source) {
     file.addSymbol(kind, symbol, targets);
   };
@@ -832,24 +854,24 @@ void swift::writeAPIJSONFile(ModuleDecl *M, llvm::raw_ostream &os,
 
 /// NOTE: This is part of an incomplete experimental feature. There are
 /// currently no clients that depend on its output.
-SymbolSourceMap SymbolSourceMapRequest::evaluate(Evaluator &evaluator,
-                                                 TBDGenDescriptor desc) const {
-  using Map = SymbolSourceMap::Storage;
-  Map symbolSources;
+const SymbolSourceMap *
+SymbolSourceMapRequest::evaluate(Evaluator &evaluator,
+                                 TBDGenDescriptor desc) const {
 
-  auto addSymbol = [&](StringRef symbol, SymbolKind kind, SymbolSource source) {
-    symbolSources.insert({symbol, source});
+  // FIXME: Once the evaluator supports returning a reference to a cached value
+  // in storage, this won't be necessary.
+  auto &Ctx = desc.getParentModule()->getASTContext();
+  auto *SymbolSources = Ctx.Allocate<SymbolSourceMap>();
+
+  auto addSymbol = [=](StringRef symbol, SymbolKind kind, SymbolSource source) {
+    SymbolSources->insert({symbol, source});
   };
 
   SimpleAPIRecorder recorder(addSymbol);
   TBDGenVisitor visitor(desc, recorder);
   visitor.visit(desc);
 
-  // FIXME: Once the evaluator supports returning a reference to a cached value
-  // in storage, this won't be necessary.
-  auto &ctx = desc.getParentModule()->getASTContext();
-  auto *memory = ctx.Allocate<Map>();
-  *memory = std::move(symbolSources);
-  ctx.addCleanup([memory](){ memory->~Map(); });
-  return SymbolSourceMap(memory);
+  Ctx.addCleanup([SymbolSources]() { SymbolSources->~SymbolSourceMap(); });
+
+  return SymbolSources;
 }

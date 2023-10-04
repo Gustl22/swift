@@ -232,7 +232,7 @@ public:
     return I->getInitializerKind() == InitializerKind::PropertyWrapper;
   }
 };
-  
+
 } // end namespace swift
 
 #endif

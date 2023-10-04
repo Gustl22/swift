@@ -161,7 +161,7 @@ IsZeroKind swift::isZeroValue(SILValue Value) {
 
 /// Check if the sign bit of the value \p V is known to be:
 /// set (true), not set (false) or unknown (None).
-Optional<bool> swift::computeSignBit(SILValue V) {
+llvm::Optional<bool> swift::computeSignBit(SILValue V) {
   SILValue Value = V;
   while (true) {
     ValueBase *Def = Value;
@@ -201,7 +201,7 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         // We don't know either's sign bit so we can't
         // say anything about the result.
         if (!Left && !Right) {
-          return None;
+          return llvm::None;
         }
 
         // Now we know that we were able to determine the sign bit
@@ -215,14 +215,14 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         // the Left. If Right is still not None, then get both values
         // and AND them together.
         if (Right) {
-          return Left.getValue() && Right.getValue();
+          return Left.value() && Right.value();
         }
 
         // Now we know that Right is None and Left has a value. If
         // Left's value is true, then we return None as the final
         // sign bit depends on the unknown Right value.
-        if (Left.getValue()) {
-          return None;
+        if (Left.value()) {
+          return llvm::None;
         }
 
         // Otherwise, Left must be false and false AND'd with anything
@@ -238,7 +238,7 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         // We don't know either's sign bit so we can't
         // say anything about the result.
         if (!Left && !Right) {
-          return None;
+          return llvm::None;
         }
 
         // Now we know that we were able to determine the sign bit
@@ -252,14 +252,14 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         // the Left. If Right is still not None, then get both values
         // and OR them together.
         if (Right) {
-          return Left.getValue() || Right.getValue();
+          return Left.value() || Right.value();
         }
 
         // Now we know that Right is None and Left has a value. If
         // Left's value is false, then we return None as the final
         // sign bit depends on the unknown Right value.
-        if (!Left.getValue()) {
-          return None;
+        if (!Left.value()) {
+          return llvm::None;
         }
 
         // Otherwise, Left must be true and true OR'd with anything
@@ -276,13 +276,13 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         // anything about the sign of the final result since
         // XOR does not short-circuit.
         if (!Left || !Right) {
-          return None;
+          return llvm::None;
         }
 
         // Now we know that both Left and Right must have a value.
         // For the sign of the final result to be set, only one
         // of Left or Right should be true.
-        return Left.getValue() != Right.getValue();
+        return Left.value() != Right.value();
       }
       case BuiltinValueKind::LShr: {
         // If count is provably >= 1, then top bit is not set.
@@ -324,11 +324,11 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         Value = BI->getArguments()[0];
         continue;
       default:
-        return None;
+        return llvm::None;
       }
     }
 
-    return None;
+    return llvm::None;
   }
 }
 

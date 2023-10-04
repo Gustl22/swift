@@ -19,6 +19,10 @@
 #include <string>
 #include <vector>
 
+namespace clang {
+class Module;
+}
+
 namespace swift {
 class ASTContext;
 class ASTPrinter;
@@ -44,8 +48,7 @@ using ModuleTraversalOptions = OptionSet<ModuleTraversal>;
 
 void collectModuleGroups(ModuleDecl *M, SmallVectorImpl<StringRef> &Into);
 
-Optional<StringRef>
-findGroupNameForUSR(ModuleDecl *M, StringRef USR);
+llvm::Optional<StringRef> findGroupNameForUSR(ModuleDecl *M, StringRef USR);
 
 bool printTypeInterface(ModuleDecl *M, Type Ty, ASTPrinter &Printer,
                         std::string &TypeName, std::string &Error);
@@ -67,6 +70,10 @@ void printHeaderInterface(StringRef Filename, ASTContext &Ctx,
 /// Print the interface for a given swift source file.
 void printSwiftSourceInterface(SourceFile &File, ASTPrinter &Printer,
                                const PrintOptions &Options);
+
+/// Print the symbolic Swift interface for a given imported clang module.
+void printSymbolicSwiftClangModuleInterface(ModuleDecl *M, ASTPrinter &Printer,
+                                            const clang::Module *clangModule);
 
 } // namespace ide
 

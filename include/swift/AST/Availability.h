@@ -24,6 +24,7 @@
 
 namespace swift {
 class ASTContext;
+class AvailableAttr;
 class Decl;
 
 /// A lattice of version ranges of the form [x.y.z, +Inf).
@@ -38,7 +39,7 @@ class VersionRange {
   //    x.y.x: all versions greater than or equal to x.y.z
 
   enum class ExtremalRange { Empty, All };
-  
+
   // A version range is either an extremal value (Empty, All) or
   // a single version tuple value representing the lower end point x.y.z of a
   // range [x.y.z, +Inf).
@@ -46,7 +47,7 @@ class VersionRange {
     llvm::VersionTuple LowerEndpoint;
     ExtremalRange ExtremalValue;
   };
-  
+
   unsigned HasLowerEndpoint : 1;
 
 public:
@@ -85,7 +86,7 @@ public:
   bool isContainedIn(const VersionRange &Other) const {
     if (isEmpty() || Other.isAll())
       return true;
-    
+
     if (isAll() || Other.isEmpty())
       return false;
 
@@ -208,6 +209,10 @@ public:
   const VersionRange &getRequiredOSVersionRange() const {
     return RequiredDeploymentRange;
   }
+
+  /// Returns true if the required OS version range's lower endpoint is at or
+  /// below the deployment target of the given ASTContext.
+  bool requiresDeploymentTargetOrEarlier(ASTContext &Ctx) const;
 };
 
 /// Represents everything that a particular chunk of code may assume about its
@@ -219,6 +224,9 @@ public:
 /// See #unionWith, #intersectWith, and #constrainWith.
 ///
 /// [lattice]: http://mathworld.wolfram.com/Lattice.html
+///
+/// NOTE: Generally you should use the utilities on \c AvailabilityInference
+/// to create an \c AvailabilityContext, rather than creating one directly.
 class AvailabilityContext {
   VersionRange OSVersion;
   llvm::Optional<bool> SPI;
@@ -318,21 +326,28 @@ public:
     OSVersion.unionWith(other.getOSVersion());
   }
 
-  bool isAvailableAsSPI() const {
-    return SPI && *SPI;
+  bool isAvailableAsSPI() const { return SPI && *SPI; }
+
+  /// Returns a representation of this range as a string for debugging purposes.
+  std::string getAsString() const {
+    return "AvailabilityContext(" + OSVersion.getAsString() +
+           (isAvailableAsSPI() ? ", spi" : "") + ")";
   }
 };
 
-
 class AvailabilityInference {
 public:
+  /// Returns the decl that should be considered the parent decl of the given
+  /// decl when looking for inherited availability annotations.
+  static const Decl *parentDeclForInferredAvailability(const Decl *D);
+
   /// Infers the common availability required to access an array of
   /// declarations and adds attributes reflecting that availability
   /// to ToDecl.
   static void
   applyInferredAvailableAttrs(Decl *ToDecl,
-                                 ArrayRef<const Decl *> InferredFromDecls,
-                                 ASTContext &Context);
+                              ArrayRef<const Decl *> InferredFromDecls,
+                              ASTContext &Context);
 
   static AvailabilityContext inferForType(Type t);
 
@@ -340,16 +355,34 @@ public:
   ///  We assume a declaration without an annotation is always available.
   static AvailabilityContext availableRange(const Decl *D, ASTContext &C);
 
+  /// Returns the availability context for a declaration with the given
+  /// @available attribute.
+  ///
+  /// NOTE: The attribute must be active on the current platform.
+  static AvailabilityContext availableRange(const AvailableAttr *attr,
+                                            ASTContext &C);
+
+  /// Returns the attribute that should be used to determine the availability
+  /// range of the given declaration, or nullptr if there is none.
+  static const AvailableAttr *attrForAnnotatedAvailableRange(const Decl *D,
+                                                             ASTContext &Ctx);
+
   /// Returns the context for which the declaration
   /// is annotated as available, or None if the declaration
   /// has no availability annotation.
-  static Optional<AvailabilityContext> annotatedAvailableRange(const Decl *D,
-                                                               ASTContext &C);
+  static llvm::Optional<AvailabilityContext>
+  annotatedAvailableRange(const Decl *D, ASTContext &C);
 
   static AvailabilityContext
-    annotatedAvailableRangeForAttr(const SpecializeAttr* attr, ASTContext &ctx);
-
+  annotatedAvailableRangeForAttr(const SpecializeAttr *attr, ASTContext &ctx);
 };
+
+/// Given a declaration upon which an availability attribute would appear in
+/// concrete syntax, return a declaration to which the parser
+/// actually attaches the attribute in the abstract syntax tree. We use this
+/// function to determine whether the concrete syntax already has an
+/// availability attribute.
+const Decl *abstractSyntaxDeclForAvailableAttribute(const Decl *D);
 
 } // end namespace swift
 

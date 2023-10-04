@@ -39,10 +39,9 @@
 using namespace swift;
 using namespace Lowering;
 
-
-Optional<SILVTable::Entry>
-SILGenModule::emitVTableMethod(ClassDecl *theClass,
-                               SILDeclRef derived, SILDeclRef base) {
+llvm::Optional<SILVTable::Entry>
+SILGenModule::emitVTableMethod(ClassDecl *theClass, SILDeclRef derived,
+                               SILDeclRef base) {
   assert(base.kind == derived.kind);
 
   auto *baseDecl = cast<AbstractFunctionDecl>(base.getDecl());
@@ -73,7 +72,7 @@ SILGenModule::emitVTableMethod(ClassDecl *theClass,
     // domain, don't emit the vtable entry.
     if (derivedClass->isResilient(M.getSwiftModule(),
                                   ResilienceExpansion::Maximal)) {
-      return None;
+      return llvm::None;
     }
   }
 
@@ -193,7 +192,7 @@ SILGenModule::emitVTableMethod(ClassDecl *theClass,
       SILLinkage::Private, name, overrideInfo.SILFnType,
       genericEnv, loc,
       IsBare, IsNotTransparent, IsNotSerialized, IsNotDynamic,
-      IsNotDistributed, ProfileCounter(), IsThunk);
+      IsNotDistributed, IsNotRuntimeAccessible, ProfileCounter(), IsThunk);
   thunk->setDebugScope(new (M) SILDebugScope(loc, thunk));
 
   PrettyStackTraceSILFunction trace("generating vtable thunk", thunk);
@@ -764,7 +763,7 @@ SILFunction *SILGenModule::emitProtocolWitness(
   // But this is expensive, so we only do it for coroutine lowering.
   // When they're part of the AST function type, we can remove this
   // parameter completely.
-  Optional<SubstitutionMap> witnessSubsForTypeLowering;
+  llvm::Optional<SubstitutionMap> witnessSubsForTypeLowering;
   if (auto accessor = dyn_cast<AccessorDecl>(requirement.getDecl())) {
     if (accessor->isCoroutine()) {
       witnessSubsForTypeLowering =
@@ -817,8 +816,8 @@ SILFunction *SILGenModule::emitProtocolWitness(
   auto *f = builder.createFunction(
       linkage, nameBuffer, witnessSILFnType, genericEnv,
       SILLocation(witnessRef.getDecl()), IsNotBare, IsTransparent, isSerialized,
-      IsNotDynamic, IsNotDistributed, ProfileCounter(), IsThunk,
-      SubclassScope::NotApplicable, InlineStrategy);
+      IsNotDynamic, IsNotDistributed, IsNotRuntimeAccessible, ProfileCounter(),
+      IsThunk, SubclassScope::NotApplicable, InlineStrategy);
 
   f->setDebugScope(new (M)
                    SILDebugScope(RegularLocation(witnessRef.getDecl()), f));
@@ -892,8 +891,8 @@ static SILFunction *emitSelfConformanceWitness(SILGenModule &SGM,
   auto *f = builder.createFunction(
       linkage, name, witnessSILFnType, genericEnv,
       SILLocation(requirement.getDecl()), IsNotBare, IsTransparent,
-      IsSerialized, IsNotDynamic, IsNotDistributed, ProfileCounter(), IsThunk,
-      SubclassScope::NotApplicable, InlineDefault);
+      IsSerialized, IsNotDynamic, IsNotDistributed, IsNotRuntimeAccessible,
+      ProfileCounter(), IsThunk, SubclassScope::NotApplicable, InlineDefault);
 
   f->setDebugScope(new (SGM.M)
                    SILDebugScope(RegularLocation(requirement.getDecl()), f));
@@ -907,9 +906,8 @@ static SILFunction *emitSelfConformanceWitness(SILGenModule &SGM,
                                       requirement.getDecl());
 
   SGF.emitProtocolWitness(AbstractionPattern(reqtOrigTy), reqtSubstTy,
-                          requirement, reqtSubs, requirement,
-                          witnessSubs, isFree, /*isSelfConformance*/ true,
-                          None);
+                          requirement, reqtSubs, requirement, witnessSubs,
+                          isFree, /*isSelfConformance*/ true, llvm::None);
 
   SGM.emitLazyConformancesForFunction(f);
 
@@ -1069,6 +1067,21 @@ void SILGenModule::emitDefaultWitnessTable(ProtocolDecl *protocol) {
   defaultWitnesses->convertToDefinition(builder.DefaultWitnesses);
 }
 
+void SILGenModule::emitNonCopyableTypeDeinitTable(NominalTypeDecl *nom) {
+  auto *dd = nom->getValueTypeDestructor();
+  if (!dd)
+    return;
+
+  SILDeclRef constant(dd, SILDeclRef::Kind::Deallocator);
+  SILFunction *f = getFunction(constant, NotForDefinition);
+  auto serialized = IsSerialized_t::IsNotSerialized;
+  bool nomIsPublic = nom->getEffectiveAccess() >= AccessLevel::Public;
+  // We only serialize the deinit if the type is public and not resilient.
+  if (nomIsPublic && !nom->isResilient())
+    serialized = IsSerialized;
+  SILMoveOnlyDeinit::create(f->getModule(), nom, serialized, f);
+}
+
 namespace {
 
 /// An ASTVisitor for generating SIL from method declarations
@@ -1085,13 +1098,21 @@ public:
   void emitType() {
     SGM.emitLazyConformancesForType(theType);
 
-    for (Decl *member : theType->getABIMembers())
+    for (Decl *member : theType->getMembersForLowering()) {
       visit(member);
+    }
 
     // Build a vtable if this is a class.
     if (auto theClass = dyn_cast<ClassDecl>(theType)) {
       SILGenVTable genVTable(SGM, theClass);
       genVTable.emitVTable();
+    }
+
+    // If this is a nominal type that is move only, emit a deinit table for it.
+    if (auto *nom = dyn_cast<NominalTypeDecl>(theType)) {
+      if (nom->isMoveOnly()) {
+        SGM.emitNonCopyableTypeDeinitTable(nom);
+      }
     }
 
     // Build a default witness table if this is a protocol that needs one.
@@ -1222,14 +1243,12 @@ public:
     });
   }
 
-  void visitMacroDecl(MacroDecl *md) {
-    llvm_unreachable("macros aren't allowed in types");
+  void visitMissingDecl(MissingDecl *missing) {
+    llvm_unreachable("missing decl in SILGen");
   }
 
-  void visitMacroExpansionDecl(MacroExpansionDecl *med) {
-    auto *rewritten = med->getRewritten();
-    assert(rewritten && "Macro must have been rewritten in SILGen");
-    visit(rewritten);
+  void visitMacroDecl(MacroDecl *md) {
+    llvm_unreachable("macros aren't allowed in types");
   }
 };
 
@@ -1254,9 +1273,10 @@ public:
     // @_objcImplementation extension, but we don't actually need to do any of
     // the stuff that it currently does.
 
-    for (Decl *member : e->getABIMembers())
+    for (Decl *member : e->getMembersForLowering()) {
       visit(member);
-    
+    }
+
     // If this is a main-interface @_objcImplementation extension and the class
     // has a synthesized destructor, emit it now.
     if (auto cd = dyn_cast_or_null<ClassDecl>(e->getImplementedObjCDecl())) {
@@ -1334,8 +1354,13 @@ public:
   void visitPatternBindingDecl(PatternBindingDecl *pd) {
     // Emit initializers for static variables.
     for (auto i : range(pd->getNumPatternEntries())) {
-      if (pd->getExecutableInit(i) && pd->isStatic()) {
-        SGM.emitGlobalInitialization(pd, i);
+      if (pd->getExecutableInit(i)) {
+        if (pd->isStatic())
+          SGM.emitGlobalInitialization(pd, i);
+        else if (isa<ExtensionDecl>(pd->getDeclContext()) &&
+                 cast<ExtensionDecl>(pd->getDeclContext())
+                     ->isObjCImplementation())
+          SGM.emitStoredPropertyInitialization(pd, i);
       }
     }
   }
@@ -1397,14 +1422,12 @@ public:
     });
   }
 
-  void visitMacroDecl(MacroDecl *md) {
-    llvm_unreachable("macros aren't allowed in extensions");
+  void visitMissingDecl(MissingDecl *missing) {
+    llvm_unreachable("missing decl in SILGen");
   }
 
-  void visitMacroExpansionDecl(MacroExpansionDecl *med) {
-    auto *rewritten = med->getRewritten();
-    assert(rewritten && "Macro must have been rewritten in SILGen");
-    visit(rewritten);
+  void visitMacroDecl(MacroDecl *md) {
+    llvm_unreachable("macros aren't allowed in extensions");
   }
 };
 

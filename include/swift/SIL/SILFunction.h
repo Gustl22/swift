@@ -38,6 +38,7 @@ class SILFunctionBuilder;
 class SILProfiler;
 class BasicBlockBitfield;
 class NodeBitfield;
+class SILPassManager;
 
 namespace Lowering {
 class TypeLowering;
@@ -64,6 +65,20 @@ enum IsExactSelfClass_t {
 enum IsDistributed_t {
   IsNotDistributed,
   IsDistributed,
+};
+enum IsRuntimeAccessible_t {
+  IsNotRuntimeAccessible,
+  IsRuntimeAccessible
+};
+
+enum ForceEnableLexicalLifetimes_t {
+  DoNotForceEnableLexicalLifetimes,
+  DoForceEnableLexicalLifetimes
+};
+
+enum UseStackForPackMetadata_t {
+  DoNotUseStackForPackMetadata,
+  DoUseStackForPackMetadata,
 };
 
 enum class PerformanceConstraints : uint8_t {
@@ -266,7 +281,7 @@ private:
   /// A monotonically increasing ID which is incremented whenever a
   /// BasicBlockBitfield or NodeBitfield is constructed.
   /// For details see SILBitfield::bitfieldID;
-  uint64_t currentBitfieldID = 1;
+  int64_t currentBitfieldID = 1;
 
   /// Unique identifier for vector indexing and deterministic sorting.
   /// May be reused when zombie functions are recovered.
@@ -280,6 +295,13 @@ private:
 
   /// The function's remaining set of specialize attributes.
   std::vector<SILSpecializeAttr*> SpecializeAttrSet;
+
+  /// Name of a section if @_section attribute was used, otherwise empty.
+  StringRef Section;
+
+  /// Name of a Wasm export if @_expose(wasm) attribute was used, otherwise
+  /// empty.
+  StringRef WasmExportName;
 
   /// Has value if there's a profile for this function
   /// Contains Function Entry Count
@@ -336,6 +358,9 @@ private:
   /// would indicate.
   unsigned HasCReferences : 1;
 
+  /// Whether attribute @_used was present
+  unsigned MarkedAsUsed : 1;
+
   /// Whether cross-module references to this function should always use weak
   /// linking.
   unsigned IsAlwaysWeakImported : 1;
@@ -349,6 +374,9 @@ private:
 
   /// Check whether this is a distributed method.
   unsigned IsDistributed : 1;
+
+  /// Check whether this function could be looked up at runtime via special API.
+  unsigned IsRuntimeAccessible : 1;
 
   unsigned stackProtection : 1;
 
@@ -396,6 +424,13 @@ private:
   /// The function is in a statically linked module.
   unsigned IsStaticallyLinked : 1;
 
+  /// If true, the function has lexical lifetimes even if the module does not.
+  unsigned ForceEnableLexicalLifetimes : 1;
+
+  /// If true, the function contains an instruction that prevents stack nesting
+  /// from running with pack metadata markers in place.
+  unsigned UseStackForPackMetadata : 1;
+
   static void
   validateSubclassScope(SubclassScope scope, IsThunk_t isThunk,
                         const GenericSpecializationInformation *genericInfo) {
@@ -432,17 +467,18 @@ private:
               const SILDebugScope *debugScope,
               IsDynamicallyReplaceable_t isDynamic,
               IsExactSelfClass_t isExactSelfClass,
-              IsDistributed_t isDistributed);
+              IsDistributed_t isDistributed,
+              IsRuntimeAccessible_t isRuntimeAccessible);
 
   static SILFunction *
   create(SILModule &M, SILLinkage linkage, StringRef name,
          CanSILFunctionType loweredType, GenericEnvironment *genericEnv,
-         Optional<SILLocation> loc, IsBare_t isBareSILFunction,
+         llvm::Optional<SILLocation> loc, IsBare_t isBareSILFunction,
          IsTransparent_t isTrans, IsSerialized_t isSerialized,
          ProfileCounter entryCount, IsDynamicallyReplaceable_t isDynamic,
          IsDistributed_t isDistributed,
-         IsExactSelfClass_t isExactSelfClass,
-         IsThunk_t isThunk = IsNotThunk,
+         IsRuntimeAccessible_t isRuntimeAccessible,
+         IsExactSelfClass_t isExactSelfClass, IsThunk_t isThunk = IsNotThunk,
          SubclassScope classSubclassScope = SubclassScope::NotApplicable,
          Inline_t inlineStrategy = InlineDefault,
          EffectsKind EffectsKindAttr = EffectsKind::Unspecified,
@@ -456,7 +492,8 @@ private:
             SubclassScope classSubclassScope, Inline_t inlineStrategy,
             EffectsKind E, const SILDebugScope *DebugScope,
             IsDynamicallyReplaceable_t isDynamic,
-            IsExactSelfClass_t isExactSelfClass, IsDistributed_t isDistributed);
+            IsExactSelfClass_t isExactSelfClass, IsDistributed_t isDistributed,
+            IsRuntimeAccessible_t isRuntimeAccessible);
 
   /// Set has ownership to the given value. True means that the function has
   /// ownership, false means it does not.
@@ -660,6 +697,22 @@ public:
     IsStaticallyLinked = value;
   }
 
+  ForceEnableLexicalLifetimes_t forceEnableLexicalLifetimes() const {
+    return ForceEnableLexicalLifetimes_t(ForceEnableLexicalLifetimes);
+  }
+
+  void setForceEnableLexicalLifetimes(ForceEnableLexicalLifetimes_t value) {
+    ForceEnableLexicalLifetimes = value;
+  }
+
+  UseStackForPackMetadata_t useStackForPackMetadata() const {
+    return UseStackForPackMetadata_t(UseStackForPackMetadata);
+  }
+
+  void setUseStackForPackMetadata(UseStackForPackMetadata_t value) {
+    UseStackForPackMetadata = value;
+  }
+
   /// Returns true if this is a reabstraction thunk of escaping function type
   /// whose single argument is a potentially non-escaping closure. i.e. the
   /// thunks' function argument may itself have @inout_aliasable parameters.
@@ -699,6 +752,10 @@ public:
 
   SILType getLoweredType(Type t) const;
 
+  CanType getLoweredRValueType(Lowering::AbstractionPattern orig, Type subst) const;
+
+  CanType getLoweredRValueType(Type t) const;
+
   SILType getLoweredLoadableType(Type t) const;
 
   SILType getLoweredType(SILType t) const;
@@ -726,6 +783,12 @@ public:
   // Returns true if the function has indirect out parameters.
   bool hasIndirectFormalResults() const {
     return getLoweredFunctionType()->hasIndirectFormalResults();
+  }
+
+  // Returns true if the function has any generic arguments.
+  bool isGeneric() const {
+    auto s = getLoweredFunctionType()->getInvocationGenericSignature();
+    return s && !s->areAllParamsConcrete();
   }
 
   /// Returns true if this function ie either a class method, or a
@@ -841,6 +904,14 @@ public:
   void
   setIsDistributed(IsDistributed_t value = IsDistributed_t::IsDistributed) {
     IsDistributed = value;
+  }
+
+  IsRuntimeAccessible_t isRuntimeAccessible() const {
+    return IsRuntimeAccessible_t(IsRuntimeAccessible);
+  }
+  void setIsRuntimeAccessible(IsRuntimeAccessible_t value =
+                                  IsRuntimeAccessible_t::IsRuntimeAccessible) {
+    IsRuntimeAccessible = value;
   }
 
   bool needsStackProtection() const { return stackProtection; }
@@ -1053,7 +1124,7 @@ public:
   void copyEffects(SILFunction *from);
   bool hasArgumentEffects() const;
   void visitArgEffects(std::function<void(int, int, bool)> c) const;
-  SILInstruction::MemoryBehavior getMemoryBehavior(bool observeRetains);
+  MemoryBehavior getMemoryBehavior(bool observeRetains);
 
   Purpose getSpecialPurpose() const { return specialPurpose; }
 
@@ -1195,6 +1266,18 @@ public:
     return V && V->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>();
   }
 
+  /// Return whether this function has attribute @_used on it
+  bool markedAsUsed() const { return MarkedAsUsed; }
+  void setMarkedAsUsed(bool value) { MarkedAsUsed = value; }
+
+  /// Return custom section name if @_section was used, otherwise empty
+  StringRef section() const { return Section; }
+  void setSection(StringRef value) { Section = value; }
+
+  /// Return Wasm export name if @_expose(wasm) was used, otherwise empty
+  StringRef wasmExportName() const { return WasmExportName; }
+  void setWasmExportName(StringRef value) { WasmExportName = value; }
+
   /// Returns true if this function belongs to a declaration that returns
   /// an opaque result type with one or more availability conditions that are
   /// allowed to produce a different underlying type at runtime.
@@ -1235,6 +1318,7 @@ public:
   const SILBasicBlock *getEntryBlock() const { return &front(); }
 
   SILBasicBlock *createBasicBlock();
+  SILBasicBlock *createBasicBlock(llvm::StringRef debugName);
   SILBasicBlock *createBasicBlockAfter(SILBasicBlock *afterBB);
   SILBasicBlock *createBasicBlockBefore(SILBasicBlock *beforeBB);
 
@@ -1352,6 +1436,14 @@ public:
     return getArguments().back();
   }
 
+  /// Like getSelfArgument() except it returns a nullptr if we do not have a
+  /// selfparam.
+  const SILArgument *maybeGetSelfArgument() const {
+    if (!hasSelfParam())
+      return nullptr;
+    return getArguments().back();
+  }
+
   const SILArgument *getDynamicSelfMetadata() const {
     assert(hasDynamicSelfMetadata() && "This method can only be called if the "
            "SILFunction has a self-metadata parameter");
@@ -1369,18 +1461,31 @@ public:
         decl->getLifetimeAnnotation());
   }
 
-  /// verify - Run the IR verifier to make sure that the SILFunction follows
+  /// verify - Run the SIL verifier to make sure that the SILFunction follows
   /// invariants.
-  void verify(bool SingleFunction = true) const;
+  void verify(SILPassManager *passManager = nullptr,
+              bool SingleFunction = true,
+              bool isCompleteOSSA = true,
+              bool checkLinearLifetime = true) const;
+
+  /// Run the SIL verifier without assuming OSSA lifetimes end at dead end
+  /// blocks.
+  void verifyIncompleteOSSA() const {
+    verify(/*passManager*/nullptr, /*SingleFunction=*/true, /*completeOSSALifetimes=*/false);
+  }
 
   /// Verifies the lifetime of memory locations in the function.
-  void verifyMemoryLifetime();
+  void verifyMemoryLifetime(SILPassManager *passManager);
 
-  /// Run the SIL ownership verifier to check for ownership invariant failures.
+  /// Run the SIL ownership verifier to check that all values with ownership
+  /// have a linear lifetime. Regular OSSA invariants are checked separately in
+  /// normal SIL verification.
   ///
-  /// NOTE: The ownership verifier is always run when performing normal IR
+  /// \p deadEndBlocks is nullptr when OSSA lifetimes are complete.
+  ///
+  /// NOTE: The ownership verifier is run when performing normal IR
   /// verification, so this verification can be viewed as a subset of
-  /// SILFunction::verify.
+  /// SILFunction::verify(checkLinearLifetimes=true).
   void verifyOwnership(DeadEndBlocks *deadEndBlocks) const;
 
   /// Verify that all non-cond-br critical edges have been split.
