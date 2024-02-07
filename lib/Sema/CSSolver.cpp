@@ -206,6 +206,9 @@ Solution ConstraintSystem::finalize() {
   for (const auto &item : caseLabelItems)
     solution.caseLabelItems.insert(item);
 
+  for (const auto &throwSite : potentialThrowSites)
+    solution.potentialThrowSites.push_back(throwSite);
+
   for (const auto &pattern : exprPatterns)
     solution.exprPatterns.insert(pattern);
 
@@ -243,6 +246,9 @@ Solution ConstraintSystem::finalize() {
 
   for (const auto &packEnv : PackEnvironments)
     solution.PackEnvironments.insert(packEnv);
+
+  for (const auto &packEltGenericEnv : PackElementGenericEnvironments)
+    solution.PackElementGenericEnvironments.push_back(packEltGenericEnv);
 
   return solution;
 }
@@ -313,6 +319,12 @@ void ConstraintSystem::applySolution(const Solution &solution) {
     PackEnvironments.insert(packEnvironment);
   }
 
+  // Register the solutions's pack element generic environments.
+  for (auto &packElementGenericEnvironment :
+       solution.PackElementGenericEnvironments) {
+    PackElementGenericEnvironments.push_back(packElementGenericEnvironment);
+  }
+
   // Register the defaulted type variables.
   DefaultedConstraints.insert(solution.DefaultedConstraints.begin(),
                               solution.DefaultedConstraints.end());
@@ -349,6 +361,10 @@ void ConstraintSystem::applySolution(const Solution &solution) {
     if (!getCaseLabelItemInfo(info.first))
       setCaseLabelItemInfo(info.first, info.second);
   }
+
+  potentialThrowSites.insert(potentialThrowSites.end(),
+                             solution.potentialThrowSites.begin(),
+                             solution.potentialThrowSites.end());
 
   for (auto param : solution.isolatedParams) {
     isolatedParams.insert(param);
@@ -640,6 +656,7 @@ ConstraintSystem::SolverScope::SolverScope(ConstraintSystem &cs)
   numOpenedPackExpansionTypes = cs.OpenedPackExpansionTypes.size();
   numPackExpansionEnvironments = cs.PackExpansionEnvironments.size();
   numPackEnvironments = cs.PackEnvironments.size();
+  numPackElementGenericEnvironments = cs.PackElementGenericEnvironments.size();
   numDefaultedConstraints = cs.DefaultedConstraints.size();
   numAddedNodeTypes = cs.addedNodeTypes.size();
   numAddedKeyPathComponentTypes = cs.addedKeyPathComponentTypes.size();
@@ -653,6 +670,7 @@ ConstraintSystem::SolverScope::SolverScope(ConstraintSystem &cs)
   numContextualTypes = cs.contextualTypes.size();
   numTargets = cs.targets.size();
   numCaseLabelItems = cs.caseLabelItems.size();
+  numPotentialThrowSites = cs.potentialThrowSites.size();
   numExprPatterns = cs.exprPatterns.size();
   numIsolatedParams = cs.isolatedParams.size();
   numPreconcurrencyClosures = cs.preconcurrencyClosures.size();
@@ -728,6 +746,10 @@ ConstraintSystem::SolverScope::~SolverScope() {
   // Remove any pack environments.
   truncate(cs.PackEnvironments, numPackEnvironments);
 
+  // Remove any pack element generic environments.
+  truncate(cs.PackElementGenericEnvironments,
+           numPackElementGenericEnvironments);
+
   // Remove any defaulted type variables.
   truncate(cs.DefaultedConstraints, numDefaultedConstraints);
 
@@ -775,6 +797,9 @@ ConstraintSystem::SolverScope::~SolverScope() {
 
   // Remove any case label item infos.
   truncate(cs.caseLabelItems, numCaseLabelItems);
+
+  // Remove any potential throw sites.
+  truncate(cs.potentialThrowSites, numPotentialThrowSites);
 
   // Remove any ExprPattern mappings.
   truncate(cs.exprPatterns, numExprPatterns);
@@ -1051,32 +1076,32 @@ void ConstraintSystem::shrink(Expr *expr) {
                             CS.getContextualType(expr, /*forConstraint=*/false),
                             CS.getContextualTypePurpose(expr));
         // Don't try to walk into the dictionary.
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       // Let's not attempt to type-check closures or expressions
       // which constrain closures, because they require special handling
       // when dealing with context and parameters declarations.
       if (isa<ClosureExpr>(expr)) {
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       // Similar to 'ClosureExpr', 'TapExpr' has a 'VarDecl' the type of which
       // is determined by type checking the parent interpolated string literal.
       if (isa<TapExpr>(expr)) {
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       // Same as TapExpr and ClosureExpr, we'll handle SingleValueStmtExprs
       // separately.
       if (isa<SingleValueStmtExpr>(expr))
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
 
       if (auto coerceExpr = dyn_cast<CoerceExpr>(expr)) {
         if (coerceExpr->isLiteralInit())
           ApplyExprs.push_back({coerceExpr, 1});
         visitCoerceExpr(coerceExpr);
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       if (auto OSR = dyn_cast<OverloadSetRefExpr>(expr)) {
@@ -1515,14 +1540,6 @@ ConstraintSystem::solve(SyntacticElementTarget &target,
       LLVM_FALLTHROUGH;
 
     case SolutionResult::UndiagnosedError:
-      /// If we have a SolutionCallback, we are inspecting constraint system
-      /// solutions directly and thus also want to receive ambiguous solutions.
-      /// Hence always run the second (salvaging) stage.
-      if (shouldSuppressDiagnostics() && !Context.SolutionCallback) {
-        solution.markAsDiagnosed();
-        return llvm::None;
-      }
-
       if (stage == 1) {
         diagnoseFailureFor(target);
         reportSolutionsToSolutionCallback(solution);
@@ -2165,17 +2182,24 @@ void DisjunctionChoiceProducer::partitionGenericOperators(
   SmallVector<unsigned, 4> simdOverloads;
   SmallVector<unsigned, 4> otherGenericOverloads;
 
-  auto refinesOrConformsTo = [&](NominalTypeDecl *nominal, KnownProtocolKind kind) -> bool {
-    if (!nominal)
-      return false;
+  auto &ctx = CS.getASTContext();
 
-    auto *protocol =
-        TypeChecker::getProtocol(CS.getASTContext(), SourceLoc(), kind);
+  auto *additiveArithmeticProto = ctx.getProtocol(KnownProtocolKind::AdditiveArithmetic);
+  auto *sequenceProto = ctx.getProtocol(KnownProtocolKind::Sequence);
+  auto *simdProto = ctx.getProtocol(KnownProtocolKind::SIMD);
+
+  auto conformsTo = [&](Type type, ProtocolDecl *protocol) -> bool {
+    return protocol && bool(CS.lookupConformance(type, protocol));
+  };
+
+  auto refinesOrConformsTo = [&](NominalTypeDecl *nominal, ProtocolDecl *protocol) -> bool {
+    if (!nominal || !protocol)
+      return false;
 
     if (auto *refined = dyn_cast<ProtocolDecl>(nominal))
       return refined->inheritsFrom(protocol);
 
-    return bool(CS.lookupConformance(nominal->getDeclaredType(), protocol));
+    return conformsTo(nominal->getDeclaredInterfaceType(), protocol);
   };
 
   // Gather Numeric and Sequence overloads into separate buckets.
@@ -2188,9 +2212,9 @@ void DisjunctionChoiceProducer::partitionGenericOperators(
       simdOverloads.push_back(index);
     } else if (!decl->getInterfaceType()->is<GenericFunctionType>()) {
       concreteOverloads.push_back(index);
-    } else if (refinesOrConformsTo(nominal, KnownProtocolKind::AdditiveArithmetic)) {
+    } else if (refinesOrConformsTo(nominal, additiveArithmeticProto)) {
       numericOverloads.push_back(index);
-    } else if (refinesOrConformsTo(nominal, KnownProtocolKind::Sequence)) {
+    } else if (refinesOrConformsTo(nominal, sequenceProto)) {
       sequenceOverloads.push_back(index);
     } else {
       otherGenericOverloads.push_back(index);
@@ -2226,27 +2250,21 @@ void DisjunctionChoiceProducer::partitionGenericOperators(
     if (argType->isTypeVariableOrMember())
       continue;
 
-    if (TypeChecker::conformsToKnownProtocol(
-            argType, KnownProtocolKind::AdditiveArithmetic,
-            CS.DC->getParentModule())) {
+    if (conformsTo(argType, additiveArithmeticProto)) {
       first =
           std::copy(numericOverloads.begin(), numericOverloads.end(), first);
       numericOverloads.clear();
       break;
     }
 
-    if (TypeChecker::conformsToKnownProtocol(
-            argType, KnownProtocolKind::Sequence,
-            CS.DC->getParentModule())) {
+    if (conformsTo(argType, sequenceProto)) {
       first =
           std::copy(sequenceOverloads.begin(), sequenceOverloads.end(), first);
       sequenceOverloads.clear();
       break;
     }
 
-    if (TypeChecker::conformsToKnownProtocol(
-            argType, KnownProtocolKind::SIMD,
-            CS.DC->getParentModule())) {
+    if (conformsTo(argType, simdProto)) {
       first = std::copy(simdOverloads.begin(), simdOverloads.end(), first);
       simdOverloads.clear();
       break;

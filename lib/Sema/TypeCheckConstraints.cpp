@@ -144,16 +144,41 @@ bool TypeVariableType::Implementation::isKeyPathType() const {
   return locator && locator->isKeyPathType();
 }
 
+bool TypeVariableType::Implementation::isKeyPathRoot() const {
+  return locator && locator->isKeyPathRoot();
+}
+
 bool TypeVariableType::Implementation::isKeyPathValue() const {
   return locator && locator->isKeyPathValue();
+}
+
+bool TypeVariableType::Implementation::isKeyPathSubscriptIndex() const {
+  return locator &&
+         locator->isLastElement<LocatorPathElt::KeyPathSubscriptIndex>();
 }
 
 bool TypeVariableType::Implementation::isSubscriptResultType() const {
   if (!(locator && locator->getAnchor()))
     return false;
 
-  return isExpr<SubscriptExpr>(locator->getAnchor()) &&
-         locator->isLastElement<LocatorPathElt::FunctionResult>();
+  if (!locator->isLastElement<LocatorPathElt::FunctionResult>())
+    return false;
+
+  if (isExpr<SubscriptExpr>(locator->getAnchor()))
+    return true;
+
+  auto *KP = getAsExpr<KeyPathExpr>(locator->getAnchor());
+  if (!KP)
+    return false;
+
+  auto componentLoc = locator->findFirst<LocatorPathElt::KeyPathComponent>();
+  if (!componentLoc)
+    return false;
+
+  auto &component = KP->getComponents()[componentLoc->getIndex()];
+  return component.getKind() == KeyPathExpr::Component::Kind::Subscript ||
+         component.getKind() ==
+             KeyPathExpr::Component::Kind::UnresolvedSubscript;
 }
 
 bool TypeVariableType::Implementation::isParameterPack() const {
@@ -180,6 +205,11 @@ bool TypeVariableType::Implementation::isOpaqueType() const {
   }
 
   return false;
+}
+
+bool TypeVariableType::Implementation::isCollectionLiteralType() const {
+  return locator && (locator->directlyAt<ArrayExpr>() ||
+                     locator->directlyAt<DictionaryExpr>());
 }
 
 void *operator new(size_t bytes, ConstraintSystem& cs,
@@ -320,7 +350,7 @@ public:
       }
     }
 
-    return Action::SkipChildren(expr);
+    return Action::SkipNode(expr);
   }
 
   PostWalkResult<Expr *> walkToExprPost(Expr *expr) override {
@@ -340,13 +370,13 @@ public:
   }
 
   PreWalkResult<Pattern *> walkToPatternPre(Pattern *pattern) override {
-    return Action::SkipChildren(pattern);
+    return Action::SkipNode(pattern);
   }
   PreWalkAction walkToTypeReprPre(TypeRepr *typeRepr) override {
-    return Action::SkipChildren();
+    return Action::SkipNode();
   }
   PreWalkAction walkToParameterListPre(ParameterList *params) override {
-    return Action::SkipChildren();
+    return Action::SkipNode();
   }
 };
 } // end anonymous namespace
@@ -444,8 +474,7 @@ TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
   // First, pre-check the target, validating any types that occur in the
   // expression and folding sequence expressions.
   if (ConstraintSystem::preCheckTarget(
-          target, /*replaceInvalidRefsWithErrors=*/true,
-          options.contains(TypeCheckExprFlags::LeaveClosureBodyUnchecked))) {
+          target, /*replaceInvalidRefsWithErrors=*/true)) {
     return llvm::None;
   }
 
@@ -463,9 +492,6 @@ TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
 
   if (DiagnosticSuppression::isEnabled(Context.Diags))
     csOptions |= ConstraintSystemFlags::SuppressDiagnostics;
-
-  if (options.contains(TypeCheckExprFlags::LeaveClosureBodyUnchecked))
-    csOptions |= ConstraintSystemFlags::LeaveClosureBodyUnchecked;
 
   if (options.contains(TypeCheckExprFlags::DisableMacroExpansions))
     csOptions |= ConstraintSystemFlags::DisableMacroExpansions;
@@ -795,7 +821,7 @@ bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
                                    TypeCheckExprOptions options) {
   SyntacticElementTarget target =
       PBD ? SyntacticElementTarget::forInitialization(
-                initializer, DC, patternType, PBD, patternNumber,
+                initializer, patternType, PBD, patternNumber,
                 /*bindPatternVarsOneWay=*/false)
           : SyntacticElementTarget::forInitialization(
                 initializer, DC, patternType, pattern,
@@ -845,14 +871,8 @@ bool TypeChecker::typeCheckPatternBinding(PatternBindingDecl *PBD,
   Expr *init = PBD->getInit(patternNumber);
 
   // Enter an initializer context if necessary.
-  PatternBindingInitializer *initContext = nullptr;
-  DeclContext *DC = PBD->getDeclContext();
-  if (!DC->isLocalContext()) {
-    initContext = cast_or_null<PatternBindingInitializer>(
-        PBD->getInitContext(patternNumber));
-    if (initContext)
-      DC = initContext;
-  }
+  PatternBindingInitializer *initContext = PBD->getInitContext(patternNumber);
+  DeclContext *DC = initContext ? initContext : PBD->getDeclContext();
 
   // If we weren't given a pattern type, compute one now.
   if (!patternType) {
@@ -876,16 +896,18 @@ bool TypeChecker::typeCheckPatternBinding(PatternBindingDecl *PBD,
     return true;
   }
 
-  PBD->setPattern(patternNumber, pattern, initContext);
+  PBD->setPattern(patternNumber, pattern);
   PBD->setInit(patternNumber, init);
 
   if (hadError)
     PBD->setInvalid();
   PBD->setInitializerChecked(patternNumber);
+  
   return hadError;
 }
 
-bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
+bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt,
+                                          GenericEnvironment *packElementEnv) {
   auto &Context = dc->getASTContext();
   FrontendStatsTracer statsTracer(Context.Stats, "typecheck-for-each", stmt);
   PrettyStackTraceStmt stackTrace(Context, "type-checking-for-each", stmt);
@@ -901,7 +923,8 @@ bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
     return true;
   };
 
-  auto target = SyntacticElementTarget::forForEachStmt(stmt, dc);
+  auto target = SyntacticElementTarget::forForEachStmt(
+      stmt, dc, /*ignoreWhereClause=*/false, packElementEnv);
   if (!typeCheckTarget(target))
     return failed();
 
@@ -1095,7 +1118,7 @@ TypeChecker::addImplicitLoadExpr(ASTContext &Context, Expr *expr,
       if (isa<LoadExpr>(E))
         return Action::Stop();
 
-      return Action::SkipChildren(createLoadExpr(E));
+      return Action::SkipNode(createLoadExpr(E));
     }
 
     PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
@@ -1644,6 +1667,33 @@ void ConstraintSystem::print(raw_ostream &out) const {
       out << "\n";
     }
   }
+
+  if (!potentialThrowSites.empty()) {
+    out.indent(indent) << "Potential throw sites:\n";
+    interleave(potentialThrowSites, [&](const auto &throwSite) {
+      out.indent(indent + 2);
+      switch (throwSite.second.kind) {
+      case PotentialThrowSite::Application:
+        out << "- application @ ";
+        break;
+      case PotentialThrowSite::ExplicitThrow:
+        out << " - explicit throw @ ";
+        break;
+      case PotentialThrowSite::NonExhaustiveDoCatch:
+        out << " - non-exhaustive do..catch @ ";
+        break;
+      case PotentialThrowSite::PropertyAccess:
+        out << " - property access @ ";
+        break;
+      }
+
+      throwSite.second.locator->dump(&getASTContext().SourceMgr, out);
+    }, [&] {
+      out << "\n";
+    });
+    out << "\n";
+
+  }
 }
 
 /// Determine the semantics of a checked cast operation.
@@ -2164,7 +2214,7 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
     auto nsErrorTy = Context.getNSErrorType();
 
     if (auto errorTypeProto = Context.getProtocol(KnownProtocolKind::Error)) {
-      if (conformsToProtocol(toType, errorTypeProto, module)) {
+      if (module->checkConformance(toType, errorTypeProto)) {
         if (nsErrorTy) {
           if (isSubtypeOf(fromType, nsErrorTy, dc)
               // Don't mask "always true" warnings if NSError is cast to
@@ -2174,7 +2224,7 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
         }
       }
 
-      if (conformsToProtocol(fromType, errorTypeProto, module)) {
+      if (module->checkConformance(fromType, errorTypeProto)) {
         // Cast of an error-conforming type to NSError or NSObject.
         if ((nsObject && toType->isEqual(nsObject)) ||
              (nsErrorTy && toType->isEqual(nsErrorTy)))
@@ -2304,19 +2354,19 @@ void ConstraintSystem::forEachExpr(
 
       if (auto closure = dyn_cast<ClosureExpr>(E)) {
         if (!CS.participatesInInference(closure))
-          return Action::SkipChildren(NewE);
+          return Action::SkipNode(NewE);
       }
       return Action::Continue(NewE);
     }
 
     PreWalkResult<Pattern *> walkToPatternPre(Pattern *P) override {
-      return Action::SkipChildren(P);
+      return Action::SkipNode(P);
     }
     PreWalkAction walkToDeclPre(Decl *D) override {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
     PreWalkAction walkToTypeReprPre(TypeRepr *T) override {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
   };
 

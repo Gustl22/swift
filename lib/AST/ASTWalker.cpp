@@ -202,7 +202,7 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
 
     for (auto idx : range(PBD->getNumPatternEntries())) {
       if (Pattern *Pat = doIt(PBD->getPattern(idx)))
-        PBD->setPattern(idx, Pat, PBD->getInitContext(idx));
+        PBD->setPattern(idx, Pat);
       else
         return true;
 
@@ -1019,7 +1019,7 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
 
     // Handle other closures.
     if (BraceStmt *body = cast_or_null<BraceStmt>(doIt(expr->getBody()))) {
-      expr->setBody(body, expr->hasSingleExpressionBody());
+      expr->setBody(body);
       return expr;
     }
     return nullptr;
@@ -1280,7 +1280,7 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     }
 
     if (!E->isObjC()) {
-      auto rootType = E->getRootType();
+      auto rootType = E->getExplicitRootType();
       if (rootType && doIt(rootType))
         return nullptr;
     }
@@ -1312,6 +1312,17 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
         break;
       }
     }
+    return E;
+  }
+
+  Expr *visitCurrentContextIsolationExpr(CurrentContextIsolationExpr *E) {
+    if (auto actor = E->getActor()) {
+      if (auto newActor = doIt(actor))
+        E->setActor(newActor);
+      else
+        return nullptr;
+    }
+
     return E;
   }
 
@@ -1444,13 +1455,15 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     switch (Pre.Action) {
     case PreWalkAction::Stop:
       return true;
-    case PreWalkAction::SkipChildren:
+    case PreWalkAction::SkipNode:
       return false;
+    case PreWalkAction::SkipChildren:
+      break;
     case PreWalkAction::Continue:
+      if (VisitChildren())
+        return true;
       break;
     }
-    if (VisitChildren())
-      return true;
     switch (WalkPost().Action) {
     case PostWalkAction::Stop:
       return true;
@@ -1465,21 +1478,25 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
   T *traverse(PreWalkResult<T *> Pre,
               llvm::function_ref<T *(T *)> VisitChildren,
               llvm::function_ref<PostWalkResult<T *>(T *)> WalkPost) {
+    auto Node = Pre.Value;
+    assert(!Node || *Node && "Use Action::Stop instead of returning nullptr");
     switch (Pre.Action.Action) {
     case PreWalkAction::Stop:
       return nullptr;
+    case PreWalkAction::SkipNode:
+      return *Node;
     case PreWalkAction::SkipChildren:
-      assert(*Pre.Value && "Use Action::Stop instead of returning nullptr");
-      return *Pre.Value;
-    case PreWalkAction::Continue:
+      break;
+    case PreWalkAction::Continue: {
+      auto NewNode = VisitChildren(*Node);
+      if (!NewNode)
+        return nullptr;
+
+      Node = NewNode;
       break;
     }
-    assert(*Pre.Value && "Use Action::Stop instead of returning nullptr");
-    auto Value = VisitChildren(*Pre.Value);
-    if (!Value)
-      return nullptr;
-
-    auto Post = WalkPost(Value);
+    }
+    auto Post = WalkPost(*Node);
     switch (Post.Action.Action) {
     case PostWalkAction::Stop:
       return nullptr;
@@ -1813,8 +1830,8 @@ Stmt *Traversal::visitIfStmt(IfStmt *IS) {
   if (doIt(IS->getCond()))
     return nullptr;
 
-  if (Stmt *S2 = doIt(IS->getThenStmt()))
-    IS->setThenStmt(S2);
+  if (auto *S2 = doIt(IS->getThenStmt()))
+    IS->setThenStmt(cast<BraceStmt>(S2));
   else
     return nullptr;
 
@@ -1905,11 +1922,9 @@ Stmt *Traversal::visitForEachStmt(ForEachStmt *S) {
   //
   // If for-in is already type-checked, the type-checked version
   // of the sequence is going to be visited as part of `iteratorVar`.
-  if (S->getTypeCheckedSequence()) {
-    if (auto IteratorVar = S->getIteratorVar()) {
-      if (doIt(IteratorVar))
-        return nullptr;
-    }
+  if (auto IteratorVar = S->getIteratorVar()) {
+    if (doIt(IteratorVar))
+      return nullptr;
 
     if (auto NextCall = S->getNextCall()) {
       if ((NextCall = doIt(NextCall)))
@@ -2213,6 +2228,10 @@ bool Traversal::visitCompileTimeConstTypeRepr(CompileTimeConstTypeRepr *T) {
   return doIt(T->getBase());
 }
 
+bool Traversal::visitResultDependsOnTypeRepr(ResultDependsOnTypeRepr *T) {
+  return doIt(T->getBase());
+}
+
 bool Traversal::visitOpaqueReturnTypeRepr(OpaqueReturnTypeRepr *T) {
   return doIt(T->getConstraint());
 }
@@ -2251,6 +2270,11 @@ bool Traversal::visitSILBoxTypeRepr(SILBoxTypeRepr *T) {
       return true;
   }
   return false;
+}
+
+bool Traversal::visitLifetimeDependentReturnTypeRepr(
+    LifetimeDependentReturnTypeRepr *T) {
+  return doIt(T->getBase());
 }
 
 Expr *Expr::walk(ASTWalker &walker) {

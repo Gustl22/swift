@@ -90,7 +90,8 @@ inline bool isEmbedded(CanType t) {
 }
 
 inline bool isMetadataAllowedInEmbedded(CanType t) {
-  return isa<ClassType>(t) || isa<BoundGenericClassType>(t);
+  return isa<ClassType>(t) || isa<BoundGenericClassType>(t) ||
+         isa<DynamicSelfType>(t);
 }
 
 inline bool isEmbedded(Decl *d) {
@@ -1012,7 +1013,8 @@ public:
   }
 
   static LinkEntity forValueWitness(CanType concreteType, ValueWitness witness) {
-    assert(!isEmbedded(concreteType));
+    // Explicitly allowed in embedded Swift because we generate value witnesses
+    // (but not witness tables) for Swift Concurrency usage.
     LinkEntity entity;
     entity.Pointer = concreteType.getPointer();
     entity.Data = LINKENTITY_SET_FIELD(Kind, unsigned(Kind::ValueWitness))
@@ -1595,6 +1597,9 @@ public:
            getKind() == Kind::DispatchThunkAllocator ||
            getKind() == Kind::DispatchThunkDerivative;
   }
+  bool isNominalTypeDescriptor() const {
+    return getKind() == Kind::NominalTypeDescriptor;
+  }
 
   /// Determine whether this entity will be weak-imported.
   bool isWeakImported(ModuleDecl *module) const;
@@ -1609,6 +1614,12 @@ public:
   /// Get the default LLVM type to use for forward declarations of this
   /// entity.
   llvm::Type *getDefaultDeclarationType(IRGenModule &IGM) const;
+
+  /// Determine whether entity that represents a symbol is in TEXT segment.
+  bool isText() const;
+
+  /// Determine whether entity that represents a symbol is in DATA segment.
+  bool isData() const { return !isText(); }
 
   bool isAlwaysSharedLinkage() const;
 #undef LINKENTITY_GET_FIELD

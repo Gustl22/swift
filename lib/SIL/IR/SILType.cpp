@@ -128,6 +128,11 @@ bool SILType::isNonTrivialOrContainsRawPointer(const SILFunction *f) const {
   return result;
 }
 
+bool SILType::isOrContainsPack(const SILFunction &F) const {
+  auto contextType = hasTypeParameter() ? F.mapTypeIntoContext(*this) : *this;
+  return F.getTypeLowering(contextType).isOrContainsPack();
+}
+
 bool SILType::isEmpty(const SILFunction &F) const {
   // Infinite types are never empty.
   if (F.getTypeLowering(*this).getRecursiveProperties().isInfinite()) {
@@ -255,12 +260,8 @@ static bool isSingleSwiftRefcounted(SILModule &M,
   if (Ty->isAnyExistentialType()) {
     auto layout = Ty->getExistentialLayout();
     // Must be no protocol constraints that aren't @objc or @_marker.
-    if (layout.containsNonObjCProtocol) {
-      for (auto proto : layout.getProtocols()) {
-        if (!proto->isObjC() && !proto->isMarkerProtocol()) {
-          return false;
-        }
-      }
+    if (layout.containsSwiftProtocol) {
+      return false;
     }
     
     // The Error existential has its own special layout.
@@ -592,6 +593,7 @@ SILType::getPreferredExistentialRepresentation(Type containedType) const {
     return ExistentialRepresentation::Class;
   
   // Otherwise, we need to use a fixed-sized buffer.
+  assert(!layout.isObjC());
   return ExistentialRepresentation::Opaque;
 }
 
@@ -705,6 +707,15 @@ bool SILModuleConventions::isReturnedIndirectlyInSIL(SILType type,
 }
 
 bool SILModuleConventions::isPassedIndirectlyInSIL(SILType type, SILModule &M) {
+  if (SILModuleConventions(M).loweredAddresses) {
+    return M.Types.getTypeLowering(type, TypeExpansionContext::minimal())
+        .isAddressOnly();
+  }
+
+  return false;
+}
+
+bool SILModuleConventions::isThrownIndirectlyInSIL(SILType type, SILModule &M) {
   if (SILModuleConventions(M).loweredAddresses) {
     return M.Types.getTypeLowering(type, TypeExpansionContext::minimal())
         .isAddressOnly();
@@ -1034,11 +1045,52 @@ SILType::getSingletonAggregateFieldType(SILModule &M,
   return SILType();
 }
 
-bool SILType::isMoveOnly() const {
-  // Nominal types are move-only if declared as such.
-  if (getASTType()->isNoncopyable())
-    return true;
+bool SILType::isEscapable() const {
+  CanType ty = getASTType();
 
+  // For storage with reference ownership, check the referent.
+  if (auto refStorage = ty->getAs<ReferenceStorageType>())
+    ty = refStorage->getReferentType()->getCanonicalType();
+
+  if (auto fnTy = getAs<SILFunctionType>()) {
+    return !fnTy->isNoEscape();
+  }
+  if (auto boxTy = getAs<SILBoxType>()) {
+    auto fields = boxTy->getLayout()->getFields();
+    assert(fields.size() == 1);
+    ty = fields[0].getLoweredType();
+  }
+
+  // TODO: Support ~Escapable in parameter packs.
+  //
+  // Treat all other SIL-specific types as Escapable.
+  if (isa<SILBlockStorageType,
+          SILBoxType,
+          SILPackType,
+          SILTokenType>(ty)) {
+    return true;
+  }
+  return ty->isEscapable();
+}
+
+bool SILType::isMoveOnly(bool orWrapped) const {
+  // If it's inside the move-only wrapper, return true iff we want to include
+  // such types as "move-only" in this query. Such values are typically
+  // just "no-implicit-copy" and not "move-only".
+  if (isMoveOnlyWrapped())
+    return orWrapped;
+
+  // Legacy check.
+  if (!getASTContext().LangOpts.hasFeature(Feature::NoncopyableGenerics)) {
+    return getASTType()->isNoncopyable();
+  }
+
+  // NOTE: getASTType strips the MoveOnlyWrapper off!
+  CanType ty = getASTType();
+
+  // For storage with reference ownership, check the referent.
+  if (auto refStorage = ty->getAs<ReferenceStorageType>())
+    ty = refStorage->getReferentType()->getCanonicalType();
 
   // TODO: Nonescaping closures ought to be treated as move-only in SIL.
   // They aren't marked move-only now, because the necessary move-only passes
@@ -1051,7 +1103,19 @@ bool SILType::isMoveOnly() const {
     return fnTy->isTrivialNoEscape();
   }
    */
-  return isMoveOnlyWrapped();
+  if (isa<SILFunctionType>(ty))
+    return false;
+
+  // Treat all other SIL-specific types as Copyable.
+  if (isa<SILBlockStorageType,
+          SILBoxType,
+          SILPackType,
+          SILTokenType>(ty)) {
+    return false;
+  }
+
+  // Finally, for other ordinary types, ask the AST type.
+  return ty->isNoncopyable();
 }
 
 
@@ -1213,7 +1277,6 @@ SILType SILType::removingMoveOnlyWrapperToBoxedType(const SILFunction *fn) {
   return SILType::getPrimitiveObjectType(newBoxType);
 }
 
-ProtocolConformanceRef
-SILType::conformsToProtocol(SILFunction *fn, ProtocolDecl *protocol) const {
-  return fn->getParentModule()->conformsToProtocol(getASTType(), protocol);
+bool SILType::isSendable(SILFunction *fn) const {
+  return getASTType()->isSendableType();
 }

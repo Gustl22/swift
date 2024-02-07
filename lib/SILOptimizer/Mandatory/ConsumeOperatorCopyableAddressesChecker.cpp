@@ -300,8 +300,8 @@ struct UseState {
   SILValue address;
   SmallVector<MarkUnresolvedMoveAddrInst *, 1> markMoves;
   SmallPtrSet<SILInstruction *, 1> seenMarkMoves;
-  SmallSetVector<SILInstruction *, 2> inits;
-  SmallSetVector<SILInstruction *, 4> livenessUses;
+  llvm::SmallSetVector<SILInstruction *, 2> inits;
+  llvm::SmallSetVector<SILInstruction *, 4> livenessUses;
   SmallBlotSetVector<DestroyAddrInst *, 4> destroys;
   llvm::SmallDenseMap<SILInstruction *, unsigned, 4> destroyToIndexMap;
   SmallBlotSetVector<SILInstruction *, 4> reinits;
@@ -2463,10 +2463,6 @@ class ConsumeOperatorCopyableAddressesCheckerPass
     auto *fn = getFunction();
     auto &astContext = fn->getASTContext();
 
-    // Only run this pass if the move only language feature is enabled.
-    if (!astContext.supportsMoveOnlyTypes())
-      return;
-
     // Don't rerun diagnostics on deserialized functions.
     if (getFunction()->wasDeserializedCanonical())
       return;
@@ -2474,7 +2470,7 @@ class ConsumeOperatorCopyableAddressesCheckerPass
     assert(fn->getModule().getStage() == SILStage::Raw &&
            "Should only run on Raw SIL");
 
-    SmallSetVector<SILValue, 32> addressesToCheck;
+    llvm::SmallSetVector<SILValue, 32> addressesToCheck;
 
     for (auto *arg : fn->front().getSILFunctionArguments()) {
       if (arg->getType().isAddress() &&

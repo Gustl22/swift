@@ -14,8 +14,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/AST/ASTContext.h"
 #include "swift/AST/Requirement.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/GenericParamList.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/Types.h"
@@ -242,4 +244,125 @@ int Requirement::compare(const Requirement &other) const {
   assert(compareProtos != 0 && "Duplicate conformance requirements");
 
   return compareProtos;
+}
+
+CheckRequirementsResult swift::checkRequirements(ArrayRef<Requirement> requirements) {
+  SmallVector<Requirement, 4> worklist(requirements.begin(), requirements.end());
+
+  bool hadSubstFailure = false;
+
+  while (!worklist.empty()) {
+    auto req = worklist.pop_back_val();
+
+  // Check preconditions.
+#ifndef NDEBUG
+  {
+    auto firstType = req.getFirstType();
+    assert(!firstType->hasTypeParameter());
+    assert(!firstType->hasTypeVariable());
+
+    if (req.getKind() != RequirementKind::Layout) {
+      auto secondType = req.getSecondType();
+      assert(!secondType->hasTypeParameter());
+      assert(!secondType->hasTypeVariable());
+    }
+  }
+#endif
+
+    switch (req.checkRequirement(worklist, /*allowMissing=*/true)) {
+    case CheckRequirementResult::Success:
+    case CheckRequirementResult::ConditionalConformance:
+    case CheckRequirementResult::PackRequirement:
+      break;
+
+    case CheckRequirementResult::RequirementFailure:
+      return CheckRequirementsResult::RequirementFailure;
+
+    case CheckRequirementResult::SubstitutionFailure:
+      hadSubstFailure = true;
+      break;
+    }
+  }
+
+  if (hadSubstFailure)
+    return CheckRequirementsResult::SubstitutionFailure;
+
+  return CheckRequirementsResult::Success;
+}
+
+CheckRequirementsResult swift::checkRequirements(
+    ModuleDecl *module, ArrayRef<Requirement> requirements,
+    TypeSubstitutionFn substitutions, SubstOptions options) {
+  SmallVector<Requirement, 4> substReqs;
+  for (auto req : requirements) {
+    substReqs.push_back(req.subst(substitutions,
+                              LookUpConformanceInModule(module), options));
+  }
+
+  return checkRequirements(substReqs);
+}
+
+InverseRequirement::InverseRequirement(Type subject,
+                                       ProtocolDecl *protocol,
+                                       SourceLoc loc)
+    : subject(subject), protocol(protocol), loc(loc) {
+  // Ensure it's an invertible protocol.
+  assert(protocol);
+  assert(protocol->getKnownProtocolKind());
+  assert(getInvertibleProtocolKind(*(protocol->getKnownProtocolKind())));
+}
+
+InvertibleProtocolKind InverseRequirement::getKind() const {
+  return *getInvertibleProtocolKind(*(protocol->getKnownProtocolKind()));
+}
+
+void InverseRequirement::enumerateDefaultedParams(
+    GenericContext *genericContext,
+    SmallVectorImpl<Type> &result) {
+
+  auto add = [&](Type t) {
+    assert(t->isTypeParameter());
+    result.push_back(t);
+  };
+
+  // Nothing to enumerate if it's not generic.
+  if (!genericContext->isGeneric())
+    return;
+
+  if (auto proto = dyn_cast<ProtocolDecl>(genericContext)) {
+    add(proto->getSelfInterfaceType());
+
+    for (auto *assocTypeDecl : proto->getAssociatedTypeMembers())
+      add(assocTypeDecl->getDeclaredInterfaceType());
+
+    return;
+  }
+
+  for (GenericTypeParamDecl *gtpd : *genericContext->getGenericParams())
+    add(gtpd->getDeclaredInterfaceType());
+}
+
+InvertibleProtocolSet InverseRequirement::expandDefault(Type gp) {
+  assert(gp->isTypeParameter());
+  return InvertibleProtocolSet::full();
+}
+
+void InverseRequirement::expandDefaults(
+    ASTContext &ctx,
+    ArrayRef<Type> gps,
+    SmallVectorImpl<StructuralRequirement> &result) {
+  if (!ctx.LangOpts.hasFeature(Feature::NoncopyableGenerics))
+    return;
+
+  for (auto gp : gps) {
+    auto protos = InverseRequirement::expandDefault(gp);
+    for (auto ip : protos) {
+      auto proto = ctx.getProtocol(getKnownProtocolKind(ip));
+      assert(proto && "missing Copyable/Escapable from stdlib!");
+      
+      auto protoTy = proto->getDeclaredInterfaceType();
+      result.push_back({{RequirementKind::Conformance, gp, protoTy},
+                        SourceLoc()});
+    }
+  }
 }

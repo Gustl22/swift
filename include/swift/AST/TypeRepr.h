@@ -19,16 +19,18 @@
 
 #include "swift/AST/Attr.h"
 #include "swift/AST/DeclContext.h"
+#include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Identifier.h"
+#include "swift/AST/LifetimeDependence.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeAlignments.h"
+#include "swift/Basic/Debug.h"
+#include "swift/Basic/InlineBitfield.h"
+#include "swift/Basic/Located.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/STLExtras.h"
-#include "swift/Basic/Debug.h"
-#include "swift/Basic/Located.h"
-#include "swift/Basic/InlineBitfield.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/TrailingObjects.h"
 
@@ -103,11 +105,20 @@ protected:
     NumFields : 32
   );
 
+  SWIFT_INLINE_BITFIELD_FULL(AttributedTypeRepr, TypeRepr, 32,
+    : NumPadBits,
+    NumAttributes : 32
+  );
+
   SWIFT_INLINE_BITFIELD_FULL(PackTypeRepr, TypeRepr, 32,
     /// The number of elements contained.
     NumElements : 32
   );
 
+  SWIFT_INLINE_BITFIELD_FULL(LifetimeDependentReturnTypeRepr, TypeRepr, 32,
+      : NumPadBits,
+      NumDependencies : 32
+   );
   } Bits;
   // clang-format on
 
@@ -147,9 +158,9 @@ public:
   SourceLoc getEndLoc() const;
   SourceRange getSourceRange() const;
 
-  /// Find an @unchecked attribute and return its source location, or return
-  /// an invalid source location if there is no such attribute.
-  SourceLoc findUncheckedAttrLoc() const;
+  /// Find an attribute with the provided kind and return its source location,
+  /// or return an invalid source location if there is no such attribute.
+  SourceLoc findAttrLoc(TypeAttrKind kind) const;
 
   /// Is this type grammatically a type-simple?
   inline bool isSimple() const; // bottom of this file
@@ -195,17 +206,35 @@ public:
 /// A TypeRepr for a type with a syntax error.  Can be used both as a
 /// top-level TypeRepr and as a part of other TypeRepr.
 ///
-/// The client should make sure to emit a diagnostic at the construction time
-/// (in the parser).  All uses of this type should be ignored and not
-/// re-diagnosed.
+/// The client can either emit a detailed diagnostic at the construction time
+/// (in the parser) or store a zero-arg diagnostic in this TypeRepr to be
+/// emitted after parsing, during type resolution.
+///
+/// All uses of this type should be ignored and not re-diagnosed.
 class ErrorTypeRepr : public TypeRepr {
   SourceRange Range;
+  llvm::Optional<ZeroArgDiagnostic> DelayedDiag;
+
+  ErrorTypeRepr(SourceRange Range, llvm::Optional<ZeroArgDiagnostic> Diag)
+      : TypeRepr(TypeReprKind::Error), Range(Range), DelayedDiag(Diag) {}
 
 public:
-  ErrorTypeRepr() : TypeRepr(TypeReprKind::Error) {}
-  ErrorTypeRepr(SourceLoc Loc) : TypeRepr(TypeReprKind::Error), Range(Loc) {}
-  ErrorTypeRepr(SourceRange Range)
-      : TypeRepr(TypeReprKind::Error), Range(Range) {}
+  static ErrorTypeRepr *
+  create(ASTContext &Context, SourceRange Range,
+         llvm::Optional<ZeroArgDiagnostic> DelayedDiag = llvm::None) {
+    assert((!DelayedDiag || Range) && "diagnostic needs a location");
+    return new (Context) ErrorTypeRepr(Range, DelayedDiag);
+  }
+
+  static ErrorTypeRepr *
+  create(ASTContext &Context, SourceLoc Loc = SourceLoc(),
+         llvm::Optional<ZeroArgDiagnostic> DelayedDiag = llvm::None) {
+    return create(Context, SourceRange(Loc), DelayedDiag);
+  }
+
+  /// If there is a delayed diagnostic stored in this TypeRepr, consumes and
+  /// emits that diagnostic.
+  void dischargeDiagnostic(ASTContext &Context);
 
   static bool classof(const TypeRepr *T) {
     return T->getKind() == TypeReprKind::Error;
@@ -223,19 +252,47 @@ private:
 /// \code
 ///   @convention(thin) Foo
 /// \endcode
-class AttributedTypeRepr : public TypeRepr {
-  // FIXME: TypeAttributes isn't a great use of space.
-  TypeAttributes Attrs;
+class AttributedTypeRepr final
+    : public TypeRepr,
+      private llvm::TrailingObjects<AttributedTypeRepr, TypeOrCustomAttr> {
   TypeRepr *Ty;
 
-public:
-  AttributedTypeRepr(const TypeAttributes &Attrs, TypeRepr *Ty)
-    : TypeRepr(TypeReprKind::Attributed), Attrs(Attrs), Ty(Ty) {
+  AttributedTypeRepr(ArrayRef<TypeOrCustomAttr> attrs, TypeRepr *Ty)
+      : TypeRepr(TypeReprKind::Attributed), Ty(Ty) {
+    assert(!attrs.empty());
+    Bits.AttributedTypeRepr.NumAttributes = attrs.size();
+    std::uninitialized_copy(attrs.begin(), attrs.end(),
+                            getTrailingObjects<TypeOrCustomAttr>());
+
   }
 
-  const TypeAttributes &getAttrs() const { return Attrs; }
-  void setAttrs(const TypeAttributes &attrs) { Attrs = attrs; }
+  friend TrailingObjects;
+
+public:
+  static AttributedTypeRepr *create(const ASTContext &C,
+                                    ArrayRef<TypeOrCustomAttr> attrs,
+                                    TypeRepr *ty);
+
+  ArrayRef<TypeOrCustomAttr> getAttrs() const {
+    return llvm::makeArrayRef(getTrailingObjects<TypeOrCustomAttr>(),
+                              Bits.AttributedTypeRepr.NumAttributes);
+  }
+
+  TypeAttribute *get(TypeAttrKind kind) const;
+  bool has(TypeAttrKind kind) const {
+    return get(kind) != nullptr;
+  }
+  SourceLoc getAttrLoc(TypeAttrKind kind) const {
+    auto attr = get(kind);
+    return attr ? attr->getAttrLoc() : SourceLoc();
+  }
+
   TypeRepr *getTypeRepr() const { return Ty; }
+
+  /// Return the value of the first SIL ownership attribute (such as
+  /// `sil_weak`) in these attributes, or ReferenceOwnership::Strong if
+  /// there is no such attribute.
+  ReferenceOwnership getSILOwnership() const;
 
   void printAttrs(llvm::raw_ostream &OS) const;
   void printAttrs(ASTPrinter &Printer, const PrintOptions &Options) const;
@@ -246,7 +303,14 @@ public:
   static bool classof(const AttributedTypeRepr *T) { return true; }
 
 private:
-  SourceLoc getStartLocImpl() const { return Attrs.AtLoc; }
+  SourceLoc getStartLocImpl() const {
+    auto attr = getAttrs().front();
+    if (auto customAttr = attr.dyn_cast<CustomAttr*>()) {
+      return customAttr->getStartLoc();
+    } else {
+      return attr.get<TypeAttribute*>()->getStartLoc();
+    }
+  }
   SourceLoc getEndLocImpl() const { return Ty->getEndLoc(); }
   SourceLoc getLocImpl() const { return Ty->getLoc(); }
   void printImpl(ASTPrinter &Printer, const PrintOptions &Opts) const;
@@ -1073,7 +1137,9 @@ public:
   static bool classof(const TypeRepr *T) {
     return T->getKind() == TypeReprKind::Ownership ||
            T->getKind() == TypeReprKind::Isolated ||
-           T->getKind() == TypeReprKind::CompileTimeConst;
+           T->getKind() == TypeReprKind::CompileTimeConst ||
+           T->getKind() == TypeReprKind::ResultDependsOn ||
+           T->getKind() == TypeReprKind::LifetimeDependentReturn;
   }
   static bool classof(const SpecifierTypeRepr *T) { return true; }
   
@@ -1142,6 +1208,21 @@ public:
     return T->getKind() == TypeReprKind::CompileTimeConst;
   }
   static bool classof(const CompileTimeConstTypeRepr *T) { return true; }
+};
+
+/// A lifetime dependent type.
+/// \code
+///   x : _resultDependsOn Int
+/// \endcode
+class ResultDependsOnTypeRepr : public SpecifierTypeRepr {
+public:
+  ResultDependsOnTypeRepr(TypeRepr *Base, SourceLoc InOutLoc)
+      : SpecifierTypeRepr(TypeReprKind::ResultDependsOn, Base, InOutLoc) {}
+
+  static bool classof(const TypeRepr *T) {
+    return T->getKind() == TypeReprKind::ResultDependsOn;
+  }
+  static bool classof(const ResultDependsOnTypeRepr *T) { return true; }
 };
 
 /// A TypeRepr for a known, fixed type.
@@ -1325,7 +1406,7 @@ private:
   friend class TypeRepr;
 };
 
-/// A type repr represeting the inverse of some constraint. For example,
+/// A type repr representing the inverse of some constraint. For example,
 ///    ~Copyable
 /// where `Copyable` is the constraint type.
 class InverseTypeRepr : public TypeRepr {
@@ -1470,6 +1551,50 @@ private:
   friend TypeRepr;
 };
 
+class LifetimeDependentReturnTypeRepr final
+    : public SpecifierTypeRepr,
+      private llvm::TrailingObjects<LifetimeDependentReturnTypeRepr,
+                                    LifetimeDependenceSpecifier> {
+  friend TrailingObjects;
+
+  size_t
+  numTrailingObjects(OverloadToken<LifetimeDependentReturnTypeRepr>) const {
+    return Bits.LifetimeDependentReturnTypeRepr.NumDependencies;
+  }
+
+public:
+  LifetimeDependentReturnTypeRepr(
+      TypeRepr *base, ArrayRef<LifetimeDependenceSpecifier> specifiers)
+      : SpecifierTypeRepr(TypeReprKind::LifetimeDependentReturn, base,
+                          specifiers.front().getLoc()) {
+    assert(base);
+    Bits.LifetimeDependentReturnTypeRepr.NumDependencies = specifiers.size();
+    std::uninitialized_copy(specifiers.begin(), specifiers.end(),
+                            getTrailingObjects<LifetimeDependenceSpecifier>());
+  }
+
+  static LifetimeDependentReturnTypeRepr *
+  create(ASTContext &C, TypeRepr *base,
+         ArrayRef<LifetimeDependenceSpecifier> specifiers);
+
+  ArrayRef<LifetimeDependenceSpecifier> getLifetimeDependencies() const {
+    return {getTrailingObjects<LifetimeDependenceSpecifier>(),
+            Bits.LifetimeDependentReturnTypeRepr.NumDependencies};
+  }
+
+  static bool classof(const TypeRepr *T) {
+    return T->getKind() == TypeReprKind::LifetimeDependentReturn;
+  }
+  static bool classof(const LifetimeDependentReturnTypeRepr *T) { return true; }
+
+private:
+  SourceLoc getStartLocImpl() const;
+  SourceLoc getEndLocImpl() const;
+  SourceLoc getLocImpl() const;
+  void printImpl(ASTPrinter &Printer, const PrintOptions &Opts) const;
+  friend class TypeRepr;
+};
+
 inline bool TypeRepr::isSimple() const {
   // NOTE: Please keep this logic in sync with TypeBase::hasSimpleTypeRepr().
   switch (getKind()) {
@@ -1503,6 +1628,8 @@ inline bool TypeRepr::isSimple() const {
   case TypeReprKind::Isolated:
   case TypeReprKind::Placeholder:
   case TypeReprKind::CompileTimeConst:
+  case TypeReprKind::ResultDependsOn:
+  case TypeReprKind::LifetimeDependentReturn:
     return true;
   }
   llvm_unreachable("bad TypeRepr kind");

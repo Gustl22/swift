@@ -1141,6 +1141,15 @@ void ASTMangler::appendExistentialLayout(
   bool DroppedRequiresClass = false;
   bool SawRequiresClass = false;
   for (auto proto : layout.getProtocols()) {
+    // Skip invertible protocols
+    //
+    // TODO: reconsituteInverses so the absence of such protocols gets mangled.
+    // I think here we need to see if any protocols inheritsFrom
+    // Copyable/Escapable, and if not, and none of those are found in the layout
+    // then it must have had an inverse.
+    if (proto->getInvertibleProtocolKind())
+      continue;
+
     // If we aren't allowed to emit marker protocols, suppress them here.
     if (!AllowMarkerProtocols && proto->isMarkerProtocol()) {
       if (proto->requiresClass())
@@ -1178,6 +1187,9 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
   switch (type->getKind()) {
     case TypeKind::TypeVariable:
       llvm_unreachable("mangling type variable");
+
+    case TypeKind::ErrorUnion:
+      llvm_unreachable("Error unions should not persist to mangling");
 
     case TypeKind::Module:
       llvm_unreachable("Cannot mangle module type yet");
@@ -1784,8 +1796,9 @@ static bool conformanceHasIdentity(const RootProtocolConformance *root) {
     return true;
   }
 
-  // Synthesized non-unique conformances all get collapsed together at run time.
-  if (conformance->isSynthesizedNonUnique())
+  // Synthesized conformances can have multiple copies, so they don't
+  // provide identity.
+  if (conformance->isSynthesized())
     return false;
 
   // Objective-C protocol conformances are checked by the ObjC runtime.
@@ -1930,14 +1943,10 @@ void ASTMangler::appendSymbolicExtendedExistentialType(
 }
 
 static llvm::Optional<char>
-getParamDifferentiability(SILParameterDifferentiability diffKind) {
-  switch (diffKind) {
-  case swift::SILParameterDifferentiability::DifferentiableOrNotApplicable:
-    return llvm::None;
-  case swift::SILParameterDifferentiability::NotDifferentiable:
+getParamDifferentiability(SILParameterInfo::Options options) {
+  if (options.contains(SILParameterInfo::NotDifferentiable))
     return 'w';
-  }
-  llvm_unreachable("bad parameter differentiability");
+  return {};
 }
 
 static char getResultConvention(ResultConvention conv) {
@@ -1953,14 +1962,10 @@ static char getResultConvention(ResultConvention conv) {
 }
 
 static llvm::Optional<char>
-getResultDifferentiability(SILResultDifferentiability diffKind) {
-  switch (diffKind) {
-  case swift::SILResultDifferentiability::DifferentiableOrNotApplicable:
-    return llvm::None;
-  case swift::SILResultDifferentiability::NotDifferentiable:
+getResultDifferentiability(SILResultInfo::Options options) {
+  if (options.contains(SILResultInfo::NotDifferentiable))
     return 'w';
-  }
-  llvm_unreachable("bad result differentiability");
+  return {};
 }
 
 void ASTMangler::appendImplFunctionType(SILFunctionType *fn,
@@ -2074,7 +2079,7 @@ void ASTMangler::appendImplFunctionType(SILFunctionType *fn,
   // Mangle the parameters.
   for (auto param : fn->getParameters()) {
     OpArgs.push_back(getParamConvention(param.getConvention()));
-    if (auto diffKind = getParamDifferentiability(param.getDifferentiability()))
+    if (auto diffKind = getParamDifferentiability(param.getOptions()))
       OpArgs.push_back(*diffKind);
     appendType(param.getInterfaceType(), sig, forDecl);
   }
@@ -2082,8 +2087,7 @@ void ASTMangler::appendImplFunctionType(SILFunctionType *fn,
   // Mangle the results.
   for (auto result : fn->getResults()) {
     OpArgs.push_back(getResultConvention(result.getConvention()));
-    if (auto diffKind =
-            getResultDifferentiability(result.getDifferentiability()))
+    if (auto diffKind = getResultDifferentiability(result.getOptions()))
       OpArgs.push_back(*diffKind);
     appendType(result.getInterfaceType(), sig, forDecl);
   }
@@ -2323,33 +2327,6 @@ void ASTMangler::appendContext(const DeclContext *ctx, StringRef useModuleName) 
     appendContext(ctx->getParent(), useModuleName);
     return;
 
-  case DeclContextKind::SerializedLocal: {
-    auto local = cast<SerializedLocalDeclContext>(ctx);
-    switch (local->getLocalDeclContextKind()) {
-    case LocalDeclContextKind::AbstractClosure:
-      appendClosureEntity(cast<SerializedAbstractClosureExpr>(local));
-      return;
-    case LocalDeclContextKind::DefaultArgumentInitializer: {
-      auto argInit = cast<SerializedDefaultArgumentInitializer>(local);
-      appendDefaultArgumentEntity(ctx->getParent(), argInit->getIndex());
-      return;
-    }
-    case LocalDeclContextKind::PatternBindingInitializer: {
-      auto patternInit = cast<SerializedPatternBindingInitializer>(local);
-      if (auto var = findFirstVariable(patternInit->getBinding())) {
-        appendInitializerEntity(var.value());
-      } else {
-        // This is incorrect in that it does not produce a /unique/ mangling,
-        // but it will at least produce a /valid/ mangling.
-        appendContext(ctx->getParent(), useModuleName);
-      }
-      return;
-    }
-    case LocalDeclContextKind::TopLevelCodeDecl:
-      return appendContext(local->getParent(), useModuleName);
-    }
-  }
-
   case DeclContextKind::GenericTypeDecl:
     appendAnyGenericType(cast<GenericTypeDecl>(ctx));
     return;
@@ -2389,6 +2366,9 @@ void ASTMangler::appendContext(const DeclContext *ctx, StringRef useModuleName) 
 
   case DeclContextKind::AbstractClosureExpr:
     return appendClosureEntity(cast<AbstractClosureExpr>(ctx));
+
+  case DeclContextKind::SerializedAbstractClosure:
+    return appendClosureEntity(cast<SerializedAbstractClosureExpr>(ctx));
 
   case DeclContextKind::AbstractFunctionDecl: {
     auto fn = cast<AbstractFunctionDecl>(ctx);
@@ -2450,6 +2430,7 @@ void ASTMangler::appendContext(const DeclContext *ctx, StringRef useModuleName) 
     llvm_unreachable("bad initializer kind");
 
   case DeclContextKind::TopLevelCodeDecl:
+  case DeclContextKind::SerializedTopLevelCodeDecl:
     // Mangle the containing module context.
     return appendContext(ctx->getParent(), useModuleName);
 
@@ -2825,8 +2806,14 @@ void ASTMangler::appendFunctionSignature(AnyFunctionType *fn,
     appendOperator("Ya");
   if (fn->isSendable())
     appendOperator("Yb");
-  if (fn->isThrowing())
-    appendOperator("K");
+  if (auto thrownError = fn->getEffectiveThrownErrorType()) {
+    if ((*thrownError)->isEqual(fn->getASTContext().getErrorExistentialType())){
+      appendOperator("K");
+    } else {
+      appendType(*thrownError, sig);
+      appendOperator("YK");
+    }
+  }
   switch (auto diffKind = fn->getDifferentiabilityKind()) {
   case DifferentiabilityKind::NonDifferentiable:
     break;
@@ -2891,7 +2878,8 @@ getParameterFlagsForMangling(ParameterTypeFlags flags,
   // `inout` should already be specified in the flags.
   case ParamSpecifier::InOut:
     return flags;
-  
+
+  case ParamSpecifier::Transferring:
   case ParamSpecifier::Consuming:
   case ParamSpecifier::Borrowing:
     // Only mangle the ownership if it diverges from the default.
@@ -3021,16 +3009,24 @@ bool ASTMangler::appendGenericSignature(GenericSignature sig,
                                         GenericSignature contextSig) {
   auto canSig = sig.getCanonicalSignature();
 
+  // FIXME: We just ignore invertible requirements for now.
+  SmallVector<Requirement, 2> reqs;
+  SmallVector<InverseRequirement, 2> inverseReqs;
+  canSig->getRequirementsWithInverses(reqs, inverseReqs);
+
   unsigned initialParamDepth;
   ArrayRef<CanTypeWrapper<GenericTypeParamType>> genericParams;
-  ArrayRef<Requirement> requirements;
-  SmallVector<Requirement, 4> requirementsBuffer;
   if (contextSig) {
     // If the signature is the same as the context signature, there's nothing
     // to do.
     if (contextSig.getCanonicalSignature() == canSig) {
       return false;
     }
+
+    // FIXME: We just ignore invertible requirements for now.
+    SmallVector<Requirement, 2> contextReqs;
+    SmallVector<InverseRequirement, 2> contextInverseReqs;
+    contextSig->getRequirementsWithInverses(contextReqs, contextInverseReqs);
 
     // The signature depth starts above the depth of the context signature.
     if (!contextSig.getGenericParams().empty()) {
@@ -3051,26 +3047,25 @@ bool ASTMangler::appendGenericSignature(GenericSignature sig,
     // have a special-case mangling for that.
     if (genericParams.empty() &&
         contextSig.getGenericParams().size() == 1 &&
-        contextSig.getRequirements().empty()) {
+        contextReqs.empty()) {
       initialParamDepth = 0;
       genericParams = canSig.getGenericParams();
-      requirements = canSig.getRequirements();
     } else {
-      requirementsBuffer = canSig.requirementsNotSatisfiedBy(contextSig);
-      requirements = requirementsBuffer;
+      llvm::erase_if(reqs, [&](Requirement req) {
+        return contextSig->isRequirementSatisfied(req);
+      });
     }
   } else {
     // Use the complete canonical signature.
     initialParamDepth = 0;
     genericParams = canSig.getGenericParams();
-    requirements = canSig.getRequirements();
   }
 
-  if (genericParams.empty() && requirements.empty())
+  if (genericParams.empty() && reqs.empty())
     return false;
 
   appendGenericSignatureParts(sig, genericParams,
-                              initialParamDepth, requirements);
+                              initialParamDepth, reqs);
   return true;
 }
 
@@ -3795,6 +3790,12 @@ void ASTMangler::appendOpParamForLayoutConstraint(LayoutConstraint layout) {
       appendOperatorParam("M", Index(layout->getTrivialSizeInBits()),
                           Index(layout->getAlignmentInBits()));
     break;
+  case LayoutConstraintKind::BridgeObject:
+    appendOperatorParam("B");
+    break;
+  case LayoutConstraintKind::TrivialStride:
+    appendOperatorParam("S", Index(layout->getTrivialSizeInBits()));
+    break;
   }
 }
 
@@ -3864,80 +3865,54 @@ void ASTMangler::appendMacroExpansionContext(
   DeclContext *outerExpansionDC;
   DeclBaseName baseName;
   unsigned discriminator;
+
+  // Determine the macro role.
   MacroRole role;
   switch (generatedSourceInfo->kind) {
-  case GeneratedSourceInfo::ExpressionMacroExpansion: {
+#define MACRO_ROLE(Name, Description)               \
+  case GeneratedSourceInfo::Name##MacroExpansion: \
+    role = MacroRole::Name;                       \
+    break;
+#include "swift/Basic/MacroRoles.def"
+
+  case GeneratedSourceInfo::PrettyPrinted:
+  case GeneratedSourceInfo::ReplacedFunctionBody:
+    return appendContext(origDC, StringRef());
+  }
+  
+  switch (generatedSourceInfo->kind) {
+  // Freestanding macros
+#define FREESTANDING_MACRO_ROLE(Name, Description) \
+  case GeneratedSourceInfo::Name##MacroExpansion:
+#define ATTACHED_MACRO_ROLE(Name, Description, MangledChar)
+#include "swift/Basic/MacroRoles.def"
+  {
     auto parent = ASTNode::getFromOpaqueValue(generatedSourceInfo->astNode);
     if (auto expr =
             cast_or_null<MacroExpansionExpr>(parent.dyn_cast<Expr *>())) {
       outerExpansionLoc = expr->getLoc();
       baseName = expr->getMacroName().getBaseName();
       discriminator = expr->getDiscriminator();
-      role = MacroRole::Expression;
       outerExpansionDC = expr->getDeclContext();
     } else {
       auto decl = cast<MacroExpansionDecl>(parent.get<Decl *>());
       outerExpansionLoc = decl->getLoc();
       baseName = decl->getMacroName().getBaseName();
       discriminator = decl->getDiscriminator();
-      role = MacroRole::Declaration;
       outerExpansionDC = decl->getDeclContext();
     }
     break;
   }
 
-  case GeneratedSourceInfo::FreestandingDeclMacroExpansion: {
-    auto expansion =
-        cast<MacroExpansionDecl>(
-          ASTNode::getFromOpaqueValue(generatedSourceInfo->astNode)
-            .get<Decl *>());
-    outerExpansionLoc = expansion->getLoc();
-    outerExpansionDC = expansion->getDeclContext();
-    discriminator = expansion->getDiscriminator();
-    role = MacroRole::Declaration;
-    baseName = expansion->getMacroName().getBaseName();
-    break;
-  }
-
-  case GeneratedSourceInfo::AccessorMacroExpansion:
-  case GeneratedSourceInfo::MemberAttributeMacroExpansion:
-  case GeneratedSourceInfo::MemberMacroExpansion:
-  case GeneratedSourceInfo::PeerMacroExpansion:
-  case GeneratedSourceInfo::ConformanceMacroExpansion:
-  case GeneratedSourceInfo::ExtensionMacroExpansion: {
+  // Attached macros
+#define FREESTANDING_MACRO_ROLE(Name, Description)
+#define ATTACHED_MACRO_ROLE(Name, Description, MangledChar)      \
+    case GeneratedSourceInfo::Name##MacroExpansion:
+#include "swift/Basic/MacroRoles.def"
+  {
     auto decl = ASTNode::getFromOpaqueValue(generatedSourceInfo->astNode)
       .get<Decl *>();
     auto attr = generatedSourceInfo->attachedMacroCustomAttr;
-
-    switch (generatedSourceInfo->kind) {
-    case GeneratedSourceInfo::AccessorMacroExpansion:
-      role = MacroRole::Accessor;
-      break;
-
-    case GeneratedSourceInfo::MemberAttributeMacroExpansion:
-      role = MacroRole::MemberAttribute;
-      break;
-
-    case GeneratedSourceInfo::MemberMacroExpansion:
-      role = MacroRole::Member;
-      break;
-
-    case GeneratedSourceInfo::PeerMacroExpansion:
-      role = MacroRole::Peer;
-      break;
-
-    case GeneratedSourceInfo::ConformanceMacroExpansion:
-      role = MacroRole::Conformance;
-      break;
-
-    case GeneratedSourceInfo::ExtensionMacroExpansion:
-      role = MacroRole::Extension;
-      break;
-
-    default:
-      llvm_unreachable("Unhandled macro role");
-    }
-
     outerExpansionLoc = decl->getLoc();
     outerExpansionDC = decl->getDeclContext();
 
@@ -3947,13 +3922,12 @@ void ASTMangler::appendMacroExpansionContext(
       baseName = ctx.getIdentifier("__unknown_macro__");
 
     discriminator = decl->getAttachedMacroDiscriminator(baseName, role, attr);
-
     break;
   }
 
   case GeneratedSourceInfo::PrettyPrinted:
   case GeneratedSourceInfo::ReplacedFunctionBody:
-    return appendContext(origDC, StringRef());
+    llvm_unreachable("Exited above");
   }
 
   // If we hit the point where the structure is represented as a DeclContext,
@@ -3973,35 +3947,18 @@ void ASTMangler::appendMacroExpansionOperator(
   appendIdentifier(macroName);
 
   switch (role) {
-  case MacroRole::Expression:
-  case MacroRole::Declaration:
-  case MacroRole::CodeItem:
+#define FREESTANDING_MACRO_ROLE(Name, Description) case MacroRole::Name:
+#define ATTACHED_MACRO_ROLE(Name, Description, MangledChar)
+#include "swift/Basic/MacroRoles.def"
     appendOperator("fMf", Index(discriminator));
     break;
 
-  case MacroRole::Accessor:
-    appendOperator("fMa", Index(discriminator));
+#define FREESTANDING_MACRO_ROLE(Name, Description)
+#define ATTACHED_MACRO_ROLE(Name, Description, MangledChar) \
+  case MacroRole::Name:                                     \
+    appendOperator("fM" MangledChar, Index(discriminator)); \
     break;
-
-  case MacroRole::MemberAttribute:
-    appendOperator("fMr", Index(discriminator));
-    break;
-
-  case MacroRole::Member:
-    appendOperator("fMm", Index(discriminator));
-    break;
-
-  case MacroRole::Peer:
-    appendOperator("fMp", Index(discriminator));
-    break;
-
-  case MacroRole::Conformance:
-    appendOperator("fMc", Index(discriminator));
-    break;
-
-  case MacroRole::Extension:
-    appendOperator("fMe", Index(discriminator));
-    break;
+#include "swift/Basic/MacroRoles.def"
   }
 }
 

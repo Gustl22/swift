@@ -30,6 +30,7 @@
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/ClangImporter/ClangImporter.h"
+#include "swift/Frontend/CASOutputBackends.h"
 #include "swift/Frontend/CachedDiagnostics.h"
 #include "swift/Frontend/DiagnosticVerifier.h"
 #include "swift/Frontend/FrontendOptions.h"
@@ -50,7 +51,7 @@
 #include "llvm/Option/ArgList.h"
 #include "llvm/Support/BLAKE3.h"
 #include "llvm/Support/HashingOutputBackend.h"
-#include "llvm/Support/Host.h"
+#include "llvm/TargetParser/Host.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualOutputBackend.h"
 
@@ -162,6 +163,10 @@ public:
 
   StringRef getTargetTriple() const {
     return LangOpts.Target.str();
+  }
+
+  bool requiresCAS() const {
+    return FrontendOpts.EnableCaching || FrontendOpts.UseCASBackend;
   }
 
   void setClangModuleCachePath(StringRef Path) {
@@ -427,6 +432,12 @@ public:
   /// fail an assert if not in that mode.
   std::string getModuleInterfaceOutputPathForWholeModule() const;
   std::string getPrivateModuleInterfaceOutputPathForWholeModule() const;
+  std::string getPackageModuleInterfaceOutputPathForWholeModule() const;
+
+  /// APIDescriptorPath only makes sense in whole module compilation mode,
+  /// so return the APIDescriptorPath when in that mode and fail an assert
+  /// if not in that mode.
+  std::string getAPIDescriptorPathForWholeModule() const;
 
 public:
   /// Given the current configuration of this frontend invocation, a set of
@@ -477,6 +488,10 @@ class CompilerInstance {
 
   /// Virtual OutputBackend.
   llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> OutputBackend = nullptr;
+
+  /// CAS OutputBackend.
+  llvm::IntrusiveRefCntPtr<swift::cas::SwiftCASOutputBackend> CASOutputBackend =
+      nullptr;
 
   /// The verification output backend.
   using HashBackendTy = llvm::vfs::HashingOutputBackend<llvm::BLAKE3>;
@@ -532,6 +547,10 @@ public:
   llvm::vfs::OutputBackend &getOutputBackend() const {
     return *OutputBackend;
   }
+  swift::cas::SwiftCASOutputBackend &getCASOutputBackend() const {
+    return *CASOutputBackend;
+  }
+
   void
   setOutputBackend(llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> Backend) {
     OutputBackend = std::move(Backend);

@@ -20,6 +20,7 @@
 #include "TypeAccessScopeChecker.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Import.h"
@@ -876,7 +877,7 @@ public:
             ty = superclass;
         return ty->getAnyNominal() == superclassDecl;
       });
-      // Sanity check: we couldn't find the superclass for whatever reason
+      // Soundness check: we couldn't find the superclass for whatever reason
       // (possibly because it's synthetic or something), so don't bother
       // checking it.
       if (superclassLocIter == inheritedEntries.end())
@@ -1280,7 +1281,7 @@ public:
   }
 
   void checkAttachedMacrosAccess(const Decl *D) {
-    for (auto customAttrC : D->getSemanticAttrs().getAttributes<CustomAttr>()) {
+    for (auto customAttrC : D->getExpandedAttrs().getAttributes<CustomAttr>()) {
       auto customAttr = const_cast<CustomAttr *>(customAttrC);
       auto *macroDecl = D->getResolvedMacro(customAttr);
       if (macroDecl) {
@@ -1610,7 +1611,7 @@ public:
             ty = superclass;
         return ty->getAnyNominal() == superclassDecl;
       });
-      // Sanity check: we couldn't find the superclass for whatever reason
+      // Soundness check: we couldn't find the superclass for whatever reason
       // (possibly because it's synthetic or something), so don't bother
       // checking it.
       if (superclassLocIter == inheritedEntries.end())
@@ -2013,6 +2014,25 @@ class DeclAvailabilityChecker : public DeclVisitor<DeclAvailabilityChecker> {
                              Where.withReason(reason), flags);
   }
 
+  /// Identify the AsyncSequence.flatMap set of functions from the
+  /// _Concurrency module.
+  static bool isAsyncSequenceFlatMap(const GenericContext *gc) {
+    auto func = dyn_cast<FuncDecl>(gc);
+    if (!func)
+      return false;
+
+    auto proto = func->getDeclContext()->getSelfProtocolDecl();
+    if (!proto ||
+        !proto->isSpecificProtocol(KnownProtocolKind::AsyncSequence))
+      return false;
+
+    ASTContext &ctx = proto->getASTContext();
+    if (func->getModuleContext()->getName() != ctx.Id_Concurrency)
+      return false;
+
+    return !func->getName().isSimpleName("flatMap");
+  }
+
   void checkGenericParams(const GenericContext *ownerCtx,
                           const ValueDecl *ownerDecl) {
     if (!ownerCtx->isGenericContext())
@@ -2030,6 +2050,13 @@ class DeclAvailabilityChecker : public DeclVisitor<DeclAvailabilityChecker> {
     }
 
     if (ownerCtx->getTrailingWhereClause()) {
+      // Ignore the where clause for AsyncSequence.flatMap from the
+      // _Concurrency module. This is an egregious hack to allow us to
+      // use overloading tricks to retain the behavior previously
+      // afforded by rethrowing conformances.
+      if (isAsyncSequenceFlatMap(ownerCtx))
+        return;
+
       forAllRequirementTypes(WhereClauseOwner(
                                const_cast<GenericContext *>(ownerCtx)),
                              [&](Type type, TypeRepr *typeRepr) {
@@ -2439,24 +2466,30 @@ void swift::diagnoseUnnecessaryPublicImports(SourceFile &SF) {
         import.accessLevel <= AccessLevel::Internal)
       continue;
 
-    AccessLevel levelUsed = SF.getMaxAccessLevelUsingImport(import);
-    if (import.accessLevel > levelUsed) {
-      auto diagId = import.accessLevel == AccessLevel::Public ?
-                                                  diag::remove_public_import :
-                                                  diag::remove_package_import;
+    // Ignore submodules as we associate decls with the top module.
+    // The top module will be reported if it's not used.
+    auto importedModule = import.module.importedModule;
+    if (importedModule->getTopLevelModule() != importedModule)
+      continue;
 
-      auto inFlight = ctx.Diags.diagnose(import.importLoc,
-                                         diagId,
-                                         import.module.importedModule);
+    AccessLevel levelUsed = SF.getMaxAccessLevelUsingImport(importedModule);
+    if (import.accessLevel <= levelUsed)
+      continue;
 
-      if (levelUsed == AccessLevel::Package) {
-        inFlight.fixItReplace(import.accessLevelRange, "package");
-      } else if (ctx.isSwiftVersionAtLeast(6)) {
-        // Let it default to internal.
-        inFlight.fixItRemove(import.accessLevelRange);
-      } else {
-        inFlight.fixItReplace(import.accessLevelRange, "internal");
-      }
+    auto diagId = import.accessLevel == AccessLevel::Public ?
+                                          diag::remove_public_import :
+                                          diag::remove_package_import;
+    auto inFlight = ctx.Diags.diagnose(import.importLoc,
+                                       diagId,
+                                       importedModule);
+
+    if (levelUsed == AccessLevel::Package) {
+      inFlight.fixItReplace(import.accessLevelRange, "package");
+    } else if (ctx.LangOpts.hasFeature(Feature::InternalImportsByDefault)) {
+      // Let it default to internal.
+      inFlight.fixItRemove(import.accessLevelRange);
+    } else {
+      inFlight.fixItReplace(import.accessLevelRange, "internal");
     }
   }
 }

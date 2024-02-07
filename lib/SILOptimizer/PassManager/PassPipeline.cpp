@@ -61,15 +61,18 @@ static llvm::cl::opt<bool> SILViewSILGenCFG(
     "sil-view-silgen-cfg", llvm::cl::init(false),
     llvm::cl::desc("Enable the sil cfg viewer pass before diagnostics"));
 
-
-llvm::cl::opt<bool> SILDisableLateOMEByDefault(
-    "sil-disable-late-ome-by-default", llvm::cl::init(false),
-    llvm::cl::desc(
-        "Disable late OME for non-transparent functions by default"));
-
 llvm::cl::opt<bool>
     EnableDestroyHoisting("enable-destroy-hoisting", llvm::cl::init(false),
                           llvm::cl::desc("Enable the DestroyHoisting pass."));
+
+llvm::cl::opt<bool>
+    EnableDeinitDevirtualizer("enable-deinit-devirtualizer", llvm::cl::init(false),
+                          llvm::cl::desc("Enable the DestroyHoisting pass."));
+
+llvm::cl::opt<bool>
+EnableLifetimeDependenceDiagnostics(
+  "enable-lifetime-dependence-diagnostics", llvm::cl::init(false),
+  llvm::cl::desc("Enable lifetime dependence diagnostics."));
 
 //===----------------------------------------------------------------------===//
 //                          Diagnostic Pass Pipeline
@@ -128,12 +131,17 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
 
   P.addAllocBoxToStack();
   P.addNoReturnFolding();
+  P.addBooleanLiteralFolding();
   addDefiniteInitialization(P);
 
   P.addAddressLowering();
 
   P.addFlowIsolation();
-  P.addSendNonSendable();
+  P.addTransferNonSendable();
+  // Lower tuple addr constructor. Eventually this can be merged into later
+  // passes. This ensures we do not need to update later passes for something
+  // that is only needed by TransferNonSendable().
+  P.addLowerTupleAddrConstructor();
 
   // Automatic differentiation: canonicalize all differentiability witnesses
   // and `differentiable_function` instructions.
@@ -158,6 +166,14 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
 
   // Check noImplicitCopy and move only types for objects and addresses.
   P.addMoveOnlyChecker();
+
+  // Check ~Escapable.
+  if (EnableLifetimeDependenceDiagnostics) {
+    P.addLifetimeDependenceDiagnostics();
+  }
+  if (EnableDeinitDevirtualizer)
+    P.addDeinitDevirtualizer();
+
   // Lower move only wrapped trivial types.
   P.addTrivialMoveOnlyTypeEliminator();
   // Check no uses after consume operator of a value in an address.
@@ -240,7 +256,19 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
 
   P.addMandatoryPerformanceOptimizations();
   P.addOnoneSimplification();
+  P.addAllocVectorLowering();
   P.addInitializeStaticGlobals();
+
+  // MandatoryPerformanceOptimizations might create specializations that are not
+  // used, and by being unused they are might have unspecialized applies.
+  // Eliminate them via the DeadFunctionAndGlobalElimination in embedded Swift
+  // to avoid getting metadata/existential use errors in them. We don't want to
+  // run this pass in regular Swift: Even unused functions are expected to be
+  // available in debug (-Onone) builds for debugging and development purposes.
+  if (P.getOptions().EmbeddedSwift) {
+    P.addDeadFunctionAndGlobalElimination();
+  }
+
   P.addPerformanceDiagnostics();
 }
 
@@ -427,16 +455,6 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   // Cleanup, which is important if the inliner has restarted the pass pipeline.
   P.addPerformanceConstantPropagation();
 
-  if (!P.getOptions().EnableOSSAModules && !SILDisableLateOMEByDefault) {
-    if (P.getOptions().StopOptimizationBeforeLoweringOwnership)
-      return;
-
-    if (SILPrintFinalOSSAModule) {
-      addModulePrinterPipeline(P, "SIL Print Final OSSA Module");
-    }
-    P.addNonTransparentFunctionOwnershipModelEliminator();
-  }
-
   addSimplifyCFGSILCombinePasses(P);
 
   P.addArrayElementPropagation();
@@ -481,13 +499,21 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   }
   P.addARCSequenceOpts();
 
-  if (P.getOptions().EnableOSSAModules) {
-    // We earlier eliminated ownership if we are not compiling the stdlib. Now
-    // handle the stdlib functions, re-simplifying, eliminating ARC as we do.
-    if (P.getOptions().CopyPropagation != CopyPropagationOption::Off) {
-      P.addCopyPropagation();
+  // We earlier eliminated ownership if we are not compiling the stdlib. Now
+  // handle the stdlib functions, re-simplifying, eliminating ARC as we do.
+  if (P.getOptions().CopyPropagation != CopyPropagationOption::Off) {
+    P.addCopyPropagation();
+  }
+  P.addSemanticARCOpts();
+
+  if (!P.getOptions().EnableOSSAModules) {
+    if (P.getOptions().StopOptimizationBeforeLoweringOwnership)
+      return;
+
+    if (SILPrintFinalOSSAModule) {
+      addModulePrinterPipeline(P, "SIL Print Final OSSA Module");
     }
-    P.addSemanticARCOpts();
+    P.addNonTransparentFunctionOwnershipModelEliminator();
   }
 
   switch (OpLevel) {
@@ -615,16 +641,6 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
   // This unblocks many other passes' optimizations (e.g. inlining) and this is
   // not blocked by any other passes' optimizations, so do it early.
   P.addDifferentiabilityWitnessDevirtualizer();
-
-  if (!P.getOptions().EnableOSSAModules && SILDisableLateOMEByDefault) {
-    if (P.getOptions().StopOptimizationBeforeLoweringOwnership)
-      return;
-
-    if (SILPrintFinalOSSAModule) {
-      addModulePrinterPipeline(P, "SIL Print Final OSSA Module");
-    }
-    P.addNonTransparentFunctionOwnershipModelEliminator();
-  }
 
   // Start by linking in referenced functions from other modules.
   P.addPerformanceSILLinker();

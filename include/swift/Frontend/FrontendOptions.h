@@ -14,15 +14,17 @@
 #define SWIFT_FRONTEND_FRONTENDOPTIONS_H
 
 #include "swift/Basic/FileTypes.h"
-#include "swift/Basic/Version.h"
 #include "swift/Basic/PathRemapper.h"
+#include "swift/Basic/Version.h"
 #include "swift/Frontend/FrontendInputsAndOutputs.h"
 #include "swift/Frontend/InputFile.h"
+#include "clang/CAS/CASOptions.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringMap.h"
-#include "clang/CAS/CASOptions.h"
+#include "llvm/MC/MCTargetOptions.h"
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -147,6 +149,18 @@ public:
 
   /// CacheKey for input file.
   std::string InputFileKey;
+
+  /// Enable using the LLVM MCCAS backend for object file output.
+  bool UseCASBackend = false;
+
+  /// The output mode for the CAS Backend.
+  llvm::CASBackendMode CASObjMode;
+
+  /// Emit a .casid file next to the object file if CAS Backend is used.
+  bool EmitCASIDFile = false;
+
+  /// CacheReplay PrefixMap.
+  std::vector<std::string> CacheReplayPrefixMap;
 
   /// Number of retry opening an input file if the previous opening returns
   /// bad file descriptor error.
@@ -321,9 +335,8 @@ public:
   /// times) when compiling a module interface?
   bool SerializeModuleInterfaceDependencyHashes = false;
 
-  /// Should we only serialize decls that may be referenced externally in the
-  /// binary module?
-  bool SerializeExternalDeclsOnly = false;
+  /// Should we skip decls that cannot be referenced externally?
+  bool SkipNonExportableDecls = false;
 
   /// Should we warn if an imported module needed to be rebuilt from a
   /// module interface file?
@@ -401,6 +414,9 @@ public:
   /// dead-stripping optimizations assuming that all users of library code
   /// are present at LTO time.
   bool HermeticSealAtLink = false;
+
+  /// Disable using the sandbox when executing subprocesses.
+  bool DisableSandbox = false;
 
   /// The different modes for validating TBD against the LLVM IR.
   enum class TBDValidationMode {
@@ -566,6 +582,7 @@ private:
   static bool canActionEmitModuleSummary(ActionType);
   static bool canActionEmitInterface(ActionType);
   static bool canActionEmitABIDescriptor(ActionType);
+  static bool canActionEmitAPIDescriptor(ActionType);
   static bool canActionEmitConstValues(ActionType);
   static bool canActionEmitModuleSemanticInfo(ActionType);
 

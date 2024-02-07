@@ -461,7 +461,8 @@ private:
         return true;
       }
     }
-    for (auto *customAttr : D->getOriginalAttrs().getAttributes<CustomAttr, true>()) {
+    for (auto *customAttr :
+         D->getParsedAttrs().getAttributes<CustomAttr, true>()) {
       if (auto *Repr = customAttr->getTypeRepr()) {
         if (!Repr->walk(*this))
           return false;
@@ -480,7 +481,7 @@ private:
 
   PreWalkAction walkToDeclPre(Decl *D) override {
     if (!walkCustomAttributes(D))
-      return Action::SkipChildren();
+      return Action::SkipNode();
 
     if (D->isImplicit())
       return Action::Continue();
@@ -491,7 +492,7 @@ private:
         for (auto Member : Clause.Elements)
           Member.walk(*this);
       }
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
 
     SourceLoc ContextLoc = D->getStartLoc();
@@ -1341,7 +1342,8 @@ private:
         return true;
       }
     }
-    for (auto *customAttr : D->getOriginalAttrs().getAttributes<CustomAttr, true>()) {
+    for (auto *customAttr :
+         D->getParsedAttrs().getAttributes<CustomAttr, true>()) {
       if (auto *Repr = customAttr->getTypeRepr()) {
         if (!Repr->walk(*this))
           return false;
@@ -1360,7 +1362,7 @@ private:
 
   PreWalkAction walkToDeclPre(Decl *D) override {
     if (!walkCustomAttributes(D))
-      return Action::SkipChildren();
+      return Action::SkipNode();
 
     auto Action = HandlePre(D, D->isImplicit());
     if (Action.shouldGenerateIndentContext()) {
@@ -1400,10 +1402,13 @@ private:
             Member.walk(*this);
         }
       }
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
 
-    return Action::VisitChildrenIf(Action.shouldVisitChildren());
+    // FIXME: We ought to be able to use Action::VisitChildrenIf here, but we'd
+    // need to ensure the AST is walked in source order (currently not the case
+    // for things like postfix operators).
+    return Action::VisitNodeIf(Action.shouldVisitChildren());
   }
 
   PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
@@ -1412,7 +1417,10 @@ private:
       if (auto IndentCtx = getIndentContextFrom(S, Action.Trailing))
         InnermostCtx = IndentCtx;
     }
-    return Action::VisitChildrenIf(Action.shouldVisitChildren(), S);
+    // FIXME: We ought to be able to use Action::VisitChildrenIf here, but we'd
+    // need to ensure the AST is walked in source order (currently not the case
+    // for things like postfix operators).
+    return Action::VisitNodeIf(Action.shouldVisitChildren(), S);
   }
 
   PreWalkResult<ArgumentList *>
@@ -1431,7 +1439,10 @@ private:
       if (auto Ctx = getIndentContextFrom(Args, Action.Trailing, ContextLoc))
         InnermostCtx = Ctx;
     }
-    return Action::VisitChildrenIf(Action.shouldVisitChildren(), Args);
+    // FIXME: We ought to be able to use Action::VisitChildrenIf here, but we'd
+    // need to ensure the AST is walked in source order (currently not the case
+    // for things like postfix operators).
+    return Action::VisitNodeIf(Action.shouldVisitChildren(), Args);
   }
 
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
@@ -1489,7 +1500,7 @@ private:
           StringLiteralRange =
               Lexer::getCharSourceRangeFromSourceRange(SM, E->getSourceRange());
 
-        return Action::SkipChildren(E);
+        return Action::SkipNode(E);
       }
     }
 
@@ -1500,11 +1511,14 @@ private:
           llvm::SaveAndRestore<ASTWalker::ParentTy>(Parent, EE);
           OE->walk(*this);
         }
-        return Action::SkipChildren(E);
+        return Action::SkipNode(E);
       }
     }
 
-    return Action::VisitChildrenIf(Action.shouldVisitChildren(), E);
+    // FIXME: We ought to be able to use Action::VisitChildrenIf here, but we'd
+    // need to ensure the AST is walked in source order (currently not the case
+    // for things like postfix operators).
+    return Action::VisitNodeIf(Action.shouldVisitChildren(), E);
   }
 
   PreWalkResult<Pattern *> walkToPatternPre(Pattern *P) override {
@@ -1513,7 +1527,10 @@ private:
       if (auto IndentCtx = getIndentContextFrom(P, Action.Trailing))
         InnermostCtx = IndentCtx;
     }
-    return Action::VisitChildrenIf(Action.shouldVisitChildren(), P);
+    // FIXME: We ought to be able to use Action::VisitChildrenIf here, but we'd
+    // need to ensure the AST is walked in source order (currently not the case
+    // for things like postfix operators).
+    return Action::VisitNodeIf(Action.shouldVisitChildren(), P);
   }
 
   PreWalkAction walkToTypeReprPre(TypeRepr *T) override {
@@ -1522,7 +1539,10 @@ private:
       if (auto IndentCtx = getIndentContextFrom(T, Action.Trailing))
         InnermostCtx = IndentCtx;
     }
-    return Action::VisitChildrenIf(Action.shouldVisitChildren());
+    // FIXME: We ought to be able to use Action::VisitChildrenIf here, but we'd
+    // need to ensure the AST is walked in source order (currently not the case
+    // for things like postfix operators).
+    return Action::VisitNodeIf(Action.shouldVisitChildren());
   }
 
   PostWalkAction walkToDeclPost(Decl *D) override {

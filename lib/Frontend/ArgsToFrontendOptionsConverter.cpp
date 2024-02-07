@@ -22,7 +22,7 @@
 #include "swift/Parse/Lexer.h"
 #include "swift/Strings.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/Triple.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/CAS/ObjectStore.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
@@ -270,14 +270,13 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.CASFSRootIDs = Args.getAllArgValues(OPT_cas_fs);
   Opts.ClangIncludeTrees = Args.getAllArgValues(OPT_clang_include_tree_root);
   Opts.InputFileKey = Args.getLastArgValue(OPT_input_file_key);
+  Opts.CacheReplayPrefixMap = Args.getAllArgValues(OPT_cache_replay_prefix_map);
 
   if (Opts.EnableCaching && Opts.CASFSRootIDs.empty() &&
       Opts.ClangIncludeTrees.empty() &&
       FrontendOptions::supportCompilationCaching(Opts.RequestedAction)) {
-    if (!Args.hasArg(OPT_allow_unstable_cache_key_for_testing)) {
-        Diags.diagnose(SourceLoc(), diag::error_caching_no_cas_fs);
-        return true;
-    }
+    Diags.diagnose(SourceLoc(), diag::error_caching_no_cas_fs);
+    return true;
   }
 
   if (FrontendOptions::doesActionGenerateIR(Opts.RequestedAction)) {
@@ -319,8 +318,28 @@ bool ArgsToFrontendOptionsConverter::convert(
         A->getOption().matches(OPT_serialize_debugging_options);
   }
 
-  Opts.SerializeExternalDeclsOnly |=
-      Args.hasArg(OPT_experimental_serialize_external_decls_only);
+  if (Args.hasArg(OPT_enable_library_evolution)) {
+    Opts.SkipNonExportableDecls |=
+        Args.hasArg(OPT_experimental_skip_non_exportable_decls);
+
+    Opts.SkipNonExportableDecls |=
+        Args.hasArg(OPT_experimental_skip_non_inlinable_function_bodies) &&
+        Args.hasArg(
+            OPT_experimental_skip_non_inlinable_function_bodies_is_lazy);
+  } else {
+    if (Args.hasArg(OPT_experimental_skip_non_exportable_decls))
+      Diags.diagnose(SourceLoc(), diag::ignoring_option_requires_option,
+                     "-experimental-skip-non-exportable-decls",
+                     "-enable-library-evolution");
+  }
+
+  // HACK: The driver currently erroneously passes all flags to module interface
+  // verification jobs. -experimental-skip-non-exportable-decls is not
+  // appropriate for verification tasks and should be ignored, though.
+  if (Opts.RequestedAction ==
+      FrontendOptions::ActionType::TypecheckModuleFromInterface)
+    Opts.SkipNonExportableDecls = false;
+
   Opts.DebugPrefixSerializedDebuggingOptions |=
       Args.hasArg(OPT_prefix_serialized_debugging_options);
   Opts.EnableSourceImport |= Args.hasArg(OPT_enable_source_import);
@@ -382,6 +401,19 @@ bool ArgsToFrontendOptionsConverter::convert(
   for (auto A : Args.getAllArgValues(options::OPT_block_list_file)) {
     Opts.BlocklistConfigFilePaths.push_back(A);
   }
+
+  if (Arg *A = Args.getLastArg(OPT_cas_backend_mode)) {
+    Opts.CASObjMode = llvm::StringSwitch<llvm::CASBackendMode>(A->getValue())
+                          .Case("native", llvm::CASBackendMode::Native)
+                          .Case("casid", llvm::CASBackendMode::CASID)
+                          .Case("verify", llvm::CASBackendMode::Verify)
+                          .Default(llvm::CASBackendMode::Native);
+  }
+
+  Opts.UseCASBackend = Args.hasArg(OPT_cas_backend);
+  Opts.EmitCASIDFile = Args.hasArg(OPT_cas_emit_casid_file);
+
+  Opts.DisableSandbox = Args.hasArg(OPT_disable_sandbox);
 
   return false;
 }
@@ -728,12 +760,12 @@ bool ArgsToFrontendOptionsConverter::checkBuildFromInterfaceOnlyOptions()
 bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
     const {
   if (!FrontendOptions::canActionEmitDependencies(Opts.RequestedAction) &&
-      Opts.InputsAndOutputs.hasDependenciesPath()) {
+      Opts.InputsAndOutputs.hasDependenciesFilePath()) {
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_dependencies);
     return true;
   }
   if (!FrontendOptions::canActionEmitReferenceDependencies(Opts.RequestedAction)
-      && Opts.InputsAndOutputs.hasReferenceDependenciesPath()) {
+      && Opts.InputsAndOutputs.hasReferenceDependenciesFilePath()) {
     Diags.diagnose(SourceLoc(),
                    diag::error_mode_cannot_emit_reference_dependencies);
     return true;
@@ -764,6 +796,11 @@ bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_abi_descriptor);
     return true;
   }
+  if (!FrontendOptions::canActionEmitAPIDescriptor(Opts.RequestedAction) &&
+      Opts.InputsAndOutputs.hasAPIDescriptorOutputPath()) {
+    Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_api_descriptor);
+    return true;
+  }
   if (!FrontendOptions::canActionEmitConstValues(Opts.RequestedAction) &&
       Opts.InputsAndOutputs.hasConstValuesOutputPath()) {
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_const_values);
@@ -782,7 +819,8 @@ bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
    }
   if (!FrontendOptions::canActionEmitInterface(Opts.RequestedAction) &&
       (Opts.InputsAndOutputs.hasModuleInterfaceOutputPath() ||
-       Opts.InputsAndOutputs.hasPrivateModuleInterfaceOutputPath())) {
+       Opts.InputsAndOutputs.hasPrivateModuleInterfaceOutputPath() ||
+        Opts.InputsAndOutputs.hasPackageModuleInterfaceOutputPath())) {
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_interface);
     return true;
   }

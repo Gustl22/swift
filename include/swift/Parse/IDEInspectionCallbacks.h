@@ -170,10 +170,6 @@ public:
   /// is completing after set as its base.
   virtual void completePostfixExpr(CodeCompletionExpr *E, bool hasSpace){};
 
-  /// Complete a given expr-postfix, given that there is a following
-  /// left parenthesis.
-  virtual void completePostfixExprParen(Expr *E, Expr *CodeCompletionE) {};
-
   /// Complete the argument to an Objective-C #keyPath
   /// expression.
   ///
@@ -184,6 +180,13 @@ public:
 
   /// Complete the beginning of the type of result of func/var/let/subscript.
   virtual void completeTypeDeclResultBeginning() {};
+
+  /// Same as `completeTypeSimpleOrComposition` but also allows `repeat`.
+  virtual void completeTypeBeginning(){};
+
+  /// Same as `completeTypeSimpleBeginning` but also allows `any`, `some` and
+  /// `each`.
+  virtual void completeTypeSimpleOrComposition(){};
 
   /// Complete the beginning of type-simple -- no tokens provided
   /// by user.
@@ -243,7 +246,7 @@ public:
   virtual void completeUnresolvedMember(CodeCompletionExpr *E,
                                         SourceLoc DotLoc) {};
 
-  virtual void completeCallArg(CodeCompletionExpr *E, bool isFirst) {};
+  virtual void completeCallArg(CodeCompletionExpr *E) {};
 
   virtual bool canPerformCompleteLabeledTrailingClosure() const {
     return false;

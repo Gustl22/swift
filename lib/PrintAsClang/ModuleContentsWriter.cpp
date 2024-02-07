@@ -61,7 +61,7 @@ class ReferencedTypeFinder : public TypeDeclFinder {
 
   Action visitNominalType(NominalType *nominal) override {
     Callback(*this, nominal->getDecl());
-    return Action::SkipChildren;
+    return Action::SkipNode;
   }
 
   Action visitTypeAliasType(TypeAliasType *aliasTy) override {
@@ -71,7 +71,7 @@ class ReferencedTypeFinder : public TypeDeclFinder {
     } else {
       Type(aliasTy->getSinglyDesugaredType()).walk(*this);
     }
-    return Action::SkipChildren;
+    return Action::SkipNode;
   }
 
   /// Returns true if \p paramTy has any constraints other than being
@@ -103,7 +103,7 @@ class ReferencedTypeFinder : public TypeDeclFinder {
       argTy.walk(*this);
       NeedsDefinition = false;
     });
-    return Action::SkipChildren;
+    return Action::SkipNode;
   }
 
 public:
@@ -130,7 +130,7 @@ class ModuleWriter {
   llvm::DenseMap<const TypeDecl *, std::pair<EmissionState, bool>> seenTypes;
   llvm::DenseSet<const clang::Type *> seenClangTypes;
   std::vector<const Decl *> declsToWrite;
-  DelayedMemberSet delayedMembers;
+  DelayedMemberSet objcDelayedMembers;
   CxxDeclEmissionScope topLevelEmissionScope;
   PrimitiveTypeMapping typeMapping;
   std::string outOfLineDefinitions;
@@ -147,7 +147,7 @@ public:
                OutputLanguageMode outputLang)
       : os(os), imports(imports), M(mod),
         outOfLineDefinitionsOS(outOfLineDefinitions),
-        printer(M, os, prologueOS, outOfLineDefinitionsOS, delayedMembers,
+        printer(M, os, prologueOS, outOfLineDefinitionsOS, objcDelayedMembers,
                 topLevelEmissionScope, typeMapping, interopContext, access,
                 requiresExposedAttribute, exposedModules, outputLang),
         outputLangMode(outputLang) {}
@@ -326,7 +326,8 @@ public:
         (void)addImport(CD);
       }
     } else if (auto PD = dyn_cast<ProtocolDecl>(TD)) {
-      forwardDeclare(PD);
+      if (!PD->isMarkerProtocol())
+        forwardDeclare(PD);
     } else if (auto TAD = dyn_cast<TypeAliasDecl>(TD)) {
       bool imported = false;
       if (TAD->hasClangNode())
@@ -439,7 +440,7 @@ public:
 
       if (needsToBeIndividuallyDelayed) {
         assert(isa<ClassDecl>(container));
-        delayedMembers.insert(VD);
+        objcDelayedMembers.insert(VD);
       }
     }
 
@@ -795,16 +796,18 @@ public:
       }
     }
 
-    if (!delayedMembers.empty()) {
-      auto groupBegin = delayedMembers.begin();
-      for (auto i = groupBegin, e = delayedMembers.end(); i != e; ++i) {
-        if ((*i)->getDeclContext() != (*groupBegin)->getDeclContext()) {
-          printer.printAdHocCategory(make_range(groupBegin, i));
-          groupBegin = i;
+    if (outputLangMode == OutputLanguageMode::ObjC)
+      if (!objcDelayedMembers.empty()) {
+        auto groupBegin = objcDelayedMembers.begin();
+        for (auto i = groupBegin, e = objcDelayedMembers.end(); i != e; ++i) {
+          if ((*i)->getDeclContext() != (*groupBegin)->getDeclContext()) {
+            printer.printAdHocCategory(make_range(groupBegin, i));
+            groupBegin = i;
+          }
         }
+        printer.printAdHocCategory(
+            make_range(groupBegin, objcDelayedMembers.end()));
       }
-      printer.printAdHocCategory(make_range(groupBegin, delayedMembers.end()));
-    }
 
     // Print any out of line definitions.
     os << outOfLineDefinitionsOS.str();

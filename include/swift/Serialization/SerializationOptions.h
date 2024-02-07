@@ -157,7 +157,8 @@ namespace swift {
     bool HermeticSealAtLink = false;
     bool EmbeddedSwiftModule = false;
     bool IsOSSA = false;
-    bool SerializeExternalDeclsOnly = false;
+    bool SkipNonExportableDecls = false;
+    bool ExplicitModuleBuild = false;
   };
 
 } // end namespace swift

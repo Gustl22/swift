@@ -98,18 +98,6 @@ function(add_sourcekit_swift_runtime_link_flags target path HAS_SWIFT_MODULES)
         message(FATAL_ERROR "Unknown ASKD_BOOTSTRAPPING_MODE '${ASKD_BOOTSTRAPPING_MODE}'")
       endif()
 
-      # Workaround to make lldb happy: we have to explicitly add all swift compiler modules
-      # to the linker command line.
-      set(swift_ast_path_flags "-Wl")
-      get_property(modules GLOBAL PROPERTY swift_compiler_modules)
-      foreach(module ${modules})
-        get_target_property(module_file "SwiftModule${module}" "module_file")
-        string(APPEND swift_ast_path_flags ",-add_ast_path,${module_file}")
-      endforeach()
-
-      set_property(TARGET ${target} APPEND_STRING PROPERTY
-                   LINK_FLAGS " ${swift_ast_path_flags} ")
-
       # Workaround for a linker crash related to autolinking: rdar://77839981
       set_property(TARGET ${target} APPEND_STRING PROPERTY
                    LINK_FLAGS " -lobjc ")
@@ -235,7 +223,7 @@ macro(add_sourcekit_library name)
     set(libkind)
   endif()
   add_library(${name} ${libkind} ${srcs})
-  if(NOT SWIFT_BUILT_STANDALONE AND NOT CMAKE_C_COMPILER_ID MATCHES Clang)
+  if(NOT SWIFT_BUILT_STANDALONE AND SOURCEKIT_SWIFT_SWAP_COMPILER)
     add_dependencies(${name} clang)
   endif()
   llvm_update_compile_flags(${name})
@@ -325,7 +313,7 @@ macro(add_sourcekit_executable name)
     "${SOURCEKIT_EXECUTABLE_multiple_parameter_options}" ${ARGN})
 
   add_executable(${name} ${SOURCEKITEXE_UNPARSED_ARGUMENTS})
-  if(NOT SWIFT_BUILT_STANDALONE AND NOT CMAKE_C_COMPILER_ID MATCHES Clang)
+  if(NOT SWIFT_BUILT_STANDALONE AND SOURCEKIT_SWIFT_SWAP_COMPILER)
     add_dependencies(${name} clang)
   endif()
   llvm_update_compile_flags(${name})

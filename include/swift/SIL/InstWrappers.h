@@ -254,10 +254,15 @@ public:
   ValueOwnershipKind getForwardingOwnershipKind();
   bool preservesOwnership();
 
+  // ForwardingInstruction.swift mirrors this implementation.
   Operand *getSingleForwardingOperand() const {
     switch (forwardingInst->getKind()) {
-    case SILInstructionKind::StructInst:
     case SILInstructionKind::TupleInst:
+    case SILInstructionKind::StructInst: {
+      if (forwardingInst->getNumRealOperands() != 1)
+        return nullptr;
+      return *forwardingInst->getRealOperands().begin();
+    }
     case SILInstructionKind::LinearFunctionInst:
     case SILInstructionKind::DifferentiableFunctionInst:
       return nullptr;
@@ -268,9 +273,6 @@ public:
         &forwardingInst->getOperandRef(RefToBridgeObjectInst::ConvertedOperand);
     case SILInstructionKind::TuplePackExtractInst:
       return &forwardingInst->getOperandRef(TuplePackExtractInst::TupleOperand);
-    case SILInstructionKind::SelectEnumInst:
-      // ignore trailing case operands
-      return &forwardingInst->getOperandRef(0);
     default:
       int numRealOperands = forwardingInst->getNumRealOperands();
       if (numRealOperands == 0) {

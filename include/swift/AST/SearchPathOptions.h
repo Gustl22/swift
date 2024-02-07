@@ -19,6 +19,8 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/Optional.h"
+#include "llvm/ADT/None.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/VirtualFileSystem.h"
 
@@ -461,6 +463,9 @@ public:
   /// Don't look in for compiler-provided modules.
   bool SkipRuntimeLibraryImportPaths = false;
 
+  /// Scanner Prefix Mapper.
+  std::vector<std::string> ScannerPrefixMapper;
+
   /// When set, don't validate module system dependencies.
   ///
   /// If a system header is modified and this is not set, the compiler will
@@ -550,6 +555,8 @@ public:
   llvm::hash_code getModuleScanningHashComponents() const {
     return getPCHHashComponents();
   }
+
+  void dump(bool isDarwin) const;
 };
 }
 

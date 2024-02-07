@@ -28,7 +28,13 @@ public class Argument : Value, Hashable {
   public var index: Int {
     return parentBlock.arguments.firstIndex(of: self)!
   }
-  
+
+  public var isReborrow: Bool { bridged.isReborrow() }
+
+  public var varDecl: VarDecl? {
+    VarDecl(bridged: bridged.getVarDecl())
+  }
+
   public static func ==(lhs: Argument, rhs: Argument) -> Bool {
     lhs === rhs
   }
@@ -50,6 +56,10 @@ final public class FunctionArgument : Argument {
   public var isIndirectResult: Bool {
     return index < parentFunction.numIndirectResultArguments
   }
+
+  public var hasResultDependsOn : Bool {
+    return bridged.hasResultDependsOn()
+  }
 }
 
 public struct Phi {
@@ -64,7 +74,19 @@ public struct Phi {
     guard term is BranchInst || term is CondBranchInst else { return nil }
     self.value = argument
   }
-  
+
+  public init?(using operand: Operand) {
+    switch operand.instruction {
+    case let br as BranchInst:
+      self.init(br.getArgument(for: operand))
+    case let condBr as CondBranchInst:
+      guard let arg = condBr.getArgument(for: operand) else { return nil }
+      self.init(arg)
+    default:
+      return nil
+    }
+  }
+
   public var predecessors: PredecessorList {
     return value.parentBlock.predecessors
   }
@@ -73,28 +95,37 @@ public struct Phi {
     return value.parentBlock
   }
 
-  public var incomingOperands: LazyMapSequence<PredecessorList, Operand> {
+  public func incomingOperand(inPredecessor predecessor: BasicBlock)
+  -> Operand {
     let blockArgIdx = value.index
-    return predecessors.lazy.map {
-      switch $0.terminator {
-        case let br as BranchInst:
-          return br.operands[blockArgIdx]
-        case let condBr as CondBranchInst:
-          if condBr.trueBlock == successor {
-            assert(condBr.falseBlock != successor)
-            return condBr.trueOperands[blockArgIdx]
-          } else {
-            assert(condBr.falseBlock == successor)
-            return condBr.falseOperands[blockArgIdx]
-          }
-        default:
-          fatalError("wrong terminator for phi-argument")
+    switch predecessor.terminator {
+    case let br as BranchInst:
+      return br.operands[blockArgIdx]
+    case let condBr as CondBranchInst:
+      if condBr.trueBlock == successor {
+        assert(condBr.falseBlock != successor)
+        return condBr.trueOperands[blockArgIdx]
+      } else {
+        assert(condBr.falseBlock == successor)
+        return condBr.falseOperands[blockArgIdx]
       }
+    default:
+      fatalError("wrong terminator for phi-argument")
     }
+  }
+
+  public var incomingOperands: LazyMapSequence<PredecessorList, Operand> {
+    predecessors.lazy.map { incomingOperand(inPredecessor: $0) }
   }
 
   public var incomingValues: LazyMapSequence<LazyMapSequence<PredecessorList, Operand>, Value> {
     incomingOperands.lazy.map { $0.value }
+  }
+
+  public var isReborrow: Bool { value.isReborrow }
+
+  public var endsLifetime: Bool {
+    value.ownership == .owned || value.isReborrow
   }
 
   public static func ==(lhs: Phi, rhs: Phi) -> Bool {
@@ -140,7 +171,114 @@ public struct TerminatorResult {
   }
 }
 
-public enum ArgumentConvention {
+/// ArgumentConventions indexed on a SIL function's argument index.
+/// When derived from an ApplySite, this corresponds to the callee index.
+public struct ArgumentConventions : Collection, CustomStringConvertible {
+  public let originalFunctionConvention: FunctionConvention
+  public let substitutedFunctionConvention: FunctionConvention?
+
+  /// Indirect results including the error result. Apply type
+  /// substitution if it is available.
+  public var indirectSILResults: LazyFilterSequence<FunctionConvention.Results> {
+    if let substitutedFunctionConvention {
+      return substitutedFunctionConvention.indirectSILResults
+    }
+    return originalFunctionConvention.indirectSILResults
+  }
+
+  /// Number of SIL arguments for the function type's results
+  /// including the error result. Use this to avoid lazy iteration.
+  var indirectSILResultCount: Int {
+    originalFunctionConvention.indirectSILResultCount
+  }
+
+  public var originalParameters: FunctionConvention.Parameters {
+    originalFunctionConvention.parameters
+  }
+
+  public var parameters: FunctionConvention.Parameters {
+    if let substitutedFunctionConvention {
+      return substitutedFunctionConvention.parameters
+    }
+    return originalFunctionConvention.parameters
+  }
+
+  public var startIndex: Int { 0 }
+
+  public var endIndex: Int { firstParameterIndex + parameters.count }
+
+  public func index(after index: Int) -> Int {
+    return index + 1
+  }
+
+  public subscript(_ index: Int) -> ArgumentConvention {
+    if index >= firstParameterIndex {
+      return parameters[index - indirectSILResultCount].convention
+    }
+    return ArgumentConvention(result: indirectSILResults[index].convention)
+  }
+
+  /// The SIL argument index of the function type's first parameter.
+  var firstParameterIndex: Int { indirectSILResultCount }
+
+  /// The SIL argument index of the 'self' paramter.
+  var selfIndex: Int? {
+    guard originalFunctionConvention.hasSelfParameter else { return nil }
+    // self is the last parameter
+    return endIndex - 1
+  }
+
+  public var description: String {
+    var str = String(taking: originalFunctionConvention.bridgedFunctionType.getDebugDescription())
+    if let substitutedFunctionConvention {
+      str += "\n" + String(taking: substitutedFunctionConvention.bridgedFunctionType.getDebugDescription())
+    }
+    indirectSILResults.forEach {
+      str += "\nindirect result: " + $0.description
+    }
+    parameters.forEach {
+      str += "\n      parameter: " + $0.description
+    }
+    return str
+  }
+}
+
+public struct YieldConventions : Collection, CustomStringConvertible {
+  public let originalFunctionConvention: FunctionConvention
+  public let substitutedFunctionConvention: FunctionConvention?
+
+  public var yields: FunctionConvention.Yields {
+    if let substitutedFunctionConvention {
+      return substitutedFunctionConvention.yields
+    }
+    return originalFunctionConvention.yields
+  }
+
+  public var startIndex: Int { 0 }
+
+  public var endIndex: Int { yields.count }
+
+  public func index(after index: Int) -> Int {
+    return index + 1
+  }
+
+  public subscript(_ index: Int) -> ArgumentConvention {
+    return yields[index].convention
+  }
+
+  public var description: String {
+    var str = String(taking: originalFunctionConvention.bridgedFunctionType.getDebugDescription())
+    if let substitutedFunctionConvention {
+      str += "\n" + String(taking: substitutedFunctionConvention.bridgedFunctionType.getDebugDescription())
+    }
+    yields.forEach {
+      str += "\n      yield: " + $0.description
+    }
+    return str
+  }
+}
+
+public enum ArgumentConvention : CustomStringConvertible {
   /// This argument is passed indirectly, i.e. by directly passing the address
   /// of an object in memory.  The callee is responsible for destroying the
   /// object.  The callee may assume that the address does not alias any valid
@@ -204,6 +342,19 @@ public enum ArgumentConvention {
   /// callee; within the callee, they are individually treated like
   /// indirectOut arguments.
   case packOut
+
+  public init(result: ResultConvention) {
+    switch result {
+    case .indirect:
+      self = .indirectOut
+    case .owned:
+      self = .directOwned
+    case .unowned, .unownedInnerPointer, .autoreleased:
+      self = .directUnowned
+    case .pack:
+      self = .packOut
+    }
+  }
 
   public var isIndirect: Bool {
     switch self {
@@ -290,6 +441,35 @@ public enum ArgumentConvention {
       return false
     }
   }
+
+  public var description: String {
+    switch self {
+    case .indirectIn:
+      return "indirectIn"
+    case .indirectInGuaranteed:
+      return "indirectInGuaranteed"
+    case .indirectInout:
+      return "indirectInout"
+    case .indirectInoutAliasable:
+      return "indirectInoutAliasable"
+    case .indirectOut:
+      return "indirectOut"
+    case .directOwned:
+      return "directOwned"
+    case .directUnowned:
+      return "directUnowned"
+    case .directGuaranteed:
+      return "directGuaranteed"
+    case .packInout:
+      return "packInout"
+    case .packOwned:
+      return "packOwned"
+    case .packGuaranteed:
+      return "packGuaranteed"
+    case .packOut:
+      return "packOut"
+    }
+  }
 }
 
 // Bridging utilities
@@ -316,6 +496,25 @@ extension BridgedArgumentConvention {
       case .Pack_Guaranteed:         return .packGuaranteed
       default:
         fatalError("unsupported argument convention")
+    }
+  }
+}
+
+extension ArgumentConvention {
+  var bridged: BridgedArgumentConvention {
+    switch self {
+      case .indirectIn:             return .Indirect_In
+      case .indirectInGuaranteed:   return .Indirect_In_Guaranteed
+      case .indirectInout:          return .Indirect_Inout
+      case .indirectInoutAliasable: return .Indirect_InoutAliasable
+      case .indirectOut:            return .Indirect_Out
+      case .directOwned:            return .Direct_Owned
+      case .directUnowned:          return .Direct_Unowned
+      case .directGuaranteed:       return .Direct_Guaranteed
+      case .packOut:                return .Pack_Out
+      case .packInout:              return .Pack_Inout
+      case .packOwned:              return .Pack_Owned
+      case .packGuaranteed:         return .Pack_Guaranteed
     }
   }
 }

@@ -125,6 +125,9 @@ public:
   /// What kind of debug info to generate.
   IRGenDebugInfoFormat DebugInfoFormat = IRGenDebugInfoFormat::None;
 
+  /// DWARF output format version number.
+  std::optional<uint8_t> DWARFVersion;
+
   /// Whether or not the driver should generate a module.
   bool ShouldGenerateModule = false;
 
@@ -149,6 +152,8 @@ public:
   std::string SDKPath;
 
   OptionSet<SanitizerKind> SelectedSanitizers;
+
+  unsigned SanitizerUseStableABI = 0;
 
   /// Might this sort of compile have explicit primary inputs?
   /// When running a single compile for the whole module (in other words
@@ -178,7 +183,8 @@ public:
     SymbolGraph,     // swift-symbolgraph
     APIExtract,      // swift-api-extract
     APIDigester,     // swift-api-digester
-    CacheTool        // swift-cache-tool
+    CacheTool,       // swift-cache-tool
+    ParseTest,       // swift-parse-test
   };
 
   class InputInfoMap;
@@ -323,12 +329,9 @@ public:
   /// \param[out] TopLevelActions The main Actions to build Jobs for.
   /// \param TC the default host tool chain.
   /// \param OI The OutputInfo for which Actions should be generated.
-  /// \param OutOfDateMap If present, information used to decide which files
-  /// need to be rebuilt.
   /// \param C The Compilation to which Actions should be added.
   void buildActions(SmallVectorImpl<const Action *> &TopLevelActions,
                     const ToolChain &TC, const OutputInfo &OI,
-                    const InputInfoMap *OutOfDateMap,
                     Compilation &C) const;
 
   /// Construct the OutputFileMap for the driver from the given arguments.

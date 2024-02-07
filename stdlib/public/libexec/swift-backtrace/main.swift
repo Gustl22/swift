@@ -13,7 +13,7 @@
 #if (os(macOS) || os(Linux)) && (arch(x86_64) || arch(arm64))
 
 #if canImport(Darwin)
-import Darwin.C
+import Darwin
 #elseif canImport(Glibc)
 import Glibc
 #elseif canImport(CRT)
@@ -111,6 +111,38 @@ internal struct SwiftBacktrace {
     if flush {
       stream.flush()
     }
+  }
+
+  static func subtract(timespec ts: timespec, from: timespec) -> timespec {
+    var sec = from.tv_sec - ts.tv_sec
+    var nsec = from.tv_nsec - ts.tv_nsec
+    if nsec < 0 {
+      sec -= 1
+      nsec += 1000000000
+    }
+    return timespec(tv_sec: sec, tv_nsec: nsec)
+  }
+
+  // We can't use Foundation here, so there's no String(format:, ...)
+  static func format(duration: timespec) -> String {
+    let centisRounded = (duration.tv_nsec + 5000000) / 10000000
+    let centis = centisRounded % 100
+    let secs = duration.tv_sec + (centisRounded / 100)
+    let d1 = centis / 10
+    let d2 = centis % 10
+
+    return "\(secs).\(d1)\(d2)"
+  }
+
+  static func measureDuration(_ body: () -> ()) -> timespec {
+    var startTime = timespec()
+    var endTime = timespec()
+
+    clock_gettime(CLOCK_MONOTONIC, &startTime)
+    body()
+    clock_gettime(CLOCK_MONOTONIC, &endTime)
+
+    return subtract(timespec: startTime, from: endTime)
   }
 
   static func usage() {
@@ -460,15 +492,40 @@ Generate a backtrace for the parent process.
     // want to do it *once* for all the backtraces we showed.
     formattingOptions = formattingOptions.showImages(.none)
 
-    target = Target(crashInfoAddr: crashInfoAddr,
-                    limit: args.limit, top: args.top,
-                    cache: args.cache)
+    // Target's initializer fetches and symbolicates backtraces, so
+    // we want to time that part here.
+    let duration = measureDuration {
+      target = Target(crashInfoAddr: crashInfoAddr,
+                      limit: args.limit, top: args.top,
+                      cache: args.cache)
 
-    currentThread = target!.crashingThreadNdx
+      currentThread = target!.crashingThreadNdx
+    }
 
     printCrashLog()
 
     writeln("")
+
+    let formattedDuration = format(duration: duration)
+
+    writeln("Backtrace took \(formattedDuration)s")
+    writeln("")
+
+    #if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+    // On Darwin, if Developer Mode is turned off, or we can't tell if it's
+    // on or not, disable interactivity
+    var developerMode: Int32 = 0
+    var developerModeSize: Int = MemoryLayout<Int32>.size
+    if args.interactive
+         && (sysctlbyname("security.mac.amfi.developer_mode_status",
+                         &developerMode,
+                         &developerModeSize,
+                         nil,
+                         0) == -1
+               || developerMode == 0) {
+      args.interactive = false
+    }
+    #endif
 
     if args.interactive {
       // Make sure we're line buffered
@@ -611,7 +668,13 @@ Generate a backtrace for the parent process.
       description = "Program crashed: \(target.signalDescription) at \(hex(target.faultAddress))"
     }
 
-    writeln("")
+    // Clear (or complete) the message written by the crash handler
+    if args.color {
+      write("\r\u{1b}[0K")
+    } else {
+      write(" done ***\n\n")
+    }
+
     writeln(theme.crashReason(description))
 
     var mentionedImages = Set<Int>()

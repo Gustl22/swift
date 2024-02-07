@@ -164,6 +164,7 @@ struct SILValuePrinterInfo {
   bool IsCapture = false;
   bool IsReborrow = false;
   bool IsEscaping = false;
+  bool HasResultDependsOn = false;
 
   SILValuePrinterInfo(ID ValueID) : ValueID(ValueID), Type(), OwnershipKind() {}
   SILValuePrinterInfo(ID ValueID, SILType Type)
@@ -174,10 +175,11 @@ struct SILValuePrinterInfo {
   SILValuePrinterInfo(ID ValueID, SILType Type,
                       ValueOwnershipKind OwnershipKind, bool IsNoImplicitCopy,
                       LifetimeAnnotation Lifetime, bool IsCapture,
-                      bool IsReborrow, bool IsEscaping)
+                      bool IsReborrow, bool IsEscaping, bool HasResultDependsOn)
       : ValueID(ValueID), Type(Type), OwnershipKind(OwnershipKind),
         IsNoImplicitCopy(IsNoImplicitCopy), Lifetime(Lifetime),
-        IsCapture(IsCapture), IsReborrow(IsReborrow), IsEscaping(IsEscaping) {}
+        IsCapture(IsCapture), IsReborrow(IsReborrow), IsEscaping(IsEscaping),
+        HasResultDependsOn(HasResultDependsOn) {}
   SILValuePrinterInfo(ID ValueID, SILType Type, bool IsNoImplicitCopy,
                       LifetimeAnnotation Lifetime, bool IsCapture,
                       bool IsReborrow, bool IsEscaping)
@@ -219,12 +221,9 @@ static void printFullContext(const DeclContext *Context, raw_ostream &Buffer) {
     return;
 
   case DeclContextKind::AbstractClosureExpr:
+  case DeclContextKind::SerializedAbstractClosure:
     // FIXME
     Buffer << "<anonymous function>";
-    return;
-
-  case DeclContextKind::SerializedLocal:
-    Buffer << "<serialized local context>";
     return;
 
   case DeclContextKind::GenericTypeDecl: {
@@ -243,6 +242,7 @@ static void printFullContext(const DeclContext *Context, raw_ostream &Buffer) {
   }
   
   case DeclContextKind::TopLevelCodeDecl:
+  case DeclContextKind::SerializedTopLevelCodeDecl:
     // FIXME
     Buffer << "<top level code>";
     return;
@@ -526,6 +526,12 @@ static void printSILFunctionNameAndType(
     for (auto *paramTy : genSig.getGenericParams()) {
       // Get a uniqued sugared name for the generic parameter type.
       auto sugaredTy = genEnv->getGenericSignature()->getSugaredType(paramTy);
+
+      // Opaque parameter types are printed as their canonical types and not
+      // the unparseable "<anonymous>".
+      if (sugaredTy->getDecl() && sugaredTy->getDecl()->isOpaqueType())
+        continue;
+
       Identifier name = sugaredTy->getName();
       while (!usedNames.insert(name).second) {
         disambiguatedNameBuf.clear();
@@ -659,6 +665,7 @@ class SILPrinter : public SILInstructionVisitor<SILPrinter> {
   SIMPLE_PRINTER(ValueOwnershipKind)
   SIMPLE_PRINTER(UUID)
   SIMPLE_PRINTER(GenericSignature)
+  SIMPLE_PRINTER(ActorIsolation)
 #undef SIMPLE_PRINTER
 
   SILPrinter &operator<<(SILValuePrinterInfo i) {
@@ -685,6 +692,8 @@ class SILPrinter : public SILInstructionVisitor<SILPrinter> {
       *this << "@reborrow ";
     if (i.IsEscaping)
       *this << "@pointer_escape ";
+    if (i.HasResultDependsOn)
+      *this << "@_resultDependsOn ";
     if (i.OwnershipKind && *i.OwnershipKind != OwnershipKind::None) {
       *this << "@" << i.OwnershipKind.value() << " ";
     }
@@ -735,7 +744,8 @@ public:
             arg->getLifetimeAnnotation(),
             arg->isClosureCapture(),
             arg->isReborrow(),
-            arg->hasPointerEscape()};
+            arg->hasPointerEscape(),
+            arg->hasResultDependsOn()};
   }
   SILValuePrinterInfo getIDAndTypeAndOwnership(SILArgument *arg) {
     return {Ctx.getID(arg), arg->getType(), arg->getOwnershipKind(),
@@ -853,8 +863,11 @@ public:
   }
 
 #ifndef NDEBUG
-  void printID(const SILBasicBlock *BB) {
-    *this << Ctx.getID(BB) << "\n";
+  void printID(const SILBasicBlock *BB, bool newline) {
+    *this << Ctx.getID(BB);
+    if (newline) {
+      *this << "\n";
+    }
   }
 #endif
 
@@ -1428,6 +1441,9 @@ public:
     printDebugVar(AVI->getVarInfo(),
                   &AVI->getModule().getASTContext().SourceMgr);
   }
+  void visitAllocVectorInst(AllocVectorInst *AVI) {
+    *this << AVI->getElementType() << ", " << getIDAndType(AVI->getCapacity());
+  }
   void visitAllocPackInst(AllocPackInst *API) {
     *this << API->getType().getObjectType();
   }
@@ -1524,6 +1540,14 @@ public:
       *this << "[nothrow] ";
     if (AI->isNonAsync())
       *this << "[noasync] ";
+    if (auto isolationCrossing = AI->getIsolationCrossing()) {
+      auto callerIsolation = isolationCrossing->getCallerIsolation();
+      if (callerIsolation != ActorIsolation::Unspecified)
+        *this << "[callee_isolation=" << callerIsolation << "] ";
+      auto calleeIsolation = isolationCrossing->getCalleeIsolation();
+      if (calleeIsolation != ActorIsolation::Unspecified)
+        *this << "[caller_isolation=" << calleeIsolation << "] ";
+    }
     visitApplyInstBase(AI);
   }
 
@@ -1571,7 +1595,7 @@ public:
   }
 
   void visitEndApplyInst(EndApplyInst *AI) {
-    *this << Ctx.getID(AI->getOperand());
+    *this << Ctx.getID(AI->getOperand()) << " as " << AI->getType();
   }
 
   void visitFunctionRefInst(FunctionRefInst *FRI) {
@@ -1618,6 +1642,9 @@ public:
       *this << "<<placeholder>>";
     }
     *this << " : " << GAI->getType();
+    if (SILValue token = GAI->getDependencyToken()) {
+      *this << " depends_on " <<  Ctx.getID(token);
+    }
   }
 
   void visitGlobalValueInst(GlobalValueInst *GVI) {
@@ -1647,6 +1674,7 @@ public:
     switch (kind) {
     case StringLiteralInst::Encoding::Bytes: return "bytes ";
     case StringLiteralInst::Encoding::UTF8: return "utf8 ";
+    case StringLiteralInst::Encoding::UTF8_OSLOG: return "oslog ";
     case StringLiteralInst::Encoding::ObjCSelector: return "objc_selector ";
     }
     llvm_unreachable("bad string literal encoding");
@@ -1697,6 +1725,9 @@ public:
     }
     if (BBI->hasPointerEscape()) {
       *this << "[pointer_escape] ";
+    }
+    if (BBI->isFromVarDecl()) {
+      *this << "[var_decl] ";
     }
     *this << getIDAndType(BBI->getOperand());
   }
@@ -2071,6 +2102,8 @@ public:
       *this << "[lexical] ";
     if (I->hasPointerEscape())
       *this << "[pointer_escape] ";
+    if (I->isFromVarDecl())
+      *this << "[var_decl] ";
     *this << getIDAndType(I->getOperand());
   }
 
@@ -2183,6 +2216,15 @@ public:
     *this << ')';
   }
 
+  void visitVectorInst(VectorInst *vi) {
+    *this << "(";
+    llvm::interleave(
+        vi->getElements(),
+        [&](const SILValue &V) { *this << getIDAndType(V); },
+        [&] { *this << ", "; });
+    *this << ')';
+  }
+
   void visitTupleInst(TupleInst *TI) {
     
     // Check to see if the type of the tuple can be inferred accurately from the
@@ -2212,7 +2254,25 @@ public:
       *this << ')';
     }
   }
-  
+
+  void visitTupleAddrConstructorInst(TupleAddrConstructorInst *TI) {
+    // First print out our dest.
+    if (TI->isInitializationOfDest()) {
+      *this << "[init] ";
+    } else {
+      *this << "[assign] ";
+    }
+    *this << getIDAndType(TI->getDest());
+
+    *this << " with (";
+
+    llvm::interleave(
+        TI->getElements(), [&](const SILValue &V) { *this << getIDAndType(V); },
+        [&] { *this << ", "; });
+
+    *this << ')';
+  }
+
   void visitEnumInst(EnumInst *UI) {
     *this << UI->getType() << ", "
           << SILDeclRef(UI->getElement(), SILDeclRef::Kind::EnumElement);
@@ -2404,9 +2464,11 @@ public:
   void visitOpenPackElementInst(OpenPackElementInst *OPEI) {
     auto env = OPEI->getOpenedGenericEnvironment();
     auto subs = env->getPackElementContextSubstitutions();
-    *this << Ctx.getID(OPEI->getIndexOperand())
-          << " of " << subs.getGenericSignature()
-          << " at ";
+    *this << Ctx.getID(OPEI->getIndexOperand()) << " of ";
+    PrintOptions Opts;
+    Opts.PrintInverseRequirements = true;
+    subs.getGenericSignature().print(PrintState.OS, Opts);
+    *this << " at ";
     printSubstitutions(subs);
     // The shape class in the opened environment is a canonical interface
     // type, which won't resolve in the generic signature we just printed.
@@ -2468,6 +2530,9 @@ public:
     *this << getIDAndType(CBOI->getOperand());
   }
   void visitMarkDependenceInst(MarkDependenceInst *MDI) {
+    if (MDI->isNonEscaping()) {
+      *this << "[nonescaping] ";
+    }
     *this << getIDAndType(MDI->getValue()) << " on "
           << getIDAndType(MDI->getBase());
     printForwardingOwnershipKind(MDI, MDI->getValue());
@@ -2614,12 +2679,16 @@ public:
     *this << getIDAndType(RI->getOperand());
   }
 
-  void visitTestSpecificationInst(TestSpecificationInst *TSI) {
+  void visitSpecifyTestInst(SpecifyTestInst *TSI) {
     *this << QuotedString(TSI->getArgumentsSpecification());
   }
 
   void visitThrowInst(ThrowInst *TI) {
     *this << getIDAndType(TI->getOperand());
+  }
+
+  void visitThrowAddrInst(ThrowAddrInst *TAI) {
+    // no operands
   }
 
   void visitUnwindInst(UnwindInst *UI) {
@@ -2734,7 +2803,6 @@ public:
 
   void visitSelectEnumInst(SelectEnumInst *SEI) {
     printSelectEnumInst(SEI);
-    printForwardingOwnershipKind(SEI, SEI->getOperand());
   }
   void visitSelectEnumAddrInst(SelectEnumAddrInst *SEI) {
     printSelectEnumInst(SEI);
@@ -2779,7 +2847,9 @@ public:
     auto pattern = KPI->getPattern();
     
     if (pattern->getGenericSignature()) {
-      pattern->getGenericSignature()->print(PrintState.OS);
+      PrintOptions Opts;
+      Opts.PrintInverseRequirements = true;
+      pattern->getGenericSignature()->print(PrintState.OS, Opts);
       *this << ' ';
     }
     
@@ -3115,17 +3185,17 @@ void SILBasicBlock::print(SILPrintContext &Ctx) const {
 }
 
 #ifndef NDEBUG
-void SILBasicBlock::dumpID() const {
-  printID(llvm::errs());
+void SILBasicBlock::dumpID(bool newline) const {
+  printID(llvm::errs(), newline);
 }
 
-void SILBasicBlock::printID(llvm::raw_ostream &OS) const {
+void SILBasicBlock::printID(llvm::raw_ostream &OS, bool newline) const {
   SILPrintContext Ctx(OS);
-  printID(Ctx);
+  printID(Ctx, newline);
 }
 
-void SILBasicBlock::printID(SILPrintContext &Ctx) const {
-  SILPrinter(Ctx).printID(this);
+void SILBasicBlock::printID(SILPrintContext &Ctx, bool newline) const {
+  SILPrinter(Ctx).printID(this, newline);
 }
 #endif
 
@@ -3150,10 +3220,13 @@ static StringRef getLinkageString(SILLinkage linkage) {
   switch (linkage) {
   case SILLinkage::Public: return "public ";
   case SILLinkage::PublicNonABI: return "non_abi ";
+  case SILLinkage::Package: return "package ";
+  case SILLinkage::PackageNonABI: return "package_non_abi ";
   case SILLinkage::Hidden: return "hidden ";
   case SILLinkage::Shared: return "shared ";
   case SILLinkage::Private: return "private ";
   case SILLinkage::PublicExternal: return "public_external ";
+  case SILLinkage::PackageExternal: return "package_external ";
   case SILLinkage::HiddenExternal: return "hidden_external ";
   }
   llvm_unreachable("bad linkage");
@@ -3243,6 +3316,9 @@ void SILFunction::print(SILPrintContext &PrintCtx) const {
   if (!useStackForPackMetadata()) {
     OS << "[no_onstack_pack_metadata] ";
   }
+  if (hasUnsafeNonEscapableResult()) {
+    OS << "[unsafe_nonescapable_result] ";
+  }
 
   if (isExactSelfClass()) {
     OS << "[exact_self_class] ";
@@ -3286,10 +3362,16 @@ void SILFunction::print(SILPrintContext &PrintCtx) const {
 
   PerformanceConstraints perf = getPerfConstraints();
   switch (perf) {
-    case PerformanceConstraints::None:         break;
-    case PerformanceConstraints::NoLocks:      OS << "[no_locks] "; break;
-    case PerformanceConstraints::NoAllocation: OS << "[no_allocation] "; break;
+    case PerformanceConstraints::None:           break;
+    case PerformanceConstraints::NoLocks:        OS << "[no_locks] "; break;
+    case PerformanceConstraints::NoAllocation:   OS << "[no_allocation] "; break;
+    case PerformanceConstraints::NoRuntime:      OS << "[no_runtime] "; break;
+    case PerformanceConstraints::NoExistentials: OS << "[no_existentials] "; break;
+    case PerformanceConstraints::NoObjCBridging: OS << "[no_objc_bridging] "; break;
   }
+
+  if (isPerformanceConstraint())
+    OS << "[perf_constraint] ";
 
   if (getEffectsKind() == EffectsKind::ReadOnly)
     OS << "[readonly] ";
@@ -3354,6 +3436,10 @@ void SILFunction::print(SILPrintContext &PrintCtx) const {
 
   if (needsStackProtection())
     OS << "[stack_protection] ";
+
+  if (hasResultDependsOnSelf()) {
+    OS << "[_resultDependsOnSelf] ";
+  }
 
   llvm::DenseMap<CanType, Identifier> sugaredTypeNames;
   printSILFunctionNameAndType(OS, this, sugaredTypeNames, &PrintCtx);
@@ -3701,7 +3787,6 @@ static void printFileIDMap(SILPrintContext &Ctx, const FileIDMap map) {
 }
 
 void SILProperty::print(SILPrintContext &Ctx) const {
-  PrintOptions Options = PrintOptions::printSIL(&Ctx);
 
   auto &OS = Ctx.OS();
   OS << "sil_property ";
@@ -3712,6 +3797,8 @@ void SILProperty::print(SILPrintContext &Ctx) const {
   printValueDecl(getDecl(), OS);
   if (auto sig = getDecl()->getInnermostDeclContext()
                           ->getGenericSignatureOfContext()) {
+    PrintOptions Options = PrintOptions::printSIL(&Ctx);
+    Options.PrintInverseRequirements = true;
     sig.getCanonicalSignature()->print(OS, Options);
   }
   OS << " (";
@@ -4141,7 +4228,14 @@ void SILCoverageMap::print(SILPrintContext &PrintCtx) const {
   for (auto &MR : getMappedRegions()) {
     OS << "  " << MR.StartLine << ":" << MR.StartCol << " -> " << MR.EndLine
        << ":" << MR.EndCol << " : ";
-    printCounter(OS, MR.Counter);
+    switch (MR.RegionKind) {
+    case MappedRegion::Kind::Code:
+      printCounter(OS, MR.Counter);
+      break;
+    case MappedRegion::Kind::Skipped:
+      OS << "skipped";
+      break;
+    }
     OS << "\n";
   }
   OS << "}\n\n";
@@ -4258,7 +4352,7 @@ void SILSpecializeAttr::print(llvm::raw_ostream &OS) const {
             Requirement ReqWithDecls(req.getKind(), FirstTy,
                                      req.getLayoutConstraint());
             auto SubPrinterCopy = SubPrinter;
-            SubPrinterCopy.PrintClassLayoutName = erased;
+            SubPrinterCopy.PrintInternalLayoutName = erased;
             ReqWithDecls.print(OS, SubPrinterCopy);
           }
         },

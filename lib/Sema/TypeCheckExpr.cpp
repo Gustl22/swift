@@ -632,26 +632,27 @@ static Type lookupDefaultLiteralType(const DeclContext *dc,
   return cast<TypeAliasDecl>(TD)->getDeclaredInterfaceType();
 }
 
-static llvm::Optional<KnownProtocolKind>
-getKnownProtocolKindIfAny(const ProtocolDecl *protocol) {
-#define EXPRESSIBLE_BY_LITERAL_PROTOCOL_WITH_NAME(Id, _, __, ___)              \
-  if (protocol == TypeChecker::getProtocol(protocol->getASTContext(),          \
-                                           SourceLoc(),                        \
-                                           KnownProtocolKind::Id))             \
-    return KnownProtocolKind::Id;
+Type TypeChecker::getDefaultType(ProtocolDecl *protocol, DeclContext *dc) {
+  auto knownKind = protocol->getKnownProtocolKind();
+  if (!knownKind)
+    return Type();
+
+  switch (knownKind.value()) {
+#define EXPRESSIBLE_BY_LITERAL_PROTOCOL_WITH_NAME(Id, _, __, ___) \
+  case KnownProtocolKind::Id: \
+    break;
+#define PROTOCOL_WITH_NAME(Id, _) \
+  case KnownProtocolKind::Id: \
+    return Type();
+
 #include "swift/AST/KnownProtocols.def"
 #undef EXPRESSIBLE_BY_LITERAL_PROTOCOL_WITH_NAME
-
-  return llvm::None;
-}
-
-Type TypeChecker::getDefaultType(ProtocolDecl *protocol, DeclContext *dc) {
-  if (auto knownProtocolKindIfAny = getKnownProtocolKindIfAny(protocol)) {
-    return evaluateOrDefault(
-        protocol->getASTContext().evaluator,
-        DefaultTypeRequest{knownProtocolKindIfAny.value(), dc}, nullptr);
+#undef PROTOCOL_WITH_NAME
   }
-  return Type();
+
+  return evaluateOrDefault(
+      protocol->getASTContext().evaluator,
+      DefaultTypeRequest{knownKind.value(), dc}, nullptr);
 }
 
 static std::pair<const char *, bool> lookupDefaultTypeInfoForKnownProtocol(
@@ -785,11 +786,11 @@ bool ClosureHasExplicitResultRequest::evaluate(Evaluator &evaluator,
     }
 
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
-      return Action::SkipChildren(expr);
+      return Action::SkipNode(expr);
     }
 
     PreWalkAction walkToDeclPre(Decl *decl) override {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
 
     PreWalkResult<Stmt *> walkToStmtPre(Stmt *stmt) override {

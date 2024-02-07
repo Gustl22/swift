@@ -108,7 +108,7 @@ private func tryDevirtualizeRelease(
   let functionRef = builder.createFunctionRef(dealloc)
 
   let substitutionMap: SubstitutionMap
-  if dealloc.isGenericFunction {
+  if dealloc.isGeneric {
     substitutionMap = context.getContextSubstitutionMap(for: type)
   } else {
     // In embedded Swift, dealloc might be a specialized deinit, so the substitution map on the old apply isn't valid for the new apply
@@ -167,7 +167,7 @@ private extension Type {
       return true
     }
     if isStruct {
-      return getNominalFields(in: function).containsSingleReference(in: function)
+      return getNominalFields(in: function)?.containsSingleReference(in: function) ?? false
     } else if isTuple {
       return tupleElements.containsSingleReference(in: function)
     } else {

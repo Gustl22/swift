@@ -108,7 +108,7 @@ static VarDecl *addImplicitDistributedActorIDProperty(
 
   // mark as nonisolated, allowing access to it from everywhere
   propDecl->getAttrs().add(
-      new (C) NonisolatedAttr(/*IsImplicit=*/true));
+      new (C) NonisolatedAttr(/*unsafe=*/false, /*implicit=*/true));
   // mark as @_compilerInitialized, since we synthesize the initializing
   // assignment during SILGen.
   propDecl->getAttrs().add(
@@ -158,7 +158,7 @@ static VarDecl *addImplicitDistributedActorActorSystemProperty(
 
   // mark as nonisolated, allowing access to it from everywhere
   propDecl->getAttrs().add(
-      new (C) NonisolatedAttr(/*IsImplicit=*/true));
+      new (C) NonisolatedAttr(/*unsafe=*/false, /*implicit=*/true));
 
   auto idProperty = nominal->getDistributedActorIDProperty();
   // If the id was not yet synthesized, we need to ensure that eventually
@@ -263,7 +263,8 @@ deriveBodyDistributed_thunk(AbstractFunctionDecl *thunk, void *context) {
           TryExpr::createImplicit(C, sloc, localPropertyAccess);
     }
 
-    auto returnLocalPropertyAccess = new (C) ReturnStmt(sloc, localPropertyAccess, implicit);
+    auto returnLocalPropertyAccess =
+        ReturnStmt::createImplicit(C, sloc, localPropertyAccess);
     localBranchStmt =
         BraceStmt::create(C, sloc, {returnLocalPropertyAccess}, sloc, implicit);
   } else {
@@ -283,7 +284,8 @@ deriveBodyDistributed_thunk(AbstractFunctionDecl *thunk, void *context) {
     if (func->hasThrows()) {
       localFuncCall = TryExpr::createImplicit(C, sloc, localFuncCall);
     }
-    auto returnLocalFuncCall = new (C) ReturnStmt(sloc, localFuncCall, implicit);
+    auto returnLocalFuncCall =
+        ReturnStmt::createImplicit(C, sloc, localFuncCall);
 
     localBranchStmt =
         BraceStmt::create(C, sloc, {returnLocalFuncCall}, sloc, implicit);
@@ -333,7 +335,7 @@ deriveBodyDistributed_thunk(AbstractFunctionDecl *thunk, void *context) {
     auto *makeInvocationArgs = ArgumentList::createImplicit(C, {});
     auto makeInvocationCallExpr =
         CallExpr::createImplicit(C, makeInvocationExpr, makeInvocationArgs);
-    makeInvocationCallExpr->setThrows(false);
+    makeInvocationCallExpr->setThrows(nullptr);
 
     auto invocationEncoderPB = PatternBindingDecl::createImplicit(
         C, StaticSpellingKind::None, invocationPattern, makeInvocationCallExpr,
@@ -524,6 +526,7 @@ deriveBodyDistributed_thunk(AbstractFunctionDecl *thunk, void *context) {
   {
     auto doneRecordingDecl =
         C.getDoneRecordingOnDistributedInvocationEncoder(invocationEncoderDecl);
+    assert(doneRecordingDecl && "Could not find 'doneRecording' ad-hoc requirement witness.");
     auto doneRecordingDeclRef =
         UnresolvedDeclRefExpr::createImplicit(C, doneRecordingDecl->getName());
 
@@ -642,8 +645,7 @@ deriveBodyDistributed_thunk(AbstractFunctionDecl *thunk, void *context) {
         CallExpr::createImplicit(C, systemRemoteCallRef, remoteCallArgs);
     remoteCallExpr = AwaitExpr::createImplicit(C, sloc, remoteCallExpr);
     remoteCallExpr = TryExpr::createImplicit(C, sloc, remoteCallExpr);
-    auto returnRemoteCall =
-                new (C) ReturnStmt(sloc, remoteCallExpr, implicit);
+    auto returnRemoteCall = ReturnStmt::createImplicit(C, sloc, remoteCallExpr);
     remoteBranchStmts.push_back(returnRemoteCall);
   }
 
@@ -693,10 +695,7 @@ static FuncDecl *createDistributedThunkFunction(FuncDecl *func) {
     genericParamList = genericParams->clone(DC);
   }
 
-  GenericSignature baseSignature =
-      buildGenericSignature(C, func->getGenericSignature(),
-                            /*addedParameters=*/{},
-                            /*addedRequirements=*/{});
+  GenericSignature baseSignature = func->getGenericSignature();
 
   // --- Prepare parameters
   auto funcParams = func->getParameters();
@@ -734,7 +733,8 @@ static FuncDecl *createDistributedThunkFunction(FuncDecl *func) {
 
   thunk->setSynthesized(true);
   thunk->setDistributedThunk(true);
-  thunk->getAttrs().add(new (C) NonisolatedAttr(/*isImplicit=*/true));
+  thunk->getAttrs().add(
+      new (C) NonisolatedAttr(/*unsafe=*/false, /*implicit=*/true));
 
   if (isa<ClassDecl>(DC))
     thunk->getAttrs().add(new (C) FinalAttr(/*isImplicit=*/true));
@@ -809,7 +809,8 @@ addDistributedActorCodableConformance(
       actor->getDeclaredInterfaceType(), proto,
       actor->getLoc(), /*dc=*/actor,
       ProtocolConformanceState::Incomplete,
-      /*isUnchecked=*/false);
+      /*isUnchecked=*/false,
+      /*isPreconcurrency=*/false);
   conformance->setSourceKindAndImplyingConformance(
       ConformanceEntryKind::Synthesized, nullptr);
   actor->registerProtocolConformance(conformance, /*synthesized=*/true);
@@ -840,8 +841,14 @@ FuncDecl *GetDistributedThunkRequest::evaluate(Evaluator &evaluator,
     if (!distributedTarget->isDistributed())
       return nullptr;
   }
-
   assert(distributedTarget);
+
+  // This evaluation type-check by now was already computed and cached;
+  // We need to check in order to avoid emitting a THUNK for a distributed func
+  // which had errors; as the thunk then may also cause un-addressable issues and confusion.
+  if (swift::checkDistributedFunction(distributedTarget)) {
+    return nullptr;
+  }
 
   auto &C = distributedTarget->getASTContext();
 
@@ -920,7 +927,7 @@ VarDecl *GetDistributedActorSystemPropertyRequest::evaluate(
     auto DistributedActorProto = C.getDistributedActorDecl();
     for (auto system : DistributedActorProto->lookupDirect(C.Id_actorSystem)) {
       if (auto var = dyn_cast<VarDecl>(system)) {
-        auto conformance = module->conformsToProtocol(
+        auto conformance = module->checkConformance(
             proto->mapTypeIntoContext(var->getInterfaceType()),
             DAS);
 

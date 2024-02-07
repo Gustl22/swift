@@ -157,24 +157,6 @@ bool TypeBase::isMarkerExistential() {
   return true;
 }
 
-bool TypeBase::isNoncopyable() {
-  if (auto *nom = getAnyNominal())
-    return nom->isMoveOnly();
-
-  if (auto *expansion = getAs<PackExpansionType>()) {
-    return expansion->getPatternType()->isNoncopyable();
-  }
-
-  // if any components of the tuple are move-only, then the tuple is move-only.
-  if (auto *tupl = getCanonicalType()->getAs<TupleType>()) {
-    for (auto eltTy : tupl->getElementTypes())
-      if (eltTy->isNoncopyable())
-        return true;
-  }
-
-  return false;
-}
-
 bool TypeBase::isPlaceholder() {
   return is<PlaceholderType>();
 }
@@ -268,6 +250,7 @@ bool CanType::isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
   case TypeKind::PackElement:
   case TypeKind::SILPack:
   case TypeKind::BuiltinTuple:
+  case TypeKind::ErrorUnion:
 #define REF_STORAGE(Name, ...) \
   case TypeKind::Name##Storage:
 #include "swift/AST/ReferenceStorage.def"
@@ -295,19 +278,71 @@ bool TypeBase::allowsOwnership(const GenericSignatureImpl *sig) {
   return getCanonicalType().allowsOwnership(sig);
 }
 
+/// Adds the inferred default protocols for an ExistentialLayout with respect
+/// to that existential's inverses and existing protocols. For example, if an
+/// inverse ~P exists, then P will not be added to the protocols list.
+///
+/// Similarly, if the protocols list has a protocol Q that already implies
+/// Copyable, then we will not add `Copyable` to the protocols list.
+///
+/// \param inverses the inverses '& ~P' that are in the existential's type.
+/// \param protocols the output vector of protocols for an ExistentialLayout
+///                  to be modified.
+static void expandDefaultProtocols(
+    ASTContext &ctx,
+    InvertibleProtocolSet inverses,
+    SmallVectorImpl<ProtocolDecl*> &protocols) {
+
+  // Skip unless noncopyable generics is enabled
+  if (!ctx.LangOpts.hasFeature(swift::Feature::NoncopyableGenerics))
+    return;
+
+  // Try to add all invertible protocols, unless:
+  //  - an inverse was provided
+  //  - an existing protocol already requires it
+  for (auto ip : InvertibleProtocolSet::full()) {
+    if (inverses.contains(ip))
+      continue;
+
+    // This matches with `lookupExistentialConformance`'s use of 'inheritsFrom'.
+    bool alreadyRequired = false;
+    for (auto proto : protocols) {
+      if (proto->requiresInvertible(ip)) {
+        alreadyRequired = true;
+        break;
+      }
+    }
+
+    if (alreadyRequired)
+      continue;
+
+    auto proto = ctx.getProtocol(getKnownProtocolKind(ip));
+    assert(proto && "missing Copyable/Escapable from stdlib!");
+
+    protocols.push_back(proto);
+  }
+}
+
 ExistentialLayout::ExistentialLayout(CanProtocolType type) {
   auto *protoDecl = type->getDecl();
 
   hasExplicitAnyObject = false;
-  containsNonObjCProtocol = !protoDecl->isObjC();
+  containsObjCProtocol = protoDecl->isObjC();
+  containsSwiftProtocol = (!protoDecl->isObjC() &&
+                           !protoDecl->isMarkerProtocol());
   containsParameterized = false;
+  representsAnyObject = false;
 
   protocols.push_back(protoDecl);
+
+  // NOTE: all the invertible protocols are usable from ObjC.
+  expandDefaultProtocols(type->getASTContext(), {}, protocols);
 }
 
 ExistentialLayout::ExistentialLayout(CanProtocolCompositionType type) {
   hasExplicitAnyObject = type->hasExplicitAnyObject();
-  containsNonObjCProtocol = false;
+  containsObjCProtocol = false;
+  containsSwiftProtocol = false;
   containsParameterized = false;
 
   auto members = type.getMembers();
@@ -327,11 +362,18 @@ ExistentialLayout::ExistentialLayout(CanProtocolCompositionType type) {
       protoDecl = parameterized->getProtocol();
       containsParameterized = true;
     }
-    containsNonObjCProtocol |=
-        !protoDecl->isObjC() &&
-        !protoDecl->isSpecificProtocol(KnownProtocolKind::Sendable);
+    if (protoDecl->isObjC())
+      containsObjCProtocol = true;
+    else if (!protoDecl->isMarkerProtocol())
+      containsSwiftProtocol = true;
     protocols.push_back(protoDecl);
   }
+
+  representsAnyObject =
+      hasExplicitAnyObject && !explicitSuperclass && getProtocols().empty();
+
+  // NOTE: all the invertible protocols are usable from ObjC.
+  expandDefaultProtocols(type->getASTContext(), type->getInverses(), protocols);
 }
 
 ExistentialLayout::ExistentialLayout(CanParameterizedProtocolType type)
@@ -398,10 +440,6 @@ Type ExistentialLayout::getSuperclass() const {
   return Type();
 }
 
-bool ExistentialLayout::isAnyObject() const {
-  return (hasExplicitAnyObject && !explicitSuperclass && getProtocols().empty());
-}
-
 bool TypeBase::isObjCExistentialType() {
   return getCanonicalType().isObjCExistentialType();
 }
@@ -440,6 +478,10 @@ NominalTypeDecl *TypeBase::getAnyActor() {
     return nullptr;
   }
 
+  if (auto self = getAs<DynamicSelfType>()) {
+    return self->getSelfType()->getAnyActor();
+  }
+
   // Existential types: check for Actor protocol.
   if (isExistentialType()) {
     auto layout = getExistentialLayout();
@@ -465,10 +507,24 @@ bool TypeBase::isActorType() {
   return false;
 }
 
+bool TypeBase::isAnyActorType() {
+  if (auto actor = getAnyActor())
+    return actor->isAnyActor();
+  return false;
+}
+
 bool TypeBase::isDistributedActor() {
   if (auto actor = getAnyActor())
     return actor->isDistributedActor();
   return false;
+}
+
+llvm::Optional<KnownProtocolKind> TypeBase::getKnownProtocol() {
+  if (auto protoTy = this->getAs<ProtocolType>())
+    if (auto protoDecl = protoTy->getDecl())
+      return protoDecl->getKnownProtocolKind();
+
+  return llvm::None;
 }
 
 bool TypeBase::isSpecialized() {
@@ -518,83 +574,6 @@ void TypeBase::getRootOpenedExistentials(
 
     return false;
   });
-}
-
-Type TypeBase::typeEraseOpenedArchetypesWithRoot(
-    const OpenedArchetypeType *root, const DeclContext *useDC) const {
-  assert(root->isRoot() && "Expected a root archetype");
-
-  Type type = Type(const_cast<TypeBase *>(this));
-  if (!hasOpenedExistential())
-    return type;
-
-  const auto sig = root->getASTContext().getOpenedExistentialSignature(
-      root->getExistentialType(), useDC->getGenericSignatureOfContext());
-
-  unsigned metatypeDepth = 0;
-
-  std::function<Type(Type)> transformFn;
-  transformFn = [&](Type type) -> Type {
-    return type.transformRec([&](TypeBase *ty) -> llvm::Optional<Type> {
-      // Don't recurse into children unless we have to.
-      if (!ty->hasOpenedExistential())
-        return Type(ty);
-
-      if (isa<MetatypeType>(ty)) {
-        const auto instanceTy = ty->getMetatypeInstanceType();
-        ++metatypeDepth;
-        const auto erasedTy = transformFn(instanceTy);
-        --metatypeDepth;
-
-        if (instanceTy.getPointer() == erasedTy.getPointer()) {
-          return Type(ty);
-        }
-
-        return Type(ExistentialMetatypeType::get(erasedTy));
-      }
-
-      // Opaque types whose substitutions involve this type parameter are
-      // erased to their upper bound.
-      if (auto opaque = dyn_cast<OpaqueTypeArchetypeType>(ty)) {
-        for (auto replacementType :
-                 opaque->getSubstitutions().getReplacementTypes()) {
-          if (replacementType->hasOpenedExistentialWithRoot(root)) {
-            Type interfaceType = opaque->getInterfaceType();
-            auto genericSig =
-                opaque->getDecl()->getOpaqueInterfaceGenericSignature();
-            return genericSig->getNonDependentUpperBounds(interfaceType);
-          }
-        }
-      }
-
-      auto *const archetype = dyn_cast<OpenedArchetypeType>(ty);
-      if (!archetype) {
-        // Recurse.
-        return llvm::None;
-      }
-
-      if (!root->isEqual(archetype->getRoot())) {
-        return Type(ty);
-      }
-
-      Type erasedTy;
-      if (root->isEqual(archetype)) {
-        erasedTy = root->getExistentialType();
-      } else {
-        erasedTy =
-            sig->getNonDependentUpperBounds(archetype->getInterfaceType());
-      }
-
-      if (metatypeDepth) {
-        if (const auto existential = erasedTy->getAs<ExistentialType>())
-          return existential->getConstraintType();
-      }
-
-      return erasedTy;
-    });
-  };
-
-  return transformFn(type);
 }
 
 Type TypeBase::addCurriedSelfType(const DeclContext *dc) {
@@ -960,7 +939,7 @@ Type TypeBase::stripConcurrency(bool recurse, bool dropGlobalActor) {
         fnType->hasExtInfo() ? fnType->getExtInfo() : ASTExtInfo();
     extInfo = extInfo.withConcurrent(false);
     if (dropGlobalActor)
-      extInfo = extInfo.withGlobalActor(Type());
+      extInfo = extInfo.withoutIsolation();
 
     ArrayRef<AnyFunctionType::Param> params = fnType->getParams();
     Type resultType = fnType->getResult();
@@ -1040,7 +1019,7 @@ Type TypeBase::stripConcurrency(bool recurse, bool dropGlobalActor) {
   if (auto protocolType = getAs<ProtocolType>()) {
     if (protocolType->getDecl()->isSpecificProtocol(
             KnownProtocolKind::Sendable))
-      return ProtocolCompositionType::get(getASTContext(), { }, false);
+      return getASTContext().TheAnyType;
 
     return Type(this);
   }
@@ -1067,6 +1046,7 @@ Type TypeBase::stripConcurrency(bool recurse, bool dropGlobalActor) {
     if (!newMembers.empty()) {
       return ProtocolCompositionType::get(
           getASTContext(), newMembers,
+          protocolCompositionType->getInverses(),
           protocolCompositionType->hasExplicitAnyObject());
     }
 
@@ -1086,6 +1066,61 @@ Type TypeBase::stripConcurrency(bool recurse, bool dropGlobalActor) {
     }
 
     return Type(this);
+  }
+
+  if (auto *BGT = getAs<BoundGenericType>()) {
+    if (!recurse)
+      return Type(this);
+
+    bool anyChanged = false;
+    SmallVector<Type, 2> genericArgs;
+    llvm::transform(BGT->getGenericArgs(), std::back_inserter(genericArgs),
+                    [&](Type argTy) {
+                      auto newArgTy =
+                          argTy->stripConcurrency(recurse, dropGlobalActor);
+                      anyChanged |= !newArgTy->isEqual(argTy);
+                      return newArgTy;
+                    });
+
+    return anyChanged ? BoundGenericType::get(BGT->getDecl(), BGT->getParent(),
+                                              genericArgs)
+                      : Type(this);
+  }
+
+  if (auto *tuple = getAs<TupleType>()) {
+    if (!recurse)
+      return Type(this);
+
+    bool anyChanged = false;
+    SmallVector<TupleTypeElt, 2> elts;
+    llvm::transform(
+        tuple->getElements(), std::back_inserter(elts), [&](const auto &elt) {
+          auto eltTy = elt.getType();
+          auto strippedTy = eltTy->stripConcurrency(recurse, dropGlobalActor);
+          anyChanged |= !strippedTy->isEqual(eltTy);
+          return elt.getWithType(strippedTy);
+        });
+
+    return anyChanged ? TupleType::get(elts, getASTContext()) : Type(this);
+  }
+
+  if (auto *arrayTy = dyn_cast<ArraySliceType>(this)) {
+    auto newBaseTy =
+        arrayTy->getBaseType()->stripConcurrency(recurse, dropGlobalActor);
+    return newBaseTy->isEqual(arrayTy->getBaseType())
+               ? Type(this)
+               : ArraySliceType::get(newBaseTy);
+  }
+
+  if (auto *dictTy = dyn_cast<DictionaryType>(this)) {
+    auto keyTy = dictTy->getKeyType();
+    auto strippedKeyTy = keyTy->stripConcurrency(recurse, dropGlobalActor);
+    auto valueTy = dictTy->getValueType();
+    auto strippedValueTy = valueTy->stripConcurrency(recurse, dropGlobalActor);
+
+    return keyTy->isEqual(strippedKeyTy) && valueTy->isEqual(strippedValueTy)
+               ? Type(this)
+               : DictionaryType::get(strippedKeyTy, strippedValueTy);
   }
 
   return Type(this);
@@ -1477,6 +1512,7 @@ static void addProtocols(Type T,
                          SmallVectorImpl<ProtocolDecl *> &Protocols,
                          ParameterizedProtocolMap &Parameterized,
                          Type &Superclass,
+                         InvertibleProtocolSet &Inverses,
                          bool &HasExplicitAnyObject) {
   if (auto Proto = T->getAs<ProtocolType>()) {
     Protocols.push_back(Proto->getDecl());
@@ -1484,11 +1520,12 @@ static void addProtocols(Type T,
   }
 
   if (auto PC = T->getAs<ProtocolCompositionType>()) {
-    if (PC->hasExplicitAnyObject())
-      HasExplicitAnyObject = true;
-    for (auto P : PC->getMembers())
-      addProtocols(P, Protocols, Parameterized, Superclass,
+    Inverses.insertAll(PC->getInverses());
+    HasExplicitAnyObject |= PC->hasExplicitAnyObject();
+    for (auto P : PC->getMembers()) {
+      addProtocols(P, Protocols, Parameterized, Superclass, Inverses,
                    HasExplicitAnyObject);
+    }
     return;
   }
 
@@ -1789,6 +1826,7 @@ CanType TypeBase::computeCanonicalType() {
     assert(!CanProtos.empty() && "Non-canonical empty composition?");
     const ASTContext &C = CanProtos[0]->getASTContext();
     Type Composition = ProtocolCompositionType::get(C, CanProtos,
+                                                    PCT->getInverses(),
                                                     PCT->hasExplicitAnyObject());
     Result = Composition.getPointer();
     break;
@@ -1852,6 +1890,15 @@ CanType TypeBase::computeCanonicalType() {
     for (Type Arg : BGT->getGenericArgs())
       CanGenericArgs.push_back(Arg->getCanonicalType());
     Result = BoundGenericType::get(BGT->getDecl(), parentTy, CanGenericArgs);
+    break;
+  }
+  case TypeKind::ErrorUnion: {
+    SmallVector<Type, 2> newTerms;
+    for (auto term : cast<ErrorUnionType>(this)->getTerms()) {
+      newTerms.push_back(term->getCanonicalType());
+    }
+    ASTContext &ctx = newTerms[0]->getASTContext();
+    Result = ErrorUnionType::get(ctx, newTerms).getPointer();
     break;
   }
   }
@@ -2369,7 +2416,8 @@ public:
         upperBoundGenericSig = buildGenericSignature(decl->getASTContext(),
                                                      upperBoundGenericSig,
                                                      /*genericParams=*/{ },
-                                                     std::move(addedRequirements));
+                                                     std::move(addedRequirements),
+                                                     /*allowInverses=*/false);
 
         upperBoundSubstMap = SubstitutionMap::get(upperBoundGenericSig,
           [&](SubstitutableType *t) -> Type {
@@ -3096,6 +3144,17 @@ getForeignRepresentable(Type type, ForeignLanguage language,
 
     case ForeignLanguage::ObjectiveC:
       if (isa<StructDecl>(nominal) || isa<EnumDecl>(nominal)) {
+        // Non-trivial C++ classes and structures are not
+        // supported by @objc attribute, even though they can
+        // be represented in Objective-C++.
+        if (auto *cxxRec = dyn_cast_or_null<clang::CXXRecordDecl>(
+                nominal->getClangDecl())) {
+          if (cxxRec->hasNonTrivialCopyConstructor() ||
+              cxxRec->hasNonTrivialMoveConstructor() ||
+              cxxRec->hasNonTrivialDestructor())
+            return failure();
+        }
+
         // Optional structs are not representable in (Objective-)C if they
         // originally came from C, whether or not they are bridged, unless they
         // came from swift_newtype. If they are defined in Swift, they are only
@@ -3318,7 +3377,8 @@ static bool matchesFunctionType(CanAnyFunctionType fn1, CanAnyFunctionType fn2,
   if (matchMode.contains(TypeMatchFlags::AllowOverride)) {
     // Removing 'throwing' is ABI-compatible for synchronous functions, but
     // not for async ones.
-    if (ext2.isThrowing() &&
+    if (ext2.isThrowing() && !ext1.isThrowing() &&
+        ext2.getThrownError().isNull() &&
         !(ext2.isAsync() &&
           matchMode.contains(TypeMatchFlags::AllowABICompatible))) {
       ext1 = ext1.withThrows(true, ext2.getThrownError());
@@ -3577,9 +3637,8 @@ Type ArchetypeType::getExistentialType() const {
   auto interfaceType = getInterfaceType();
   auto genericSig = genericEnv->getGenericSignature();
 
-  auto upperBound = genericSig->getDependentUpperBounds(interfaceType);
-
-  return genericEnv->mapTypeIntoContext(upperBound);
+  auto existentialType = genericSig->getExistentialType(interfaceType);
+  return genericEnv->mapTypeIntoContext(existentialType);
 }
 
 bool ArchetypeType::requiresClass() const {
@@ -3803,10 +3862,13 @@ CanExistentialType CanExistentialType::get(CanType constraint) {
 
 void ProtocolCompositionType::Profile(llvm::FoldingSetNodeID &ID,
                                       ArrayRef<Type> Members,
+                                      InvertibleProtocolSet Inverses,
                                       bool HasExplicitAnyObject) {
-  ID.AddInteger(HasExplicitAnyObject);
+  ID.AddBoolean(HasExplicitAnyObject);
   for (auto T : Members)
     ID.AddPointer(T.getPointer());
+  for (auto IP : Inverses)
+    ID.AddInteger((uint8_t)IP);
 }
 
 ParameterizedProtocolType::ParameterizedProtocolType(
@@ -3855,46 +3917,72 @@ bool ProtocolCompositionType::requiresClass() {
   return getExistentialLayout().requiresClass();
 }
 
+/// Constructs a protocol composition corresponding to the `Any` type.
+Type ProtocolCompositionType::theAnyType(const ASTContext &C) {
+  return ProtocolCompositionType::get(C, {}, /*Inverses=*/{},
+                                      /*HasExplicitAnyObject=*/false);
+}
+
+/// Constructs a protocol composition containing the `AnyObject` constraint.
+Type ProtocolCompositionType::theAnyObjectType(const ASTContext &C) {
+  return ProtocolCompositionType::get(C, {}, /*Inverses=*/{},
+                                      /*HasExplicitAnyObject=*/true);
+}
+
+Type ProtocolCompositionType::getInverseOf(const ASTContext &C,
+                                           InvertibleProtocolKind IP) {
+  return ProtocolCompositionType::get(C, {}, /*Inverses=*/{IP},
+                                      /*HasExplicitAnyObject=*/false);
+}
+
 Type ProtocolCompositionType::get(const ASTContext &C,
                                   ArrayRef<Type> Members,
+                                  InvertibleProtocolSet Inverses,
                                   bool HasExplicitAnyObject) {
   // Fast path for 'AnyObject' and 'Any'.
   if (Members.empty()) {
-    return build(C, Members, HasExplicitAnyObject);
+    return build(C, Members, Inverses, HasExplicitAnyObject);
   }
 
-  // If there's a single member and no layout constraint, return that type.
-  if (Members.size() == 1 && !HasExplicitAnyObject) {
+  // Whether this composition has an `AnyObject` or protocol-inverse member
+  // that is not reflected in the Members array.
+  auto haveExtraMember = [&]{
+    return HasExplicitAnyObject || !Inverses.empty();
+  };
+
+  // If there's a single member and no layout constraint or inverses,
+  // return that type.
+  if (Members.size() == 1 && !haveExtraMember()) {
     return Members.front();
   }
 
   for (Type t : Members) {
     if (!t->isCanonical())
-      return build(C, Members, HasExplicitAnyObject);
+      return build(C, Members, Inverses, HasExplicitAnyObject);
   }
-    
+
   Type Superclass;
   SmallVector<ProtocolDecl *, 4> Protocols;
   ParameterizedProtocolMap Parameterized;
   for (Type t : Members) {
-    addProtocols(t, Protocols, Parameterized, Superclass, HasExplicitAnyObject);
+    addProtocols(t, Protocols, Parameterized, Superclass,
+                 Inverses, HasExplicitAnyObject);
   }
-
-  // The presence of a superclass constraint makes AnyObject redundant.
-  if (Superclass)
-    HasExplicitAnyObject = false;
-
-  // If there are any parameterized protocols, the canonicalization
-  // algorithm gets more complex.
 
   // Form the set of canonical component types.
   SmallVector<Type, 4> CanTypes;
-  if (Superclass)
-    CanTypes.push_back(Superclass->getCanonicalType());
 
+  // The presence of a superclass constraint makes AnyObject redundant.
+  if (Superclass) {
+    HasExplicitAnyObject = false;
+    CanTypes.push_back(Superclass->getCanonicalType());
+  }
+
+  // If there are any parameterized protocols, the canonicalization
+  // algorithm gets more complex.
   canonicalizeProtocols(Protocols, &Parameterized);
 
-  for (auto proto: Protocols) {
+  for (auto proto : Protocols) {
     // If we have a parameterized type for this protocol, use the
     // canonical type of that.  Sema should prevent us from building
     // compositions with the same protocol and conflicting constraints.
@@ -3909,11 +3997,11 @@ Type ProtocolCompositionType::get(const ASTContext &C,
     CanTypes.push_back(proto->getDeclaredInterfaceType());
   }
 
-  // If one member remains and no layout constraint, return that type.
-  if (CanTypes.size() == 1 && !HasExplicitAnyObject)
+  // If one member remains with no extra members, return that type.
+  if (CanTypes.size() == 1 && !haveExtraMember())
     return CanTypes.front();
 
-  return build(C, CanTypes, HasExplicitAnyObject);
+  return build(C, CanTypes, Inverses, HasExplicitAnyObject);
 }
 
 CanType ProtocolCompositionType::getMinimalCanonicalType(
@@ -3950,6 +4038,9 @@ CanType ProtocolCompositionType::getMinimalCanonicalType(
     return Reqs.front().getSecondType()->getCanonicalType();
   }
 
+  // The set of inverses is already minimal.
+  auto MinimalInverses = Composition->getInverses();
+
   llvm::SmallVector<Type, 2> MinimalMembers;
   bool MinimalHasExplicitAnyObject = false;
   auto ifaceTy = Sig.getGenericParams().back();
@@ -3981,11 +4072,14 @@ CanType ProtocolCompositionType::getMinimalCanonicalType(
   // If we are left with a single member and no layout constraint, the member
   // is the minimal type. Also, note that a protocol composition cannot be
   // constructed with a single member unless there is a layout constraint.
-  if (MinimalMembers.size() == 1 && !MinimalHasExplicitAnyObject)
+  if (MinimalMembers.size() == 1
+      && !MinimalHasExplicitAnyObject
+      && MinimalInverses.empty())
     return CanType(MinimalMembers.front());
 
   // The resulting composition is necessarily canonical.
-  return CanType(build(Ctx, MinimalMembers, MinimalHasExplicitAnyObject));
+  return CanType(build(Ctx, MinimalMembers, MinimalInverses,
+                       MinimalHasExplicitAnyObject));
 }
 
 ClangTypeInfo AnyFunctionType::getClangTypeInfo() const {
@@ -4022,6 +4116,19 @@ Type AnyFunctionType::getGlobalActor() const {
   }
 }
 
+LifetimeDependenceInfo AnyFunctionType::getLifetimeDependenceInfo() const {
+  switch (getKind()) {
+  case TypeKind::Function:
+    return cast<FunctionType>(this)->getLifetimeDependenceInfo();
+  case TypeKind::GenericFunction:
+    // TODO: Handle GenericFunction
+    return LifetimeDependenceInfo();
+
+  default:
+    llvm_unreachable("Illegal type kind for AnyFunctionType.");
+  }
+}
+
 ClangTypeInfo AnyFunctionType::getCanonicalClangTypeInfo() const {
   return getClangTypeInfo().getCanonical();
 }
@@ -4029,15 +4136,20 @@ ClangTypeInfo AnyFunctionType::getCanonicalClangTypeInfo() const {
 ASTExtInfo
 AnyFunctionType::getCanonicalExtInfo(bool useClangFunctionType) const {
   assert(hasExtInfo());
+
+  CanGenericSignature genericSig;
+  if (auto *genericFnTy = dyn_cast<GenericFunctionType>(this))
+    genericSig = genericFnTy->getGenericSignature().getCanonicalSignature();
+
   Type globalActor = getGlobalActor();
   if (globalActor)
-    globalActor = globalActor->getCanonicalType();
+    globalActor = globalActor->getReducedType(genericSig);
 
   // When there is an explicitly-specified thrown error, canonicalize it's type.
   auto bits = Bits.AnyFunctionType.ExtInfoBits;
   Type thrownError = getThrownError();
   if (thrownError) {
-    thrownError = thrownError->getCanonicalType();
+    thrownError = thrownError->getReducedType(genericSig);
 
     //   - If the thrown error is `any Error`, the function throws and we
     //     drop the thrown error.
@@ -4056,7 +4168,7 @@ AnyFunctionType::getCanonicalExtInfo(bool useClangFunctionType) const {
   return ExtInfo(bits,
                  useClangFunctionType ? getCanonicalClangTypeInfo()
                                       : ClangTypeInfo(),
-                 globalActor, thrownError);
+                 globalActor, thrownError, getLifetimeDependenceInfo());
 }
 
 bool AnyFunctionType::hasNonDerivableClangType() {
@@ -4073,12 +4185,30 @@ bool AnyFunctionType::hasSameExtInfoAs(const AnyFunctionType *otherFn) {
   return getExtInfo().isEqualTo(otherFn->getExtInfo(), useClangTypes(this));
 }
 
+bool swift::hasIsolatedParameter(ArrayRef<AnyFunctionType::Param> params) {
+  for (auto &param : params) {
+    if (param.isIsolated())
+      return true;
+  }
+  return false;
+}
+
 ClangTypeInfo SILFunctionType::getClangTypeInfo() const {
   if (!Bits.SILFunctionType.HasClangTypeInfo)
     return ClangTypeInfo();
   auto *info = getTrailingObjects<ClangTypeInfo>();
   assert(!info->empty() &&
          "If the ClangTypeInfo was empty, we shouldn't have stored it.");
+  return *info;
+}
+
+LifetimeDependenceInfo SILFunctionType::getLifetimeDependenceInfo() const {
+  if (!Bits.SILFunctionType.HasLifetimeDependenceInfo)
+    return LifetimeDependenceInfo();
+  auto *info = getTrailingObjects<LifetimeDependenceInfo>();
+  assert(
+      !info->empty() &&
+      "If the LifetimeDependenceInfo was empty, we shouldn't have stored it.");
   return *info;
 }
 
@@ -4631,6 +4761,48 @@ case TypeKind::Id:
     return ParenType::get(Ptr->getASTContext(), underlying);
   }
 
+  case TypeKind::ErrorUnion: {
+    auto errorUnion = cast<ErrorUnionType>(base);
+    bool anyChanged = false;
+    SmallVector<Type, 4> terms;
+    unsigned Index = 0;
+    for (Type term : errorUnion->getTerms()) {
+      Type transformedTerm =
+          term.transformWithPosition(TypePosition::Invariant, fn);
+      if (!transformedTerm)
+        return Type();
+
+      // If nothing has changed, just keep going.
+      if (!anyChanged &&
+          transformedTerm.getPointer() == term.getPointer()) {
+        ++Index;
+        continue;
+      }
+
+      // If this is the first change we've seen, copy all of the previous
+      // elements.
+      if (!anyChanged) {
+        // Copy all of the previous elements.
+        terms.append(errorUnion->getTerms().begin(),
+                     errorUnion->getTerms().begin() + Index);
+        anyChanged = true;
+      }
+
+      // If the transformed type is a pack, immediately expand it.
+      if (auto termPack = getTransformedPack(transformedTerm)) {
+        auto termElements = termPack->getElementTypes();
+        terms.append(termElements.begin(), termElements.end());
+      } else {
+        terms.push_back(transformedTerm);
+      }
+    }
+
+    if (!anyChanged)
+      return *this;
+
+    return ErrorUnionType::get(Ptr->getASTContext(), terms);
+  }
+
   case TypeKind::Pack: {
     auto pack = cast<PackType>(base);
     bool anyChanged = false;
@@ -4898,28 +5070,50 @@ case TypeKind::Id:
     if (resultTy.getPointer() != function->getResult().getPointer())
       isUnchanged = false;
 
-    // Transform the thrown error.
-    Type thrownError;
-    if (Type origThrownError = function->getThrownError()) {
-      thrownError = origThrownError.transformWithPosition(
-          TypePosition::Invariant, fn);
-      if (!thrownError)
-        return Type();
+    // Transform the extended info.
+    llvm::Optional<ASTExtInfo> extInfo;
+    if (function->hasExtInfo()) {
+      auto origExtInfo = function->getExtInfo();
+      extInfo = origExtInfo;
 
-      if (thrownError.getPointer() != origThrownError.getPointer())
-        isUnchanged = false;
-    }
-    
-    // Transform the global actor.
-    Type globalActorType;
-    if (Type origGlobalActorType = function->getGlobalActor()) {
-      globalActorType = origGlobalActorType.transformWithPosition(
-          TypePosition::Invariant, fn);
-      if (!globalActorType)
-        return Type();
+      // Transform the thrown error.
+      if (Type origThrownError = origExtInfo.getThrownError()) {
+        Type thrownError = origThrownError.transformWithPosition(pos, fn);
+        if (!thrownError)
+          return Type();
 
-      if (globalActorType.getPointer() != origGlobalActorType.getPointer())
-        isUnchanged = false;
+        if (thrownError.getPointer() != origThrownError.getPointer())
+          isUnchanged = false;
+
+        extInfo = extInfo->withThrows(true, thrownError);
+
+        // If there was a generic thrown error and it substituted with
+        // 'any Error' or 'Never', map to 'throws' or non-throwing rather than
+        // maintaining the sugar.
+        if (origThrownError->isTypeParameter() ||
+            origThrownError->isTypeVariableOrMember()) {
+          // 'any Error'
+          if (thrownError->isEqual(
+                  thrownError->getASTContext().getErrorExistentialType())) {
+            extInfo = extInfo->withThrows(true, Type());
+          } else if (thrownError->isNever()) {
+            extInfo = extInfo->withThrows(false, Type());
+          }
+        }
+      }
+
+      // Transform the global actor.
+      if (Type origGlobalActorType = origExtInfo.getGlobalActor()) {
+        Type globalActorType = origGlobalActorType.transformWithPosition(
+            TypePosition::Invariant, fn);
+        if (!globalActorType)
+          return Type();
+
+        if (globalActorType.getPointer() != origGlobalActorType.getPointer())
+          isUnchanged = false;
+
+        extInfo = extInfo->withGlobalActor(globalActorType);
+      }
     }
 
     if (auto genericFnType = dyn_cast<GenericFunctionType>(base)) {
@@ -4937,24 +5131,13 @@ case TypeKind::Id:
       if (isUnchanged) return *this;
 
       auto genericSig = genericFnType->getGenericSignature();
-      if (!function->hasExtInfo())
-        return GenericFunctionType::get(genericSig, substParams, resultTy);
       return GenericFunctionType::get(
-               genericSig, substParams, resultTy,
-               function->getExtInfo()
-                 .withGlobalActor(globalActorType)
-                 .withThrows(function->isThrowing(), thrownError));
+          genericSig, substParams, resultTy, extInfo);
     }
 
     if (isUnchanged) return *this;
 
-    if (!function->hasExtInfo())
-      return FunctionType::get(substParams, resultTy);
-    return FunctionType::get(
-             substParams, resultTy,
-             function->getExtInfo()
-               .withGlobalActor(globalActorType)
-               .withThrows(function->isThrowing(), thrownError));
+    return FunctionType::get(substParams, resultTy, extInfo);
   }
 
   case TypeKind::ArraySlice: {
@@ -5068,6 +5251,7 @@ case TypeKind::Id:
     
     return ProtocolCompositionType::get(Ptr->getASTContext(),
                                         substMembers,
+                                        pc->getInverses(),
                                         pc->hasExplicitAnyObject());
   }
 
@@ -5319,6 +5503,7 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   case TypeKind::PackElement:
   case TypeKind::SILPack:
   case TypeKind::BuiltinTuple:
+  case TypeKind::ErrorUnion:
 #define REF_STORAGE(Name, ...) \
   case TypeKind::Name##Storage:
 #include "swift/AST/ReferenceStorage.def"
@@ -5419,7 +5604,7 @@ AnyFunctionType *AnyFunctionType::getWithoutThrowing() const {
   return withExtInfo(info);
 }
 
-llvm::Optional<Type> AnyFunctionType::getEffectiveThrownInterfaceType() const {
+llvm::Optional<Type> AnyFunctionType::getEffectiveThrownErrorType() const {
   // A non-throwing function... has no thrown interface type.
   if (!isThrowing())
     return llvm::None;
@@ -5430,11 +5615,18 @@ llvm::Optional<Type> AnyFunctionType::getEffectiveThrownInterfaceType() const {
     return getASTContext().getErrorExistentialType();
 
   // If the thrown interface type is "Never", this function does not throw.
-  if (thrownError->isEqual(getASTContext().getNeverType()))
+  if (thrownError->isNever())
     return llvm::None;
 
   // Otherwise, return the typed error.
   return thrownError;
+}
+
+Type AnyFunctionType::getEffectiveThrownErrorTypeOrNever() const {
+  if (auto thrown = getEffectiveThrownErrorType())
+    return *thrown;
+
+  return getASTContext().getNeverType();
 }
 
 llvm::Optional<TangentSpace>
@@ -5485,7 +5677,7 @@ TypeBase::getAutoDiffTangentSpace(LookupConformanceFn lookupConformance) {
 
   // Try to get the `TangentVector` associated type of `base`.
   // Return the associated type if it is valid.
-  auto assocTy = dependentType->substBaseType(this, lookupConformance);
+  auto assocTy = dependentType->substBaseType(this, lookupConformance, llvm::None);
   if (!assocTy->hasError())
     return cache(TangentSpace::getTangentVector(assocTy));
 
@@ -5543,6 +5735,13 @@ bool TypeBase::hasSimpleTypeRepr() const {
   default:
     return true;
   }
+}
+
+bool CanType::isErrorExistentialType() const {
+  if (!isExistentialTypeImpl(*this))
+    return false;
+
+  return const_cast<CanType *>(this)->getExistentialLayout().isErrorExistential();
 }
 
 bool CanType::isForeignReferenceType() {

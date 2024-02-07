@@ -6,6 +6,9 @@
 // RUN: %FileCheck --input-file %t.ir --check-prefix NEGATIVE %s
 // REQUIRES: objc_interop
 
+// CHECK: [[selector_data_implProperty:@[^, ]+]] = private global [13 x i8] c"implProperty\00", section "__TEXT,__objc_methname,cstring_literals", align 1
+// CHECK: [[selector_data_setImplProperty_:@[^, ]+]] = private global [17 x i8] c"setImplProperty:\00", section "__TEXT,__objc_methname,cstring_literals", align 1
+
 // CHECK: [[selector_data_mainMethod_:@[^, ]+]] = private global [12 x i8] c"mainMethod:\00", section "__TEXT,__objc_methname,cstring_literals", align 1
 
 //
@@ -19,8 +22,6 @@
 // TODO: Why the extra i32 field above?
 
 // Class
-// CHECK: [[selector_data_implProperty:@[^, ]+]] = private global [13 x i8] c"implProperty\00", section "__TEXT,__objc_methname,cstring_literals", align 1
-// CHECK: [[selector_data_setImplProperty_:@[^, ]+]] = private global [17 x i8] c"setImplProperty:\00", section "__TEXT,__objc_methname,cstring_literals", align 1
 // CHECK: [[selector_data__cxx_destruct:@[^, ]+]] = private global [14 x i8] c".cxx_destruct\00", section "__TEXT,__objc_methname,cstring_literals", align 1
 // CHECK: [[_INSTANCE_METHODS_ImplClass:@[^, ]+]] = internal constant { i32, i32, [7 x { ptr, ptr, ptr }] } { i32 24, i32 7, [7 x { ptr, ptr, ptr }] [{ ptr, ptr, ptr } { ptr @"\01L_selector_data(init)", ptr @".str.7.@16@0:8", ptr @"$sSo9ImplClassC19objc_implementationEABycfcTo{{(\.ptrauth)?}}" }, { ptr, ptr, ptr } { ptr [[selector_data_implProperty]], ptr @".str.7.i16@0:8", ptr @"$sSo9ImplClassC19objc_implementationE12implPropertys5Int32VvgTo{{(\.ptrauth)?}}" }, { ptr, ptr, ptr } { ptr [[selector_data_setImplProperty_]], ptr @".str.10.v20@0:8i16", ptr @"$sSo9ImplClassC19objc_implementationE12implPropertys5Int32VvsTo{{(\.ptrauth)?}}" }, { ptr, ptr, ptr } { ptr [[selector_data_mainMethod_]], ptr @".str.10.v20@0:8i16", ptr @"$sSo9ImplClassC19objc_implementationE10mainMethodyys5Int32VFTo{{(\.ptrauth)?}}" }, { ptr, ptr, ptr } { ptr @"\01L_selector_data(copyWithZone:)", ptr @".str.11.@24@0:8^v16", ptr @"$sSo9ImplClassC19objc_implementationE4copy4withypSg10ObjectiveC6NSZoneVSg_tFTo{{(\.ptrauth)?}}" }, { ptr, ptr, ptr } { ptr @"\01L_selector_data(dealloc)", ptr @".str.7.v16@0:8", ptr @"$sSo9ImplClassC19objc_implementationEfDTo{{(\.ptrauth)?}}" }, { ptr, ptr, ptr } { ptr [[selector_data__cxx_destruct]], ptr @".str.7.v16@0:8", ptr @"$sSo9ImplClassCfETo{{(\.ptrauth)?}}" }] }, section "__DATA, __objc_data", align 8
 // CHECK: [[_IVARS_ImplClass:@[^, ]+]] = internal constant { i32, i32, [2 x { ptr, ptr, ptr, i32, i32 }] } { i32 32, i32 2, [2 x { ptr, ptr, ptr, i32, i32 }] [{ ptr, ptr, ptr, i32, i32 } { ptr @"$sSo9ImplClassC19objc_implementationE12implPropertys5Int32VvpWvd", ptr @.str.12.implProperty, ptr @.str.0., i32 2, i32 4 }, { ptr, ptr, ptr, i32, i32 } { ptr @"$sSo9ImplClassC19objc_implementationE13implProperty2So8NSObjectCSgvpWvd", ptr @.str.13.implProperty2, ptr @.str.0., i32 3, i32 8 }] }, section "__DATA, __objc_const", align 8
@@ -138,9 +139,17 @@ open class SwiftSubclass: ImplClass {
 // Functions
 //
 
+@_objcImplementation @_cdecl("implFunc")
+public func implFunc(_ param: Int32) {}
+
+@_objcImplementation @_cdecl("implFuncCName")
+public func implFuncCName(_ param: Int32) {}
+
 public func fn(impl: ImplClass, swiftSub: SwiftSubclass) {
   impl.mainMethod(0)
   swiftSub.mainMethod(1)
+  implFunc(2)
+  implFuncCName(3)
 }
 
 // Swift calling convention -[ImplClass init]
@@ -193,6 +202,9 @@ public func fn(impl: ImplClass, swiftSub: SwiftSubclass) {
 // Swift calling convention -[ImplClass copyWithZone:]
 // CHECK-LABEL: define hidden swiftcc void @"$sSo9ImplClassC19objc_implementationE4copy4withypSg10ObjectiveC6NSZoneVSg_tF"
 
+// FIXME: Do we actually want a public type metadata accessor? I'm guessing no.
+// CHECK-LABEL: define swiftcc %swift.metadata_response @"$sSo9ImplClassCMa"
+
 // ObjC calling convention -[ImplClass copyWithZone:]
 // CHECK-LABEL: define internal ptr @"$sSo9ImplClassC19objc_implementationE4copy4withypSg10ObjectiveC6NSZoneVSg_tFTo"
 
@@ -238,17 +250,25 @@ public func fn(impl: ImplClass, swiftSub: SwiftSubclass) {
 // Swift calling convention SwiftSubclass.deinit (deallocating)
 // CHECK-LABEL: define swiftcc void @"$s19objc_implementation13SwiftSubclassCfD"
 
+// inplFunc(_:)
+// CHECK-LABEL: define void @implFunc
+// FIXME: We'd like this to be internal or hidden, not public.
+// CHECK: define swiftcc void @"$s19objc_implementation8implFuncyys5Int32VF"
+
+// inplFuncCName(_:)
+// CHECK-LABEL: define void @"\01_implFuncAsmName"
+// FIXME: We'd like this to be internal or hidden, not public.
+// CHECK: define swiftcc void @"$s19objc_implementation13implFuncCNameyys5Int32VF"
+
 // fn(impl:swiftSub:)
 // CHECK-LABEL: define swiftcc void @"$s19objc_implementation2fn4impl8swiftSubySo9ImplClassC_AA13SwiftSubclassCtF"
 // CHECK:   [[SEL_1:%[^ ]+]] = load ptr, ptr @"\01L_selector(mainMethod:)", align 8
 // CHECK:   call void @objc_msgSend(ptr {{.*}}, ptr [[SEL_1]], i32 0)
 // CHECK:   [[SEL_2:%[^ ]+]] = load ptr, ptr @"\01L_selector(mainMethod:)", align 8
 // CHECK:   call void @objc_msgSend(ptr {{.*}}, ptr [[SEL_2]], i32 1)
+// CHECK:   call void @implFunc
 // CHECK:   ret void
 // CHECK: }
-
-// FIXME: Do we actually want a public type metadata accessor? I'm guessing no.
-// CHECK-LABEL: define swiftcc %swift.metadata_response @"$sSo9ImplClassCMa"
 
 //
 // Not implemented in Swift

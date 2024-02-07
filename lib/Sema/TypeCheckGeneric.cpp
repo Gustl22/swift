@@ -118,7 +118,8 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
         WhereClauseOwner(),
         /*addedRequirements=*/{},
         /*inferenceSources=*/{},
-        /*allowConcreteGenericParams=*/false};
+        /*isExtension=*/false,
+        /*allowInverses=*/true};
 
     interfaceSignature = evaluateOrDefault(
         ctx.evaluator, request, GenericSignatureWithError())
@@ -203,7 +204,8 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
 
     interfaceSignature = buildGenericSignature(ctx, outerGenericSignature,
                                                genericParamTypes,
-                                               std::move(requirements));
+                                               std::move(requirements),
+                                               /*allowInverses=*/true);
     genericParams = originatingGenericContext
         ? originatingGenericContext->getGenericParams()
         : nullptr;
@@ -336,10 +338,10 @@ void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
       // Find generic parameters or dependent member types.
       // Once such a type is found, don't recurse into its children.
       if (!ty->hasTypeParameter())
-        return Action::SkipChildren;
+        return Action::SkipNode;
       if (ty->isTypeParameter()) {
         ReferencedGenericParams.insert(ty->getCanonicalType());
-        return Action::SkipChildren;
+        return Action::SkipNode;
       }
 
       // Skip the count type, which is always a generic parameter;
@@ -347,7 +349,7 @@ void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
       // shape and not the metadata.
       if (auto *expansionTy = ty->getAs<PackExpansionType>()) {
         expansionTy->getPatternType().walk(*this);
-        return Action::SkipChildren;
+        return Action::SkipNode;
       }
 
       // Don't walk into generic type alias substitutions. This does
@@ -357,7 +359,7 @@ void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
       //   func foo<T>(_: Foo<T>) {}
       if (auto *aliasTy = dyn_cast<TypeAliasType>(ty.getPointer())) {
         Type(aliasTy->getSinglyDesugaredType()).walk(*this);
-        return Action::SkipChildren;
+        return Action::SkipNode;
       }
 
       return Action::Continue;
@@ -643,30 +645,13 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
     auto req =
         Requirement(RequirementKind::Conformance, self,
                     PD->getDeclaredInterfaceType());
-    auto sig = GenericSignature::get({self}, {req});
-
-    // Debugging of the generic signature builder and generic signature
-    // generation.
-    if (ctx.TypeCheckerOpts.DebugGenericSignatures) {
-      llvm::errs() << "\n";
-      PD->printContext(llvm::errs());
-      llvm::errs() << "Generic signature: ";
-      PrintOptions Opts;
-      Opts.ProtocolQualifiedDependentMemberTypes = true;
-      sig->print(llvm::errs(), Opts);
-      llvm::errs() << "\n";
-      llvm::errs() << "Canonical generic signature: ";
-      sig.getCanonicalSignature()->print(llvm::errs(), Opts);
-      llvm::errs() << "\n";
-    }
-    return sig;
+    return GenericSignature::get({self}, {req});
   }
 
   if (auto accessor = dyn_cast<AccessorDecl>(GC))
     if (auto subscript = dyn_cast<SubscriptDecl>(accessor->getStorage()))
        return subscript->getGenericSignature();
 
-  bool allowConcreteGenericParams = false;
   auto *genericParams = GC->getGenericParams();
   const auto *where = GC->getTrailingWhereClause();
 
@@ -694,9 +679,6 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
       return nullptr;
     }
   }
-
-  if (!genericParams && where)
-    allowConcreteGenericParams = true;
 
   GenericSignature parentSig;
   SmallVector<TypeLoc, 2> inferenceSources;
@@ -732,12 +714,8 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
 
         auto paramOptions = baseOptions;
 
-        if (auto *specifier = dyn_cast<SpecifierTypeRepr>(typeRepr)) {
-          if (isa<OwnershipTypeRepr>(specifier))
-            paramOptions |= TypeResolutionFlags::HasOwnership;
-
+        if (auto *specifier = dyn_cast<SpecifierTypeRepr>(typeRepr))
           typeRepr = specifier->getBase();
-        }
 
         if (auto *packExpansion = dyn_cast<VarargTypeRepr>(typeRepr)) {
           paramOptions.setContext(TypeResolverContext::VariadicFunctionInput);
@@ -751,6 +729,29 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
             resolution.withOptions(paramOptions).resolveType(typeRepr);
 
         inferenceSources.emplace_back(typeRepr, type);
+      }
+
+      // Handle the thrown error type.
+      auto effectiveFunc = func ? func
+                                : subscr ? subscr->getEffectfulGetAccessor()
+                                : nullptr;
+      if (effectiveFunc) {
+        // Infer constraints from the thrown type of a declaration.
+        if (auto thrownTypeRepr = effectiveFunc->getThrownTypeRepr()) {
+          auto thrownOptions = baseOptions | TypeResolutionFlags::Direct;
+          const auto thrownType = resolution.withOptions(thrownOptions)
+              .resolveType(thrownTypeRepr);
+
+          // Add this type as an inference source.
+          inferenceSources.emplace_back(thrownTypeRepr, thrownType);
+
+          // Add conformance of this type to the Error protocol.
+          if (auto errorProtocol = ctx.getErrorDecl()) {
+            extraReqs.push_back(
+                Requirement(RequirementKind::Conformance, thrownType,
+                            errorProtocol->getDeclaredInterfaceType()));
+          }
+        }
       }
 
       // Gather requirements from the result type.
@@ -790,12 +791,12 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
     // the right sugared types, since we don't want to expose the
     // name of the generic parameter of BuiltinTupleDecl itself.
     if (extraReqs.empty() && !ext->getTrailingWhereClause() &&
-        !isa<BuiltinTupleDecl>(extendedNominal)) {
+        !isa<BuiltinTupleDecl>(extendedNominal) &&
+        !ctx.LangOpts.hasFeature(Feature::NoncopyableGenerics)) {
+      // FIXME: Recover this optimization even with NoncopyableGenerics on.
       return parentSig;
     }
 
-    // Extensions allow parameters to be equated with concrete types.
-    allowConcreteGenericParams = true;
   } else {
     llvm_unreachable("Unknown generic declaration kind");
   }
@@ -804,31 +805,10 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
       parentSig.getPointer(),
       genericParams, WhereClauseOwner(GC),
       extraReqs, inferenceSources,
-      allowConcreteGenericParams};
-  auto sig = evaluateOrDefault(ctx.evaluator, request,
-                               GenericSignatureWithError()).getPointer();
-
-  // Debugging of the generic signature builder and generic signature
-  // generation.
-  if (ctx.TypeCheckerOpts.DebugGenericSignatures) {
-    llvm::errs() << "\n";
-    if (auto *VD = dyn_cast_or_null<ValueDecl>(GC->getAsDecl())) {
-      VD->dumpRef(llvm::errs());
-      llvm::errs() << "\n";
-    } else {
-      GC->printContext(llvm::errs());
-    }
-    llvm::errs() << "Generic signature: ";
-    PrintOptions Opts;
-    Opts.ProtocolQualifiedDependentMemberTypes = true;
-    sig->print(llvm::errs(), Opts);
-    llvm::errs() << "\n";
-    llvm::errs() << "Canonical generic signature: ";
-    sig.getCanonicalSignature()->print(llvm::errs(), Opts);
-    llvm::errs() << "\n";
-  }
-
-  return sig;
+      /*isExtension=*/isa<ExtensionDecl>(GC),
+      /*allowInverses=*/true};
+  return evaluateOrDefault(ctx.evaluator, request,
+                           GenericSignatureWithError()).getPointer();
 }
 
 ///
@@ -1043,70 +1023,6 @@ CheckGenericArgumentsResult TypeChecker::checkGenericArgumentsForDiagnostics(
     return CheckGenericArgumentsResult::createSubstitutionFailure();
 
   return CheckGenericArgumentsResult::createSuccess();
-}
-
-CheckGenericArgumentsResult::Kind TypeChecker::checkGenericArguments(
-    ModuleDecl *module, ArrayRef<Requirement> requirements,
-    TypeSubstitutionFn substitutions, SubstOptions options) {
-  SmallVector<Requirement, 4> worklist;
-
-  bool hadSubstFailure = false;
-
-  for (auto req : requirements) {
-    worklist.push_back(req.subst(substitutions,
-                              LookUpConformanceInModule(module), options));
-  }
-
-  while (!worklist.empty()) {
-    auto req = worklist.pop_back_val();
-    switch (req.checkRequirement(worklist, /*allowMissing=*/true)) {
-    case CheckRequirementResult::Success:
-    case CheckRequirementResult::ConditionalConformance:
-    case CheckRequirementResult::PackRequirement:
-      break;
-
-    case CheckRequirementResult::RequirementFailure:
-      return CheckGenericArgumentsResult::RequirementFailure;
-
-    case CheckRequirementResult::SubstitutionFailure:
-      hadSubstFailure = true;
-      break;
-    }
-  }
-
-  if (hadSubstFailure)
-    return CheckGenericArgumentsResult::SubstitutionFailure;
-
-  return CheckGenericArgumentsResult::Success;
-}
-
-CheckGenericArgumentsResult::Kind TypeChecker::checkGenericArguments(
-    ArrayRef<Requirement> requirements) {
-  SmallVector<Requirement, 4> worklist(requirements.begin(), requirements.end());
-
-  bool hadSubstFailure = false;
-
-  while (!worklist.empty()) {
-    auto req = worklist.pop_back_val();
-    switch (req.checkRequirement(worklist, /*allowMissing=*/true)) {
-    case CheckRequirementResult::Success:
-    case CheckRequirementResult::ConditionalConformance:
-    case CheckRequirementResult::PackRequirement:
-      break;
-
-    case CheckRequirementResult::RequirementFailure:
-      return CheckGenericArgumentsResult::RequirementFailure;
-
-    case CheckRequirementResult::SubstitutionFailure:
-      hadSubstFailure = true;
-      break;
-    }
-  }
-
-  if (hadSubstFailure)
-    return CheckGenericArgumentsResult::SubstitutionFailure;
-
-  return CheckGenericArgumentsResult::Success;
 }
 
 Requirement

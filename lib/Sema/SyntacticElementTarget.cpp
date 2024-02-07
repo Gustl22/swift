@@ -165,9 +165,12 @@ SyntacticElementTarget::forInitialization(Expr *initializer, DeclContext *dc,
 }
 
 SyntacticElementTarget SyntacticElementTarget::forInitialization(
-    Expr *initializer, DeclContext *dc, Type patternType,
-    PatternBindingDecl *patternBinding, unsigned patternBindingIndex,
-    bool bindPatternVarsOneWay) {
+    Expr *initializer, Type patternType, PatternBindingDecl *patternBinding,
+    unsigned patternBindingIndex, bool bindPatternVarsOneWay) {
+  auto *dc = patternBinding->getDeclContext();
+  if (auto *initContext = patternBinding->getInitContext(patternBindingIndex))
+    dc = initContext;
+
   auto result = forInitialization(
       initializer, dc, patternType,
       patternBinding->getPattern(patternBindingIndex), bindPatternVarsOneWay);
@@ -178,8 +181,9 @@ SyntacticElementTarget SyntacticElementTarget::forInitialization(
 
 SyntacticElementTarget
 SyntacticElementTarget::forForEachStmt(ForEachStmt *stmt, DeclContext *dc,
-                                       bool ignoreWhereClause) {
-  SyntacticElementTarget target(stmt, dc, ignoreWhereClause);
+                                       bool ignoreWhereClause,
+                                       GenericEnvironment *packElementEnv) {
+  SyntacticElementTarget target(stmt, dc, ignoreWhereClause, packElementEnv);
   return target;
 }
 
@@ -239,7 +243,7 @@ bool SyntacticElementTarget::infersOpaqueReturnType() const {
   switch (getExprContextualTypePurpose()) {
   case CTP_Initialization:
   case CTP_ReturnStmt:
-  case CTP_ReturnSingleExpr:
+  case CTP_ImpliedReturnStmt:
     if (Type convertType = getExprContextualType())
       return convertType->hasOpaqueArchetype();
     return false;
@@ -257,7 +261,7 @@ bool SyntacticElementTarget::contextualTypeIsOnlyAHint() const {
     return true;
   case CTP_Unused:
   case CTP_ReturnStmt:
-  case CTP_ReturnSingleExpr:
+  case CTP_ImpliedReturnStmt:
   case CTP_YieldByValue:
   case CTP_YieldByReference:
   case CTP_CaseStmt:

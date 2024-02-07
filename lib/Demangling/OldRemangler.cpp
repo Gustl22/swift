@@ -829,6 +829,11 @@ ManglingError Remangler::mangleThrowsAnnotation(Node *node, unsigned depth) {
   return ManglingError::Success;
 }
 
+ManglingError Remangler::mangleTypedThrowsAnnotation(Node *node, unsigned depth) {
+  Buffer << "z";
+  return ManglingError::Success;
+}
+
 ManglingError Remangler::mangleDifferentiableFunctionType(Node *node,
                                                           unsigned depth) {
   Buffer << "D";
@@ -838,6 +843,12 @@ ManglingError Remangler::mangleDifferentiableFunctionType(Node *node,
 ManglingError Remangler::mangleGlobalActorFunctionType(Node *node,
                                                        unsigned depth) {
   Buffer << "Y" << (char)node->getIndex(); // differentiability kind
+  return ManglingError::Success;
+}
+
+ManglingError Remangler::mangleIsolatedAnyFunctionType(Node *node,
+                                                       unsigned depth) {
+  Buffer << "YA";
   return ManglingError::Success;
 }
 
@@ -1075,47 +1086,15 @@ ManglingError Remangler::mangleFreestandingMacroExpansion(
   return mangleChildNodes(node, depth + 1);
 }
 
-ManglingError Remangler::mangleAccessorAttachedMacroExpansion(
-    Node *node, unsigned depth) {
-  Buffer << "fMa";
-  RETURN_IF_ERROR(mangleIndex(node, depth + 1));
-  return mangleChildNodes(node, depth + 1);
+#define FREESTANDING_MACRO_ROLE(Name, Description)
+#define ATTACHED_MACRO_ROLE(Name, Description, MangledChar)    \
+ManglingError Remangler::mangle##Name##AttachedMacroExpansion( \
+    Node *node, unsigned depth) {                              \
+  Buffer << "fM" MangledChar;                                  \
+  RETURN_IF_ERROR(mangleIndex(node, depth + 1));               \
+  return mangleChildNodes(node, depth + 1);                    \
 }
-
-ManglingError Remangler::mangleMemberAttributeAttachedMacroExpansion(
-    Node *node, unsigned depth) {
-  Buffer << "fMr";
-  RETURN_IF_ERROR(mangleIndex(node, depth + 1));
-  return mangleChildNodes(node, depth + 1);
-}
-
-ManglingError Remangler::mangleMemberAttachedMacroExpansion(
-    Node *node, unsigned depth) {
-  Buffer << "fMm";
-  RETURN_IF_ERROR(mangleIndex(node, depth + 1));
-  return mangleChildNodes(node, depth + 1);
-}
-
-ManglingError Remangler::manglePeerAttachedMacroExpansion(
-    Node *node, unsigned depth) {
-  Buffer << "fMp";
-  RETURN_IF_ERROR(mangleIndex(node, depth + 1));
-  return mangleChildNodes(node, depth + 1);
-}
-
-ManglingError Remangler::mangleConformanceAttachedMacroExpansion(
-    Node *node, unsigned depth) {
-  Buffer << "fMc";
-  RETURN_IF_ERROR(mangleIndex(node, depth + 1));
-  return mangleChildNodes(node, depth + 1);
-}
-
-ManglingError Remangler::mangleExtensionAttachedMacroExpansion(
-    Node *node, unsigned depth) {
-  Buffer << "fMe";
-  RETURN_IF_ERROR(mangleIndex(node, depth + 1));
-  return mangleChildNodes(node, depth + 1);
-}
+#include "swift/Basic/MacroRoles.def"
 
 ManglingError Remangler::mangleMacroExpansionUniqueName(
     Node *node, unsigned depth) {
@@ -2576,6 +2555,36 @@ ManglingError Remangler::mangleOutlinedDestroy(Node *node, unsigned depth) {
   Buffer << "Wh";
   return mangleSingleChildNode(node, depth + 1);
 }
+ManglingError Remangler::mangleOutlinedInitializeWithCopyNoValueWitness(Node *node,
+                                                                        unsigned depth) {
+  return MANGLING_ERROR(ManglingError::UnsupportedNodeKind, node);
+}
+
+ManglingError Remangler::mangleOutlinedAssignWithTakeNoValueWitness(Node *node,
+                                                                    unsigned depth) {
+  return MANGLING_ERROR(ManglingError::UnsupportedNodeKind, node);
+}
+
+ManglingError Remangler::mangleOutlinedAssignWithCopyNoValueWitness(Node *node,
+                                                                    unsigned depth) {
+  return MANGLING_ERROR(ManglingError::UnsupportedNodeKind, node);
+}
+
+ManglingError Remangler::mangleOutlinedDestroyNoValueWitness(Node *node, unsigned depth) {
+  return MANGLING_ERROR(ManglingError::UnsupportedNodeKind, node);
+}
+ManglingError Remangler::mangleOutlinedEnumTagStore(Node *node, unsigned depth) {
+  Buffer << "Wi";
+  return mangleSingleChildNode(node, depth + 1);
+}
+ManglingError Remangler::mangleOutlinedEnumGetTag(Node *node, unsigned depth) {
+  Buffer << "Wg";
+  return mangleSingleChildNode(node, depth + 1);
+}
+ManglingError Remangler::mangleOutlinedEnumProjectDataForLoad(Node *node, unsigned depth) {
+  Buffer << "Wj";
+  return mangleSingleChildNode(node, depth + 1);
+}
 
 ManglingError Remangler::mangleOutlinedVariable(Node *node, unsigned depth) {
   Buffer << "Tv" << node->getIndex();
@@ -2876,6 +2885,12 @@ mangleNonUniqueExtendedExistentialTypeShapeSymbolicReference(Node *node,
                                                      unsigned int depth) {
   return MANGLING_ERROR(ManglingError::UnsupportedNodeKind, node);
 }
+ManglingError
+Remangler::mangleObjectiveCProtocolSymbolicReference(Node *node,
+                                                     unsigned int depth) {
+  return MANGLING_ERROR(ManglingError::UnsupportedNodeKind, node);
+}
+
 ManglingError
 Remangler::mangleCanonicalSpecializedGenericMetaclass(Node *node,
                                                       unsigned depth) {

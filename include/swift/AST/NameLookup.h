@@ -18,6 +18,7 @@
 #define SWIFT_AST_NAME_LOOKUP_H
 
 #include "swift/AST/ASTVisitor.h"
+#include "swift/AST/CatchNode.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/Module.h"
@@ -244,6 +245,8 @@ enum class UnqualifiedLookupFlags {
   ExcludeMacroExpansions = 1 << 6,
   /// This lookup should only return macros.
   MacroLookup            = 1 << 7,
+  /// This lookup should only return modules
+  ModuleLookup           = 1 << 8,
 };
 
 using UnqualifiedLookupOptions = OptionSet<UnqualifiedLookupFlags>;
@@ -549,8 +552,10 @@ void filterForDiscriminator(SmallVectorImpl<Result> &results,
 
 /// \returns The set of macro declarations with the given name that
 /// fulfill any of the given macro roles.
-SmallVector<MacroDecl *, 1>
-lookupMacros(DeclContext *dc, DeclNameRef macroName, MacroRoles roles);
+SmallVector<MacroDecl *, 1> lookupMacros(DeclContext *dc,
+                                         DeclNameRef moduleName,
+                                         DeclNameRef macroName,
+                                         MacroRoles roles);
 
 /// \returns Whether the given source location is inside an attached
 /// or freestanding macro argument.
@@ -581,12 +586,15 @@ struct InheritedNominalEntry : Located<NominalTypeDecl *> {
   /// The location of the "unchecked" attribute, if present.
   SourceLoc uncheckedLoc;
 
+  /// The location of the "preconcurrency" attribute if present.
+  SourceLoc preconcurrencyLoc;
+
   InheritedNominalEntry() { }
 
-  InheritedNominalEntry(
-    NominalTypeDecl *item, SourceLoc loc,
-    SourceLoc uncheckedLoc
-  ) : Located(item, loc), uncheckedLoc(uncheckedLoc) { }
+  InheritedNominalEntry(NominalTypeDecl *item, SourceLoc loc,
+                        SourceLoc uncheckedLoc, SourceLoc preconcurrencyLoc)
+      : Located(item, loc), uncheckedLoc(uncheckedLoc),
+        preconcurrencyLoc(preconcurrencyLoc) {}
 };
 
 /// Retrieve the set of nominal type declarations that are directly
@@ -832,6 +840,25 @@ public:
   static void lookupEnclosingMacroScope(
       SourceFile *sourceFile, SourceLoc loc,
       llvm::function_ref<bool(PotentialMacro macro)> consume);
+
+  /// Look up the scope tree for the nearest point at which an error thrown from
+  /// this location can be caught or rethrown.
+  ///
+  /// For example, given this code:
+  ///
+  /// \code
+  /// func f() throws {
+  ///   do {
+  ///     try g() // A
+  ///   } catch {
+  ///     throw ErrorWrapper(error) // B
+  ///   }
+  /// }
+  /// \endcode
+  ///
+  /// At the point marked A, the catch node is the enclosing do...catch
+  /// statement. At the point marked B, the catch node is the function itself.
+  static CatchNode lookupCatchNode(ModuleDecl *module, SourceLoc loc);
 
   SWIFT_DEBUG_DUMP;
   void print(llvm::raw_ostream &) const;

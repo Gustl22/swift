@@ -20,7 +20,9 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Types.h"
 
-#include "llvm/Support/MathExtras.h"
+#include "llvm/ADT/bit.h"
+
+#include <limits>
 
 using namespace swift;
 
@@ -108,10 +110,12 @@ AccessLevelRequest::evaluate(Evaluator &evaluator, ValueDecl *D) const {
 
   switch (DC->getContextKind()) {
   case DeclContextKind::TopLevelCodeDecl:
+  case DeclContextKind::SerializedTopLevelCodeDecl:
     // Variables declared in a top-level 'guard' statement can be accessed in
     // later top-level code.
     return AccessLevel::FilePrivate;
   case DeclContextKind::AbstractClosureExpr:
+  case DeclContextKind::SerializedAbstractClosure:
     if (isa<ParamDecl>(D)) {
       // Closure parameters may need to be accessible to the enclosing
       // context, for single-expression closures.
@@ -119,7 +123,6 @@ AccessLevelRequest::evaluate(Evaluator &evaluator, ValueDecl *D) const {
     } else {
       return AccessLevel::Private;
     }
-  case DeclContextKind::SerializedLocal:
   case DeclContextKind::Initializer:
   case DeclContextKind::AbstractFunctionDecl:
   case DeclContextKind::SubscriptDecl:
@@ -329,8 +332,15 @@ DefaultAndMaxAccessLevelRequest::getCachedResult() const {
   if (extensionDecl->hasDefaultAccessLevel()) {
     uint8_t Bits = extensionDecl->getDefaultAndMaxAccessLevelBits();
     assert(Bits != 0x7 && "more than two bits set for Default and Max");
-    AccessLevel Max = static_cast<AccessLevel>(llvm::findLastSet(Bits) + 1);
-    AccessLevel Default = static_cast<AccessLevel>(llvm::findFirstSet(Bits) + 1);
+
+    uint8_t lastSet = Bits == 0 ? std::numeric_limits<uint8_t>::max()
+                                : (llvm::countl_zero(Bits) ^
+                                   (std::numeric_limits<uint8_t>::digits - 1));
+    uint8_t firstSet = Bits == 0 ? std::numeric_limits<uint8_t>::max()
+                                 : llvm::countr_zero(Bits);
+    AccessLevel Max = static_cast<AccessLevel>(lastSet + 1);
+    AccessLevel Default = static_cast<AccessLevel>(firstSet + 1);
+
     assert(Max >= Default);
     return std::make_pair(Default, Max);
   }

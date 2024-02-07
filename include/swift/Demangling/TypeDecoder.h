@@ -24,6 +24,7 @@
 #include "swift/ABI/MetadataValues.h"
 #include "swift/AST/LayoutConstraintKind.h"
 #include "swift/AST/RequirementKind.h"
+#include "swift/Basic/OptionSet.h"
 #include "swift/Basic/Unreachable.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/NamespaceMacros.h"
@@ -106,10 +107,17 @@ enum class ImplParameterConvention {
   Pack_Inout,
 };
 
-enum class ImplParameterDifferentiability {
-  DifferentiableOrNotApplicable,
-  NotDifferentiable
+enum class ImplParameterInfoFlags : uint8_t {
+  NotDifferentiable = 0x1,
 };
+
+using ImplParameterInfoOptions = OptionSet<ImplParameterInfoFlags>;
+
+enum class ImplResultInfoFlags : uint8_t {
+  NotDifferentiable = 0x1,
+};
+
+using ImplResultInfoOptions = OptionSet<ImplResultInfoFlags>;
 
 /// Describe a lowered function parameter, parameterized on the type
 /// representation.
@@ -117,11 +125,11 @@ template <typename BuiltType>
 class ImplFunctionParam {
   BuiltType Type;
   ImplParameterConvention Convention;
-  ImplParameterDifferentiability Differentiability;
+  ImplParameterInfoOptions Options;
 
 public:
   using ConventionType = ImplParameterConvention;
-  using DifferentiabilityType = ImplParameterDifferentiability;
+  using OptionsType = ImplParameterInfoOptions;
 
   static llvm::Optional<ConventionType>
   getConventionFromString(StringRef conventionString) {
@@ -151,24 +159,28 @@ public:
     return llvm::None;
   }
 
-  static llvm::Optional<DifferentiabilityType>
+  static llvm::Optional<OptionsType>
   getDifferentiabilityFromString(StringRef string) {
+    OptionsType result;
+
     if (string.empty())
-      return DifferentiabilityType::DifferentiableOrNotApplicable;
-    if (string == "@noDerivative")
-      return DifferentiabilityType::NotDifferentiable;
-    return llvm::None;
+      return result;
+
+    if (string == "@noDerivative") {
+      result |= ImplParameterInfoFlags::NotDifferentiable;
+      return result;
+    }
+
+    return {};
   }
 
   ImplFunctionParam(BuiltType type, ImplParameterConvention convention,
-                    ImplParameterDifferentiability diffKind)
-      : Type(type), Convention(convention), Differentiability(diffKind) {}
+                    OptionsType options)
+      : Type(type), Convention(convention), Options(options) {}
 
   ImplParameterConvention getConvention() const { return Convention; }
 
-  ImplParameterDifferentiability getDifferentiability() const {
-    return Differentiability;
-  }
+  OptionsType getOptions() const { return Options; }
 
   BuiltType getType() const { return Type; }
 };
@@ -193,11 +205,11 @@ template <typename BuiltType>
 class ImplFunctionResult {
   BuiltType Type;
   ImplResultConvention Convention;
-  ImplResultDifferentiability Differentiability;
+  ImplResultInfoOptions Options;
 
 public:
   using ConventionType = ImplResultConvention;
-  using DifferentiabilityType = ImplResultDifferentiability;
+  using OptionsType = ImplResultInfoOptions;
 
   static llvm::Optional<ConventionType>
   getConventionFromString(StringRef conventionString) {
@@ -217,26 +229,28 @@ public:
     return llvm::None;
   }
 
-  static llvm::Optional<DifferentiabilityType>
+  static llvm::Optional<OptionsType>
   getDifferentiabilityFromString(StringRef string) {
+    OptionsType result;
+
     if (string.empty())
-      return DifferentiabilityType::DifferentiableOrNotApplicable;
-    if (string == "@noDerivative")
-      return DifferentiabilityType::NotDifferentiable;
-    return llvm::None;
+      return result;
+
+    if (string == "@noDerivative") {
+      result |= ImplResultInfoFlags::NotDifferentiable;
+      return result;
+    }
+
+    return {};
   }
 
-  ImplFunctionResult(
-      BuiltType type, ImplResultConvention convention,
-      ImplResultDifferentiability diffKind =
-          ImplResultDifferentiability::DifferentiableOrNotApplicable)
-      : Type(type), Convention(convention), Differentiability(diffKind) {}
+  ImplFunctionResult(BuiltType type, ImplResultConvention convention,
+                     ImplResultInfoOptions options = {})
+      : Type(type), Convention(convention), Options(options) {}
 
   ImplResultConvention getConvention() const { return Convention; }
 
-  ImplResultDifferentiability getDifferentiability() const {
-    return Differentiability;
-  }
+  ImplResultInfoOptions getOptions() const { return Options; }
 
   BuiltType getType() const { return Type; }
 };
@@ -427,8 +441,10 @@ void decodeRequirement(NodePointer node,
               .Case("C", LayoutConstraintKind::Class)
               .Case("D", LayoutConstraintKind::NativeClass)
               .Case("T", LayoutConstraintKind::Trivial)
+              .Case("B", LayoutConstraintKind::BridgeObject)
               .Cases("E", "e", LayoutConstraintKind::TrivialOfExactSize)
               .Cases("M", "m", LayoutConstraintKind::TrivialOfAtMostSize)
+              .Case("S", LayoutConstraintKind::TrivialStride)
               .Default(llvm::None);
 
       if (!kind)
@@ -437,7 +453,8 @@ void decodeRequirement(NodePointer node,
       BuiltLayoutConstraint layout;
 
       if (kind != LayoutConstraintKind::TrivialOfExactSize &&
-          kind != LayoutConstraintKind::TrivialOfAtMostSize) {
+          kind != LayoutConstraintKind::TrivialOfAtMostSize &&
+          kind != LayoutConstraintKind::TrivialStride) {
         layout = Builder.getLayoutConstraint(*kind);
       } else {
         auto size = child->getChild(2)->getIndex();
@@ -754,6 +771,7 @@ protected:
     case NodeKind::ConstrainedExistentialSelf:
       return Builder.createGenericTypeParameterType(/*depth*/ 0, /*index*/ 0);
 
+    case NodeKind::ObjectiveCProtocolSymbolicReference:
     case NodeKind::Protocol:
     case NodeKind::ProtocolSymbolicReference: {
       if (auto Proto = decodeMangledProtocolType(Node, depth + 1)) {
@@ -794,6 +812,7 @@ protected:
                                     Node->getNumChildren());
 
       FunctionTypeFlags flags;
+      ExtendedFunctionTypeFlags extFlags;
       if (Node->getKind() == NodeKind::ObjCBlock ||
           Node->getKind() == NodeKind::EscapingObjCBlock) {
         flags = flags.withConvention(FunctionMetadataConvention::Block);
@@ -827,6 +846,9 @@ protected:
 
         globalActorType = globalActorResult.getType();
         ++firstChildIdx;
+      } else if (Node->getChild(firstChildIdx)->getKind() ==
+                 NodeKind::IsolatedAnyFunctionType) {
+        extFlags = extFlags.withIsolatedAny();
       }
 
       FunctionMetadataDifferentiabilityKind diffKind;
@@ -854,11 +876,31 @@ protected:
         ++firstChildIdx;
       }
 
+      BuiltType thrownErrorType = BuiltType();
       bool isThrow = false;
       if (Node->getChild(firstChildIdx)->getKind()
             == NodeKind::ThrowsAnnotation) {
         isThrow = true;
         ++firstChildIdx;
+      } else if (Node->getChild(firstChildIdx)->getKind()
+                   == NodeKind::TypedThrowsAnnotation) {
+        isThrow = true;
+
+        auto child = Node->getChild(firstChildIdx);
+        if (child->getNumChildren() < 1) {
+          return MAKE_NODE_TYPE_ERROR0(child,
+                                       "Thrown error node is missing child");
+        }
+
+        auto thrownErrorResult =
+            decodeMangledType(child->getChild(0), depth + 1);
+        if (thrownErrorResult.isError())
+          return thrownErrorResult;
+
+        thrownErrorType = thrownErrorResult.getType();
+        ++firstChildIdx;
+
+        extFlags = extFlags.withTypedThrows(true);
       }
 
       bool isSendable = false;
@@ -904,8 +946,13 @@ protected:
                             /*forRequirement=*/false);
       if (result.isError())
         return result;
+
+      if (extFlags != ExtendedFunctionTypeFlags())
+        flags = flags.withExtendedFlags(true);
+
       return Builder.createFunctionType(
-          parameters, result.getType(), flags, diffKind, globalActorType);
+          parameters, result.getType(), flags, extFlags, diffKind, globalActorType,
+          thrownErrorType);
     }
     case NodeKind::ImplFunctionType: {
       auto calleeConvention = ImplParameterConvention::Direct_Unowned;
@@ -1473,20 +1520,21 @@ private:
     if (result.isError())
       return true;
 
-    auto diffKind = T::DifferentiabilityType::DifferentiableOrNotApplicable;
+    typename T::OptionsType options;
     if (node->getNumChildren() == 3) {
       auto diffKindNode = node->getChild(1);
       if (diffKindNode->getKind() !=
           Node::Kind::ImplParameterResultDifferentiability)
         return true;
-      auto optDiffKind =
+      auto optDiffOptions =
           T::getDifferentiabilityFromString(diffKindNode->getText());
-      if (!optDiffKind)
+      if (!optDiffOptions)
         return true;
-      diffKind = *optDiffKind;
+      options |= *optDiffOptions;
     }
 
-    results.emplace_back(result.getType(), *convention, diffKind);
+    results.emplace_back(result.getType(), *convention, options);
+
     return false;
   }
 
@@ -1574,8 +1622,9 @@ private:
     if (node->getKind() == NodeKind::Type)
       return decodeMangledProtocolType(node->getChild(0), depth + 1);
 
-    if ((node->getNumChildren() < 2 || node->getKind() != NodeKind::Protocol)
-        && node->getKind() != NodeKind::ProtocolSymbolicReference)
+    if ((node->getNumChildren() < 2 || node->getKind() != NodeKind::Protocol) &&
+        node->getKind() != NodeKind::ProtocolSymbolicReference &&
+        node->getKind() != NodeKind::ObjectiveCProtocolSymbolicReference)
       return BuiltProtocolDecl();
 
 #if SWIFT_OBJC_INTEROP

@@ -22,6 +22,7 @@
 #include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/LayoutConstraint.h"
+#include "swift/AST/LifetimeDependence.h"
 #include "swift/AST/ParseRequests.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/SourceFile.h"
@@ -42,6 +43,7 @@ namespace llvm {
 
 namespace swift {
   class IdentTypeRepr;
+  class ErrorTypeRepr;
   class CodeCompletionCallbacks;
   class DoneParsingCallback;
   class IDEInspectionCallbacksFactory;
@@ -157,6 +159,10 @@ public:
   bool InInactiveClauseEnvironment = false;
   bool InSwiftKeyPath = false;
   bool InFreestandingMacroArgument = false;
+
+  /// This Parser is a fallback parser for ASTGen.
+  // Note: This doesn't affect anything in non-SWIFT_BUILD_SWIFT_SYNTAX envs.
+  bool IsForASTGen = false;
 
   // A cached answer to
   //     Context.LangOpts.hasFeature(Feature::NoncopyableGenerics)
@@ -596,6 +602,18 @@ public:
     return true;
   }
 
+  /// Consume a '('. If it is not directly following the previous token, emit an
+  /// error (Swift 6) or warning (Swift <6) that attribute name and parentheses
+  /// must not be separated by a space.
+  SourceLoc consumeAttributeLParen();
+
+  /// If the next token is a '(' that's not on a new line consume it, and error
+  /// (Swift 6) or warn (Swift <6) that the attribute must not be separted from
+  /// the '(' by a space.
+  ///
+  /// If the next token is not '(' or it's on a new line, return false.
+  bool consumeIfAttributeLParen();
+
   bool consumeIfNotAtStartOfLine(tok K) {
     if (Tok.isAtStartOfLine()) return false;
     return consumeIf(K);
@@ -700,8 +718,11 @@ public:
   ///
   /// \param Loc where to diagnose.
   /// \param DiagText name for the string literal in the diagnostic.
+  /// \param AllowMultiline Whether the string literal can be a multiline string
+  ///        literal.
   llvm::Optional<StringRef>
-  getStringLiteralIfNotInterpolated(SourceLoc Loc, StringRef DiagText);
+  getStringLiteralIfNotInterpolated(SourceLoc Loc, StringRef DiagText,
+                                    bool AllowMultiline);
 
   /// Returns true to indicate that experimental concurrency syntax should be
   /// parsed if the parser is generating only a syntax tree or if the user has
@@ -953,13 +974,12 @@ public:
   /// Options that control the parsing of declarations.
   using ParseDeclOptions = OptionSet<ParseDeclFlags>;
 
-  void consumeDecl(ParserPosition BeginParserPosition, ParseDeclOptions Flags,
-                   bool IsTopLevel);
+  void consumeDecl(ParserPosition BeginParserPosition, bool IsTopLevel);
 
-  ParserResult<Decl> parseDecl(ParseDeclOptions Flags,
-                               bool IsAtStartOfLineOrPreviousHadSemi,
+  ParserResult<Decl> parseDecl(bool IsAtStartOfLineOrPreviousHadSemi,
                                bool IfConfigsAreDeclAttrs,
-                               llvm::function_ref<void(Decl*)> Handler);
+                               llvm::function_ref<void(Decl *)> Handler,
+                               bool fromASTGen = false);
 
   std::pair<std::vector<Decl *>, llvm::Optional<Fingerprint>>
   parseDeclListDelayed(IterableDeclContext *IDC);
@@ -1011,8 +1031,6 @@ public:
   /// 'isLine = true' indicates parsing #line instead of #sourcelocation
   ParserStatus parseLineDirective(bool isLine = false);
 
-  void recordLocalType(TypeDecl *TD);
-
   /// Skip an `#if` configuration block containing only attributes.
   ///
   /// \returns true if the skipping was successful, false otherwise.
@@ -1050,7 +1068,7 @@ public:
   /// Parse a string literal whose contents can be interpreted as a UUID.
   ///
   /// \returns false on success, true on error.
-  bool parseUUIDString(UUID &uuid, Diag<> diag);
+  bool parseUUIDString(UUID &uuid, Diag<> diag, bool justChecking = false);
 
   /// Parse the Objective-C selector inside @objc
   void parseObjCSelector(SmallVector<Identifier, 4> &Names,
@@ -1094,6 +1112,10 @@ public:
   /// Parse the @differentiable attribute.
   ParserResult<DifferentiableAttr> parseDifferentiableAttribute(SourceLoc AtLoc,
                                                                 SourceLoc Loc);
+
+  /// Parse the @_extern attribute.
+  bool parseExternAttribute(DeclAttributes &Attributes, bool &DiscardAttribute,
+                            StringRef AttrName, SourceLoc AtLoc, SourceLoc Loc);
 
   /// Parse the arguments inside the @differentiable attribute.
   bool parseDifferentiableAttributeArguments(
@@ -1140,6 +1162,7 @@ public:
 
   /// Parse a specific attribute.
   ParserStatus parseDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
+                                  SourceLoc AtEndLoc,
                                   PatternBindingInitializer *&initContext,
                                   bool isFromClangAttribute = false);
 
@@ -1166,6 +1189,36 @@ public:
   bool parseVersionTuple(llvm::VersionTuple &Version, SourceRange &Range,
                          const Diagnostic &D);
 
+  bool isParameterSpecifier() {
+    if (Tok.is(tok::kw_inout)) return true;
+    if (!canHaveParameterSpecifierContextualKeyword()) return false;
+    if (Tok.isContextualKeyword("__shared") ||
+        Tok.isContextualKeyword("__owned") ||
+        Tok.isContextualKeyword("borrowing") ||
+        Tok.isContextualKeyword("consuming") ||
+        Tok.isContextualKeyword("isolated") ||
+        Tok.isContextualKeyword("_const"))
+      return true;
+    if (Context.LangOpts.hasFeature(Feature::NonescapableTypes) &&
+        Tok.isContextualKeyword("_resultDependsOn"))
+      return true;
+    if (Context.LangOpts.hasFeature(Feature::TransferringArgsAndResults) &&
+        Tok.isContextualKeyword("transferring"))
+      return true;
+    if (Context.LangOpts.hasFeature(Feature::NonescapableTypes) &&
+        (Tok.isContextualKeyword("_resultDependsOn") ||
+         Tok.isLifetimeDependenceToken()))
+      return true;
+    return false;
+  }
+
+  /// Given that we just returned true from isParameterSpecifier(), skip
+  /// over the specifier.
+  void skipParameterSpecifier() {
+    // These are all currently single tokens.
+    consumeToken();
+  }
+
   bool canHaveParameterSpecifierContextualKeyword() {
     // The parameter specifiers like `isolated`, `consuming`, `borrowing` are
     // also valid identifiers and could be the name of a type. Check whether
@@ -1185,36 +1238,46 @@ public:
                            tok::kw_let);
   }
 
-  ParserStatus parseTypeAttributeList(ParamDecl::Specifier &Specifier,
-                                      SourceLoc &SpecifierLoc,
-                                      SourceLoc &IsolatedLoc,
-                                      SourceLoc &ConstLoc,
-                                      TypeAttributes &Attributes) {
-    if (Tok.isAny(tok::at_sign, tok::kw_inout) ||
-        (canHaveParameterSpecifierContextualKeyword() &&
-         (Tok.getRawText().equals("__shared") ||
-          Tok.getRawText().equals("__owned") ||
-          Tok.getRawText().equals("consuming") ||
-          Tok.getRawText().equals("borrowing") ||
-          Tok.isContextualKeyword("isolated") ||
-          Tok.isContextualKeyword("_const"))))
-      return parseTypeAttributeListPresent(
-          Specifier, SpecifierLoc, IsolatedLoc, ConstLoc, Attributes);
-    return makeParserSuccess();
-  }
+  struct ParsedTypeAttributeList {
+    ParamDecl::Specifier Specifier = ParamDecl::Specifier::Default;
+    SourceLoc SpecifierLoc;
+    SourceLoc IsolatedLoc;
+    SourceLoc ConstLoc;
+    SourceLoc ResultDependsOnLoc;
+    SmallVector<TypeOrCustomAttr> Attributes;
+    SmallVector<LifetimeDependenceSpecifier> lifetimeDependenceSpecifiers;
 
-  ParserStatus parseTypeAttributeListPresent(ParamDecl::Specifier &Specifier,
-                                             SourceLoc &SpecifierLoc,
-                                             SourceLoc &IsolatedLoc,
-                                             SourceLoc &ConstLoc,
-                                             TypeAttributes &Attributes);
+    /// Main entry point for parsing.
+    ///
+    /// Inline we just have the fast path of failing to match. We call slowParse
+    /// that contains the outline of more complex implementation. This is HOT
+    /// code!
+    ParserStatus parse(Parser &P) {
+      auto &Tok = P.Tok;
+      if (Tok.is(tok::at_sign) || P.isParameterSpecifier())
+        return slowParse(P);
+      return makeParserSuccess();
+    }
 
-  bool parseConventionAttributeInternal(bool justChecking,
-                                        TypeAttributes::Convention &convention);
+    TypeRepr *applyAttributesToType(Parser &P, TypeRepr *Type) const;
 
-  ParserStatus parseTypeAttribute(TypeAttributes &Attributes, SourceLoc AtLoc,
+  private:
+    /// An out of line implementation of the more complicated cases. This
+    /// ensures on the inlined fast path we handle the case of not matching.
+    ParserStatus slowParse(Parser &P);
+  };
+
+  bool parseConventionAttributeInternal(SourceLoc atLoc, SourceLoc attrLoc,
+                                        ConventionTypeAttr *&result,
+                                        bool justChecking);
+
+  ParserStatus parseTypeAttribute(TypeOrCustomAttr &result, SourceLoc AtLoc,
+                                  SourceLoc AtEndLoc,
                                   PatternBindingInitializer *&initContext,
                                   bool justChecking = false);
+
+  ParserStatus parseLifetimeDependenceSpecifiers(
+      SmallVectorImpl<LifetimeDependenceSpecifier> &specifierList);
 
   ParserResult<ImportDecl> parseDeclImport(ParseDeclOptions Flags,
                                            DeclAttributes &Attributes);
@@ -1231,11 +1294,9 @@ public:
                                 bool allowAnyObject,
                                 SourceLoc *parseTildeCopyable = nullptr);
   ParserStatus parseDeclItem(bool &PreviousHadSemi,
-                             ParseDeclOptions Options,
-                             llvm::function_ref<void(Decl*)> handler);
+                             llvm::function_ref<void(Decl *)> handler);
   std::pair<std::vector<Decl *>, llvm::Optional<Fingerprint>>
   parseDeclList(SourceLoc LBLoc, SourceLoc &RBLoc, Diag<> ErrorDiag,
-                ParseDeclOptions Options, IterableDeclContext *IDC,
                 bool &hadError);
   ParserResult<ExtensionDecl> parseDeclExtension(ParseDeclOptions Flags,
                                                  DeclAttributes &Attributes);
@@ -1260,14 +1321,13 @@ public:
 
   bool parseAccessorAfterIntroducer(
       SourceLoc Loc, AccessorKind Kind, ParsedAccessors &accessors,
-      bool &hasEffectfulGet, ParameterList *Indices, bool &parsingLimitedSyntax,
+      bool &hasEffectfulGet, bool &parsingLimitedSyntax,
       DeclAttributes &Attributes, ParseDeclOptions Flags,
-      AbstractStorageDecl *storage, SourceLoc StaticLoc, ParserStatus &Status
-  );
+      AbstractStorageDecl *storage, ParserStatus &Status);
 
   ParserStatus parseGetSet(ParseDeclOptions Flags, ParameterList *Indices,
                            TypeRepr *ResultType, ParsedAccessors &accessors,
-                           AbstractStorageDecl *storage, SourceLoc StaticLoc);
+                           AbstractStorageDecl *storage);
   ParserResult<VarDecl> parseDeclVarGetSet(PatternBindingEntry &entry,
                                            ParseDeclOptions Flags,
                                            SourceLoc StaticLoc,
@@ -1349,50 +1409,6 @@ public:
   /// Get the location for a type error.
   SourceLoc getTypeErrorLoc() const;
 
-  /// Callback function used for creating a C++ AST from the syntax node at the given source location.
-  ///
-  /// The arguments to this callback are the source file to pass into ASTGen (the exported source file)
-  /// and the source location pointer to pass into ASTGen (to find the syntax node).
-  ///
-  /// The callback returns the new AST node and the ending location of the syntax node. If the AST node
-  /// is NULL, something went wrong.
-  template<typename T>
-  using ASTFromSyntaxTreeCallback = std::pair<T*, const void *>(
-      void *sourceFile, const void *sourceLoc
-  );
-
-  /// Parse by constructing a C++ AST node from the Swift syntax tree via ASTGen.
-  template<typename T>
-  ParserResult<T> parseASTFromSyntaxTree(
-      llvm::function_ref<ASTFromSyntaxTreeCallback<T>> body
-  ) {
-    if (!Context.LangOpts.hasFeature(Feature::ASTGenTypes))
-      return nullptr;
-
-    auto exportedSourceFile = SF.getExportedSourceFile();
-    if (!exportedSourceFile)
-      return nullptr;
-
-    // Perform the translation.
-    auto sourceLoc = Tok.getLoc().getOpaquePointerValue();
-    T* astNode;
-    const void *endLocPtr;
-    std::tie(astNode, endLocPtr) = body(exportedSourceFile, sourceLoc);
-
-    if (!astNode) {
-      assert(false && "Could not build AST node from syntax tree");
-      return nullptr;
-    }
-
-    // Reset the lexer to the ending location.
-    StringRef contents =
-        SourceMgr.extractText(SourceMgr.getRangeForBuffer(L->getBufferID()));
-    L->resetToOffset((const char *)endLocPtr - contents.data());
-    L->lex(Tok);
-
-    return makeParserResult(astNode);
-  }
-
   //===--------------------------------------------------------------------===//
   // Type Parsing
 
@@ -1409,9 +1425,10 @@ public:
       ParseTypeReason reason);
 
   ParserResult<TypeRepr> parseType();
-  ParserResult<TypeRepr> parseType(
-      Diag<> MessageID,
-      ParseTypeReason reason = ParseTypeReason::Unspecified);
+  ParserResult<TypeRepr>
+  parseType(Diag<> MessageID,
+            ParseTypeReason reason = ParseTypeReason::Unspecified,
+            bool fromASTGen = false);
 
   /// Parse a type optionally prefixed by a list of named opaque parameters. If
   /// no params present, return 'type'. Otherwise, return 'type-named-opaque'.
@@ -1459,7 +1476,7 @@ public:
   ParserResult<TypeRepr> parseOldStyleProtocolComposition();
   ParserResult<TypeRepr> parseAnyType();
   ParserResult<TypeRepr> parseSILBoxType(GenericParamList *generics,
-                                         const TypeAttributes &attrs);
+                                         ParsedTypeAttributeList &attrs);
   
   ParserResult<TypeRepr> parseTypeTupleBody();
   ParserResult<TypeRepr> parseTypeArray(ParserResult<TypeRepr> Base);
@@ -1480,12 +1497,6 @@ public:
   
   bool isImplicitlyUnwrappedOptionalToken(const Token &T) const;
   SourceLoc consumeImplicitlyUnwrappedOptionalToken();
-
-  TypeRepr *applyAttributeToType(TypeRepr *Ty, const TypeAttributes &Attr,
-                                 ParamDecl::Specifier Specifier,
-                                 SourceLoc SpecifierLoc,
-                                 SourceLoc IsolatedLoc,
-                                 SourceLoc ConstLoc);
 
   //===--------------------------------------------------------------------===//
   // Pattern Parsing
@@ -1546,6 +1557,9 @@ public:
 
     /// The location of the '_const' keyword, if present.
     SourceLoc CompileConstLoc;
+
+    /// The location of the '_resultDependsOn' keyword, if present.
+    SourceLoc ResultDependsOnLoc;
 
     /// The type following the ':'.
     TypeRepr *Type = nullptr;
@@ -1829,7 +1843,7 @@ public:
       SourceLoc &rightAngleLoc, ArgumentList *&argList, bool isExprBasic,
       const Diagnostic &diag);
 
-  ParserResult<Expr> parseExprIdentifier();
+  ParserResult<Expr> parseExprIdentifier(bool allowKeyword);
   Expr *parseExprEditorPlaceholder(Token PlaceholderTok,
                                    Identifier PlaceholderId);
 
@@ -1899,6 +1913,8 @@ public:
   parseArgumentList(tok leftTok, tok rightTok, bool isExprBasic,
                     bool allowTrailingClosure = true);
 
+  ParserStatus parseExprListElement(tok rightTok, bool isArgumentList, SourceLoc leftLoc, SmallVectorImpl<ExprListElt> &elts);
+
   /// Parse one or more trailing closures after an argument list.
   ParserStatus parseTrailingClosures(bool isExprBasic, SourceRange calleeRange,
                                      SmallVectorImpl<Argument> &closures);
@@ -1944,7 +1960,7 @@ public:
 
   bool isTerminatorForBraceItemListKind(BraceItemListKind Kind,
                                         ArrayRef<ASTNode> ParsedDecls);
-  ParserResult<Stmt> parseStmt();
+  ParserResult<Stmt> parseStmt(bool fromASTGen = false);
   ParserStatus parseExprOrStmt(ASTNode &Result);
   ParserResult<Stmt> parseStmtBreak();
   ParserResult<Stmt> parseStmtContinue();
@@ -2071,10 +2087,17 @@ public:
   void performIDEInspectionSecondPassImpl(
       IDEInspectionDelayedDeclState &info);
 
-  /// Returns true if the caller should skip calling `parseType` afterwards.
-  bool parseLegacyTildeCopyable(SourceLoc *parseTildeCopyable,
-                                ParserStatus &Status,
-                                SourceLoc &TildeCopyableLoc);
+  //===--------------------------------------------------------------------===//
+  // ASTGen support.
+
+  /// Parse a TypeRepr from the syntax tree. i.e. SF->getExportedSourceFile()
+  ParserResult<TypeRepr> parseTypeReprFromSyntaxTree();
+  /// Parse a Stmt from the syntax tree. i.e. SF->getExportedSourceFile()
+  ParserResult<Stmt> parseStmtFromSyntaxTree();
+  /// Parse a Decl from the syntax tree. i.e. SF->getExportedSourceFile()
+  ParserResult<Decl> parseDeclFromSyntaxTree();
+  /// Parse an Expr from the syntax tree. i.e. SF->getExportedSourceFile()
+  ParserResult<Expr> parseExprFromSyntaxTree();
 };
 
 /// Describes a parsed declaration name.
